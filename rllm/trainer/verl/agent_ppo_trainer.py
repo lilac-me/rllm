@@ -168,7 +168,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                 metrics = {}
                 timing_raw = {}
 
-                batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
+                # batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
 
                 with marked_timer("step", timing_raw):
                     self.init_envs_and_agents(batch)
@@ -462,7 +462,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             test_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_batch.pop(["input_ids", "attention_mask", "position_ids"])  # these are not needed for environment based interaction
+            # test_batch.pop(["input_ids", "attention_mask", "position_ids"])  # these are not needed for environment based interaction
             test_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,

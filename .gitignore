@@ -181,6 +181,7 @@ data/*
 **/outputs/
 **/wandb/
 **/checkpoints/
+**/checkpoints_bak/
 tmp/
 
 # Ignore debug logs and run result logs

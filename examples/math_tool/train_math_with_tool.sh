@@ -1,7 +1,7 @@
 set -x
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
@@ -9,13 +9,31 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 # Find the directory where rllm package is located
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 
-python3 -m examples.math_tool.train_math_with_tool \
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+ray start --head --port 8265 --node-ip-address ${MASTER_ADDR} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+
+# RUNTIME_ENV_JSON="{
+#   \"env_vars\": {
+#     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+#     \"RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES\": \"1\",
+#     \"ASCEND_TOOLKIT_HOME\": \"/usr/local/Ascend/ascend-toolkit/latest/\",
+#     \"ASCEND_OPP_PATH\": \"/usr/local/Ascend/ascend-toolkit/latest/opp/\",
+#     \"ASCEND_AICPU_PATH\": \"/usr/local/Ascend/ascend-toolkit/latest/\",
+#     \"ASCEND_HOME_PATH\": \"/usr/local/Ascend/ascend-toolkit/latest/\",
+#     \"set_env_path\": \"/usr/local/Ascend/nnal/atb/set_env.sh\",
+#     \"HYDRA_FULL_ERROR\": \"1\"
+#   }
+# }"
+
+# ray job submit --address="http://127.0.0.1:8265" \
+#    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+python -m examples.math_tool.train_math_with_tool \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=32 \
     data.val_batch_size=500 \
     data.max_prompt_length=2048 \
     data.max_response_length=8192 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-4B \
+    actor_rollout_ref.model.path=/home/g00841271/Qwen3-8B \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \

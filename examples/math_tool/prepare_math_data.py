@@ -4,8 +4,8 @@ from rllm.data.dataset import DatasetRegistry
 
 
 def prepare_math_data():
-    train_dataset = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
-    test_dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    train_dataset = load_dataset("/home/g00841271/datasets/agentica-org/DeepScaleR-Preview-Dataset", split="train")
+    test_dataset = load_dataset("/home/g00841271/datasets/HuggingFaceH4/aime_2024", split="train")
 
     def preprocess_fn(example, idx):
         return {
