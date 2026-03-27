@@ -20,6 +20,7 @@ AGENT_IMPORTS = [
     ("rllm.agents.swe_agent", "SWEAgent"),
     ("rllm.agents.code_agent", "CompetitionCodingAgent"),
     ("rllm.agents.webarena_agent", "WebArenaAgent"),
+    ("rllm.agents.kernelgym_agent", "KernelAgent"),
 ]
 
 for module_path, class_name in AGENT_IMPORTS:
