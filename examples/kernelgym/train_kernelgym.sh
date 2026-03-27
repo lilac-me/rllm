@@ -1,0 +1,113 @@
+#!/bin/bash
+# =============================================================================
+# train_kernelgym.sh — rllm + KernelGYM 训练启动脚本（math_tool 风格）
+#
+# 用法:
+#   bash examples/kernelgym/train_kernelgym.sh
+# =============================================================================
+set -x
+
+# ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
+export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:False"
+export VLLM_USE_V1=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
+
+export RAY_DEBUG_POST_MORTEM=1
+# ValueError: FRACTAL_NZ mode is enabled. This may cause model parameter precision issues in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0.
+export VLLM_ASCEND_ENABLE_NZ=0
+
+# 修复 ModuleNotFoundError: 自动获取当前目录并加入 PYTHONPATH
+RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
+export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
+
+# 设置 Master 节点地址
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+
+export ASCEND_RT_VISIBLE_DEVICES="8,9,10,11,12,13,14,15"
+
+# ── NCCL / Tokenizers ─────────────────────────────────────────────────────────
+export TOKENIZERS_PARALLELISM=true
+export VLLM_LOGGING_LEVEL=WARN
+export NCCL_DEBUG=WARN
+
+
+# 2. 重启 Ray 服务 (解决之前的 Connection Refused 问题)
+echo "正在重启 Ray 集群..."
+ray stop --force
+rm -rf /tmp/ray/*
+sleep 2
+ray start --head \
+    --port 6379 \
+    --dashboard-host 0.0.0.0 \
+    --dashboard-port 8265 \
+    --disable-usage-stats \
+    --node-ip-address ${MASTER_ADDR}
+
+
+# ── 定位 rllm 根目录 ──────────────────────────────────────────────────────────
+RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
+
+python3 -m examples.kernelgym.train_kernelgym \
+    algorithm.adv_estimator=grpo \
+    data.train_batch_size=32 \
+    data.val_batch_size=64 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=8192 \
+    actor_rollout_ref.model.path=/home/g00841271/Qwen3-8B \
+    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode="async" \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    rllm.mask_truncated_samples=False \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name='rllm-agent' \
+    trainer.experiment_name='4b-kernelgym' \
+    trainer.val_before_train=True \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.device=npu \
+    trainer.save_freq=100 \
+    trainer.test_freq=20 \
+    trainer.default_hdfs_dir=null \
+    rllm.agent.max_steps=3 \
+    rllm.stepwise_advantage.enable=False \
+    trainer.total_epochs=100 \
+    ++kernel.server_url=http://localhost:8000 \
+    ++kernel.backend=cuda \
+    ++kernel.toolkit=kernelbench \
+    ++kernel.use_ray=false \
+    ++kernel.timeout=300 \
+    ++kernel.num_correct_trials=5 \
+    ++kernel.num_perf_trials=100
+    # data.train_files=data/kernelbench_train.jsonl \
+    # data.val_files=data/kernelbench_val.jsonl
