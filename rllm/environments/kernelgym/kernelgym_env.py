@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Ensure KernelGYM packages are importable
 # ---------------------------------------------------------------------------
-_KERNELGYM_ROOT = ""
+_KERNELGYM_ROOT = "/data/home/3120235672/code_agent/KernelGYM"
 
 for _p in [_KERNELGYM_ROOT, f"{_KERNELGYM_ROOT}/drkernel"]:
     if _p not in sys.path:
@@ -613,8 +613,34 @@ class KernelGymEnv(MultiTurnEnvironment):
             config = {k: env_args.pop(k) for k in list(env_args) if k in KernelGymEnv._ENV_CONFIG_KEYS}
             task = env_args if env_args else None  # remaining keys = task data
             env_args = config
-
-        return KernelGymEnv(task=task, **env_args)
+        # self,
+        # task: dict | None = None,
+        # kernel_server_url: str = "http://localhost:8000",
+        # max_turns: int = 3,
+        # num_correct_trials: int = 5,
+        # num_perf_trials: int = 100,
+        # timeout: int = 300,
+        # toolkit: str = "kernelbench",
+        # backend_adapter: str = "kernelbench",
+        # backend: str = "cuda",
+        # request_timeout: int = 360,
+        # use_ray: bool = False,
+        # reward_func_name: str = "calculate_reward_like_kernel",
+        # reward_config: dict | None = None,
+        return KernelGymEnv(
+            task=task, 
+            kernel_server_url=env_args['kernel_server_url'],
+            max_turns=env_args['max_turns'],
+            num_correct_trials=env_args['num_correct_trials'],
+            num_perf_trials=env_args['num_perf_trials'],
+            timeout=env_args['timeout'],
+            toolkit=env_args['toolkit'],
+            backend_adapter=env_args['backend_adapter'],
+            backend=env_args['backend'],
+            use_ray=env_args['use_ray'],
+            reward_func_name=env_args['reward_func_name'],
+            reward_config=env_args['reward_config'],
+        )
 
     @staticmethod
     def is_multithread_safe() -> bool:

@@ -16,10 +16,10 @@ from __future__ import annotations
 import json
 import os
 os.environ['HF_ENDPOINT']='https://hf-mirror.com'
-os.environ['HTTP_PROXY']='http://127.0.0.1:18080'
-os.environ['HTTPS_PROXY']='http://127.0.0.1:18080'
-os.environ['http_proxy']='http://127.0.0.1:18080'
-os.environ['https_proxy']='http://127.0.0.1:18080'
+# os.environ['HTTP_PROXY']='http://127.0.0.1:18080'
+# os.environ['HTTPS_PROXY']='http://127.0.0.1:18080'
+# os.environ['http_proxy']='http://127.0.0.1:18080'
+# os.environ['https_proxy']='http://127.0.0.1:18080'
 os.environ['NO_PROXY']='localhost,127.*.*.*,127.0.1.1,127.0.0.1,*.huawei.com,test.huaweisymantec.com,*-dev.huaweicloud.com,*-dev.myhuaweicloud.com,*.athuawei.com,*.chaspark.cn,*.chaspark.com,*.chaspark.net,*.hic.cloud,*.hisilicon.*,*.hisilicon.cn,*.huawei.cn,*.huawei.com,*.huaweimarine.com,*.huaweimossel.*,*.huaweistatic.cn,*.huaweistatic.com,*.hw3static.cn,*.hw3static.com,*.hwht.*,*.hwtelcloud.com,*.hwtrip.*,*.inhuawei.com,*.pinjiantrip.com,*.yinwang.com,*.yw-beta.com,*.yw-partners.com,*acm.chaspark.com,*cn-north-5-console.huaweicloud.com,*cn-north-5.myhuaweicloud.com,*cn-north-6.myhuaweicloud.com,*heds.huaweigsc.com,*irad.huaweigsc.com,*paper.chaspark.com,*papers.chaspark.com,*tool.chaspark.net,10.*,100.10*,100.11*,100.120.*,100.121.*,100.122.*,100.123.*,100.124.*,100.125.*,100.126.*,100.64.*,100.65.*,100.66.*,100.67.*,100.68.*,100.69.*,100.7*,100.8*,100.9*,127.0.0.1*,172.16.*,172.17.*,172.18.*,172.19.*,172.20.*,172.21.*,172.22.*,172.23.*,172.24.*,172.25.*,172.26.*,172.27.*,172.28.*,172.29.*,172.30.*,172.31.*,172.32.*,7.*,his.chaspark.com,wo-dr*.dbankcloud.cn,wo-dr*.dbankcloud.ru,wo.hicloud.com,.huawei.com'
 # export NO_PROXY=localhost,127.*.*.*,127.0.1.1,127.0.0.1,*.huawei.com #,test.huaweisymantec.com,*-dev.huaweicloud.com,*-dev.myhuaweicloud.com,*.athuawei.com,*.chaspark.cn,*.chaspark.com,*.chaspark.net,*.hic.cloud,*.hisilicon.*,*.hisilicon.cn,*.huawei.cn,*.huawei.com,*.huaweimarine.com,*.huaweimossel.*,*.huaweistatic.cn,*.huaweistatic.com,*.hw3static.cn,*.hw3static.com,*.hwht.*,*.hwtelcloud.com,*.hwtrip.*,*.inhuawei.com,*.pinjiantrip.com,*.yinwang.com,*.yw-beta.com,*.yw-partners.com,*acm.chaspark.com,*cn-north-5-console.huaweicloud.com,*cn-north-5.myhuaweicloud.com,*cn-north-6.myhuaweicloud.com,*heds.huaweigsc.com,*irad.huaweigsc.com,*paper.chaspark.com,*papers.chaspark.com,*tool.chaspark.net,10.*,100.10*,100.11*,100.120.*,100.121.*,100.122.*,100.123.*,100.124.*,100.125.*,100.126.*,100.64.*,100.65.*,100.66.*,100.67.*,100.68.*,100.69.*,100.7*,100.8*,100.9*,127.0.0.1*,172.16.*,172.17.*,172.18.*,172.19.*,172.20.*,172.21.*,172.22.*,172.23.*,172.24.*,172.25.*,172.26.*,172.27.*,172.28.*,172.29.*,172.30.*,172.31.*,172.32.*,7.*,his.chaspark.com,wo-dr*.dbankcloud.cn,wo-dr*.dbankcloud.ru,wo.hicloud.com,.huawei.com
 # export no_proxy=$NO_PROXY^
@@ -30,14 +30,20 @@ from datasets import load_dataset
 
 from rllm.data.dataset import DatasetRegistry
 
+# - ``problem_id`` (str): Unique problem identifier.
+# - ``reference_code`` (str): PyTorch reference implementation.
+# - ``description`` (str, optional): Human-readable problem description.
+# - ``entry_point`` (str, optional): Class name to evaluate (default "Model").
 
 def _hf_row_to_record(row: dict) -> dict:
     """Convert a HuggingFace row to the JSONL record format."""
     return {
-        "problem_id": f"level{row['level']}_{row['problem_id']}_{row['name']}",
-        "reference_code": row["code"],
-        "task": f"Optimise the PyTorch module '{row['name']}' (Level {row['level']}, Problem {row['problem_id']}).",
-        "entry_point": "Model",
+        "task": {
+            "problem_id": f"level{row['level']}_{row['problem_id']}_{row['name']}",
+            "reference_code": row["code"],
+            "description": "",
+            "entry_point": "Model",
+        },
         "backend": "cuda",
     }
 
