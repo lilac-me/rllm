@@ -27,6 +27,7 @@ class Step(_StepBase):
     chat_completions: list[dict[str, Any]] = Field(default_factory=list)
 
     observation: Any = None
+    next_observation: Any = None
     thought: str = ""
     # action: inherited from _StepBase
     model_response: str = ""

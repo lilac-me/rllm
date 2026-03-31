@@ -222,3 +222,7 @@ gcp-key.json
 
 # IDE
 .vscode/
+
+extra-info
+*.parquet
+litellm_proxy_config_autogen.yaml
