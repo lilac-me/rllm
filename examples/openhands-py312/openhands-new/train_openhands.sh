@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Train OpenHands agent with rllm AgentSDKEngine (PPO/GRPO)
+# Train OpenHands agent with rllm (container-based, no openhands Python lib)
 #
-# Uses sandbox mode (方案 B):
-#   - Agent code runs inside Docker containers
-#   - worker_server.py inside containers handles LLM routing via metadata slug
-#   - LiteLLM Proxy runs in subprocess mode on the host
-#
-# Usage:
-#   bash examples/openhands/train_openhands.sh
+# Architecture:
+#   Host
+#   ├─ vLLM (GPU inference)
+#   ├─ LiteLLM proxy  (rllm metadata-slug proxy, port PROXY_PORT)
+#   └─ rllm training process (Ray workers)
+#        └─ rollout()  in openhands_agent.py
+#             ├─ build_proxied_base_url()  → metadata slug embedded in URL
+#             └─ docker run ghcr.io/all-hands-ai/openhands
+#                  └─ OpenHands headless → LLM_BASE_URL (proxied) → LiteLLM proxy
 #
 # Key knobs:
-#   MODEL_PATH   — base model (HuggingFace ID or local path)
-#   N_GPUS       — number of GPUs per node
-#   BATCH_SIZE   — training batch size (number of rollouts per step)
-#   PROXY_PORT   — LiteLLM proxy port
+#   MODEL_PATH          — base model (HuggingFace ID or local path)
+#   N_GPUS              — number of GPUs per node
+#   PROXY_PORT          — LiteLLM proxy port
+#   OPENHANDS_IMAGE     — OpenHands Docker image to run per rollout
 # ==============================================================================
 set -euo pipefail
 set -x
 
 # ------------------------------------------------------------------------------
-# vLLM / CUDA environment
+# vLLM / CUDA
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
@@ -30,16 +32,20 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # ------------------------------------------------------------------------------
-# OpenHands agent settings — forwarded via environment variables into the sandbox
-# (see openhands_agent.py for all supported variables)
+# OpenHands container settings
+# (read by openhands_agent.py → forwarded into each OpenHands container)
 # ------------------------------------------------------------------------------
-export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-openhands-model}"
+# Custom rllm-openhands image (built from workspace/Dockerfile).
+# This image extends the official OpenHands image with workspace/entrypoint.py
+# which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
+export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-rllm-openhands}"
+export OPENHANDS_SANDBOX_IMAGE="${OPENHANDS_SANDBOX_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik}"
+export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-openai/openhands-model}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-30}"
-# Docker image used by OpenHands' docker runtime for per-rollout code execution
-export OPENHANDS_RUNTIME_IMAGE="${OPENHANDS_RUNTIME_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:0.20-nikolaik}"
+export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 
 # ------------------------------------------------------------------------------
-# Configurable parameters
+# Training parameters
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
 N_GPUS="${N_GPUS:-8}"
@@ -49,30 +55,34 @@ TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-openhands-ppo}"
 
-# Docker image for the rllm sandbox worker (NOT the OpenHands runtime image)
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-rllm-openhands-sandbox}"
-
-echo "=== rllm + OpenHands training (Sandbox Mode) ==="
+echo "=== rllm + OpenHands (container-based) ==="
 echo "  Model           : ${MODEL_PATH}"
 echo "  GPUs            : ${N_GPUS}"
-echo "  Batch size      : ${BATCH_SIZE}"
 echo "  Proxy port      : ${PROXY_PORT}"
-echo "  Trace DB        : ${TRACE_DB_PATH}"
-echo "  Sandbox image   : ${SANDBOX_IMAGE}"
+echo "  OpenHands image : ${OPENHANDS_IMAGE}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
 
 # ------------------------------------------------------------------------------
-# Build Docker sandbox image (if not already built)
+# Build the custom rllm-openhands image from workspace/Dockerfile.
+# This image extends the official OpenHands base with workspace/entrypoint.py
+# (uses new OpenHands SDK: LLM, Agent, Conversation, Tool).
+# Rebuild only if image doesn't exist or FORCE_BUILD=1 is set.
 # ------------------------------------------------------------------------------
-if ! docker image inspect "${SANDBOX_IMAGE}" &>/dev/null; then
-    echo "Building Docker sandbox image: ${SANDBOX_IMAGE}"
-    docker build -t "${SANDBOX_IMAGE}" -f examples/openhands/Dockerfile .
+if [ "${FORCE_BUILD:-0}" = "1" ] || ! docker image inspect "${OPENHANDS_IMAGE}" &>/dev/null; then
+    echo "Building custom OpenHands image: ${OPENHANDS_IMAGE}"
+    docker build \
+        -t "${OPENHANDS_IMAGE}" \
+        -f examples/openhands-sdk/workspace/Dockerfile \
+        examples/openhands-sdk/workspace
 fi
 
 # ------------------------------------------------------------------------------
 # Launch training
+# rollout() in openhands_agent.py runs directly in rllm Ray workers.
+# Each rollout spawns its own OpenHands Docker container via docker run.
+# No rllm sandbox (worker_server.py) wrapper is used.
 # ------------------------------------------------------------------------------
-python3 -m examples.openhands.train_openhands \
+python3 -m examples.openhands_sdk.train_openhands \
     algorithm.adv_estimator=grpo \
     \
     data.train_batch_size=${BATCH_SIZE} \
@@ -143,17 +153,6 @@ python3 -m examples.openhands.train_openhands \
     "rllm.sdk.proxy.model_name=${OPENHANDS_MODEL_NAME}" \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
     \
-    rllm.sdk.sandbox.enabled=True \
-    rllm.sdk.sandbox.backend=docker \
-    "rllm.sdk.sandbox.image=${SANDBOX_IMAGE}" \
-    rllm.sdk.sandbox.agent_dir=examples/openhands \
-    rllm.sdk.sandbox.agent_module=openhands_agent \
-    rllm.sdk.sandbox.agent_func=rollout \
-    rllm.sdk.sandbox.pool_mode=per_task \
-    rllm.sdk.sandbox.max_concurrent=16 \
-    rllm.sdk.sandbox.execution_timeout=700 \
-    \
-    "rllm.sdk.sandbox.extra.docker_volumes=[\"/var/run/docker.sock:/var/run/docker.sock\"]"
-
+    rllm.sdk.sandbox.enabled=False
 
 pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true
