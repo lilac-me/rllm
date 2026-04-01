@@ -175,6 +175,7 @@ class AgentSdkTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
         start_time = time.time()
         if self.config.trainer.get("val_before_train", True):
