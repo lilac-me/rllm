@@ -19,8 +19,6 @@ Environment Variables:
     OPENHANDS_IMAGE             : Custom rllm-openhands image
                                   (built from workspace/Dockerfile)
                                   Default: rllm-openhands
-    OPENHANDS_SANDBOX_IMAGE     : Runtime image used by OpenHands internally
-                                  Default: docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik
     OPENHANDS_MODEL_NAME        : Model name on the LiteLLM proxy
                                   Default: openai/openhands-model
     OPENHANDS_MAX_ITERATIONS    : Max agent iterations, default 30
@@ -265,7 +263,7 @@ def _run_openhands_container(
         instruction:  Task instruction (also written to INSTRUCTIONS.md).
     """
     container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
-    # breakpoint()
+    breakpoint()
     cmd = [
         "docker", "run",
         "--rm",

@@ -131,6 +131,7 @@ agent = Agent(
 conversation = Conversation(
     agent=agent,
     workspace=WORKSPACE_BASE,
+    max_iteration_per_run=MAX_ITERATIONS,
 )
 
 

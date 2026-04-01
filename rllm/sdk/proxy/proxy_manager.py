@@ -199,8 +199,10 @@ class ProxyManager:
         logger.info("Starting proxy subprocess: %s", " ".join(cmd))
         self._proxy_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # stdout=subprocess.DEVNULL,
+            # stderr=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
             env=env,
             preexec_fn=set_limits,
         )

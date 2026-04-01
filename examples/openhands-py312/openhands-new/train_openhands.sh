@@ -39,7 +39,6 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-rllm-openhands}"
-export OPENHANDS_SANDBOX_IMAGE="${OPENHANDS_SANDBOX_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik}"
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-openai/openhands-model}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-30}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"

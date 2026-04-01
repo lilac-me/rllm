@@ -27,7 +27,9 @@ export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
 export MODEL_PATH=/home/g00841271/Qwen3-8B
 
-export RAY_DEBUG_POST_MORTEM=1
+# export ASCEND_LAUNCH_BLOCKING=1
+
+# export RAY_DEBUG_POST_MORTEM=0
 export RAY_DEBUG_POST_MORTEM=1
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
@@ -35,11 +37,12 @@ export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
 export HYDRA_FULL_ERROR=1
 
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 # ------------------------------------------------------------------------------
 # vLLM / CUDA
 # ------------------------------------------------------------------------------
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -54,7 +57,6 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-ghcr.io/openhands/agent-server:full3}"
-export OPENHANDS_SANDBOX_IMAGE="${OPENHANDS_SANDBOX_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik}"
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/g00841271/Qwen3-8B}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-5}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
@@ -83,15 +85,14 @@ echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
 # (uses new OpenHands SDK: LLM, Agent, Conversation, Tool).
 # Rebuild only if image doesn't exist or FORCE_BUILD=1 is set.
 # ------------------------------------------------------------------------------
-if [ "${FORCE_BUILD:-0}" = "1" ] || ! docker image inspect "${OPENHANDS_IMAGE}" &>/dev/null; then
-    echo "Building custom OpenHands image: ${OPENHANDS_IMAGE}"
-    docker build \
-        -t "${OPENHANDS_IMAGE}" \
-        -f examples/openhands_sdk/workspace/Dockerfile \
-        examples/openhands_sdk/workspace
-fi
+# if [ "${FORCE_BUILD:-0}" = "1" ] || ! docker image inspect "${OPENHANDS_IMAGE}" &>/dev/null; then
+#     echo "Building custom OpenHands image: ${OPENHANDS_IMAGE}"
+#     docker build \
+#         -t "${OPENHANDS_IMAGE}" \
+#         -f examples/openhands_sdk/workspace/Dockerfile \
+#         examples/openhands_sdk/workspace
+# fi
 
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 echo "正在重启 Ray 集群清理 NPU 状态..."
 ray stop --force || true
@@ -115,8 +116,8 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     \
     data.train_batch_size=${BATCH_SIZE} \
     data.val_batch_size=16 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=8192 \
     \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.hybrid_engine=True \
@@ -130,13 +131,16 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=2 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=8 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
     \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -179,8 +183,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     rllm.sdk.proxy.port=${PROXY_PORT} \
     rllm.sdk.proxy.mode=external \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
-    \
-    rllm.sdk.sandbox.enabled=False  \
+    rllm.workflow.n_parallel_tasks=1
 
 
 # pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true
