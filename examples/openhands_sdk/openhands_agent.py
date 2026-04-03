@@ -102,16 +102,21 @@ def _is_npu_operator_task(task: dict[str, Any]) -> bool:
 
 
 def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
-    workspace = tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-")
+    import shutil
+    from pathlib import Path
+    workspace = Path(tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-"))
+    shutil.copytree(Path(__file__).parent / 'workspace', workspace)
+
     instruction = task.get("instruction", "Implement a simple vector_add NPU kernel.")
-    with open(os.path.join(workspace, "INSTRUCTIONS.md"), "w") as f:
+    with open(workspace / "INSTRUCTIONS.md", "w") as f:
         f.write(_NPU_INSTRUCTION_TEMPLATE.format(instruction=instruction))
-    tools_dir = os.path.join(workspace, "tools")
+    
+    tools_dir = Path(workspace)/"tools"
     os.makedirs(tools_dir, exist_ok=True)
-    profiler_path = os.path.join(tools_dir, "profile_wrapper.sh")
-    with open(profiler_path, "w") as f:
-        f.write(_MOCK_PROFILE_SCRIPT)
-    os.chmod(profiler_path, os.stat(profiler_path).st_mode | stat.S_IEXEC)
+    profiler_path = tools_dir/"profile_wrapper.sh"
+    profiler_path.write_text(_MOCK_PROFILE_SCRIPT)
+    profiler_path.chmod(0o0755)
+
     return workspace
 
 
@@ -326,50 +331,25 @@ def _run_openhands_container(
         "--rm",
         "-it",
         "--name", container_name,
-
-        # --- LLM routing ---
-        # proxied_url carries the rllm metadata slug so every LLM call made
-        # by OpenHands SDK (via workspace/entrypoint.py) is attributed to
-        # this training session by the rllm LiteLLM proxy.
         "-e", f"LLM_BASE_URL={proxied_url}",
         "-e", "LLM_API_KEY=EMPTY",
         "-e", f"LLM_MODEL=openai/{_MODEL_NAME}",
         "-e", f"NPU_OPERATOR_TASK={'1' if npu_operator else '0'}",
+        "--add-host", "host.docker.internal:host-gateway",
+        "-e", "http_proxy=", 
+        "-e", "https_proxy=",
+        "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1"
+        "-e", "WORKSPACE_BASE=/opt/workspace",
+        "-v", f"{workspace}:/opt/workspace",
+        # "-v", f"/home/g00841271/rllm-071/examples/openhands_sdk/workspace_debug:/opt/workspace",
+        "--entrypoint", f"/opt/workspace/entrypoint.py",
+        "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
     ]
         
     if npu_operator:
         cmd.extend(["-e", f"TASK_INSTRUCTION=\"{instruction}\""])
-    
-    cmd.extend([
-            "-e", "http_proxy=", 
-            "-e", "https_proxy=",
-            "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1"
-        ])
 
-    cmd.extend(
-        [
-        # --- Workspace ---
-        # The host workspace dir is mounted; the agent operates directly
-        # inside the container — no inner sandbox is created.
-        "-e", "WORKSPACE_BASE=/opt/workspace",
-        # "-v", f"{workspace}:/opt/workspace",
-        "-v", f"/home/g00841271/rllm-071/examples/openhands_sdk/workspace_debug:/opt/workspace",
-        # "--entrypoint", f"/app/rllm_entrypoint.py",
-        "--entrypoint", f"/opt/workspace/entrypoint.py",
-        # --- Agent iterations ---
-        "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
-
-        # --- Network ---
-        # host.docker.internal resolves to the training host so the agent
-        # can reach the LiteLLM proxy.
-        "--add-host", "host.docker.internal:host-gateway",
-
-        # Custom image built from workspace/Dockerfile.
-        # ENTRYPOINT = workspace/entrypoint.py (new OpenHands SDK).
-        # No docker.sock mount needed — no inner sandbox.
-        _OPENHANDS_IMAGE,
-        ]
-    )
+    cmd.extend([_OPENHANDS_IMAGE,])
     
     logger.info(
         "[openhands] Launching container %s (image=%s, proxied_url=%s...)",
@@ -474,7 +454,7 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     # }
     
     
-    # breakpoint()
+    breakpoint()
     
     metadata = _routing_metadata_for_rollout(slug_uids, slug_name)
     trace_label = _trace_label_from_routing_metadata(metadata)

@@ -23,6 +23,7 @@ set -euo pipefail
 set -x
 
 # First time
+export RLLM_UI_URL=http://127.0.0.1:3000
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
 export MODEL_PATH=/home/g00841271/Qwen3-8B
@@ -185,7 +186,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     rllm.sdk.proxy.port=${PROXY_PORT} \
     rllm.sdk.proxy.mode=subprocess \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
-    rllm.workflow.n_parallel_tasks=16
+    rllm.workflow.n_parallel_tasks=1
 
 
 # pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true
