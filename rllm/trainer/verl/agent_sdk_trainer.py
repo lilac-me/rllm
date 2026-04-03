@@ -51,6 +51,7 @@ class AgentSdkTrainer(RayPPOTrainer):
         role_worker_mapping: dict[Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
+        processor=None,
         agent_run_func: Callable = None,
     ):
         """Initialize AgentSdkTrainer.
@@ -61,11 +62,13 @@ class AgentSdkTrainer(RayPPOTrainer):
             role_worker_mapping: Maps roles to worker types for VERL.
             resource_pool_manager: Manages GPU resources across workers.
             ray_worker_group_cls: Ray worker group class (default: RayWorkerGroup).
+            processor: Optional processor for multi-modal (VLM) inputs.
             agent_run_func: Agent workflow function to execute during rollouts.
         """
         super().__init__(
             config=config,
             tokenizer=tokenizer,
+            processor=processor,
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
@@ -136,6 +139,7 @@ class AgentSdkTrainer(RayPPOTrainer):
             config=self.config,
             rollout_manager=self.async_rollout_manager,
             tokenizer=self.tokenizer,
+            processor=self.processor,
         )
 
         # Setup proxy config for VERL engine
@@ -214,6 +218,7 @@ class AgentSdkTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate trajectories
                     final_gen_batch_output = self.generate_trajectories(batch=new_batch, timing_raw=timing_raw)
+                    self.checkpoint_manager.sleep_replicas()
 
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
@@ -250,6 +255,11 @@ class AgentSdkTrainer(RayPPOTrainer):
                             seen_episodes.add(episode_id)
                             episode_unique_idxs.append(i)
                     episode_unique_batch = new_batch.select_idxs(episode_unique_idxs)
+
+                    # Include termination reasons from episodes that were dropped before producing any steps.
+                    dropped_episodes = final_gen_batch_output.meta_info.get("dropped_episodes", [])
+                    for ep in dropped_episodes:
+                        termination_counts.update([ep.get("termination_reason", "unknown")])
 
                     # log metrics returned by workflows
                     for metric_dict in episode_unique_batch.non_tensor_batch["metrics"]:
@@ -320,6 +330,21 @@ class AgentSdkTrainer(RayPPOTrainer):
                         # then we just pad the batch size to a multiple of world size
                         batch = self._pad_dataproto_to_world_size(batch=batch)
 
+                    # Balance the number of valid tokens across DP ranks BEFORE compute_log_prob to prevent
+                    # NCCL desync when workers process micro-batches with uneven token distributions.
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    if "multi_modal_inputs" in batch.non_tensor_batch.keys():
+                        images_seqlens_all = []
+                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                            if "image_grid_thw" not in multi_modal_input.keys():
+                                continue
+                            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                        batch.meta_info["images_seqlens"] = images_seqlens_all
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -333,28 +358,10 @@ class AgentSdkTrainer(RayPPOTrainer):
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
-                            attention_mask = batch.batch["attention_mask"]
-                            responses = batch.batch["responses"]
-                            response_length = responses.size(1)
-                            response_mask = attention_mask[:, -response_length:]
+                            from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            rollout_probs = torch.exp(rollout_old_log_probs)
-                            actor_probs = torch.exp(actor_old_log_probs)
-                            rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
-                            rollout_probs_diff_max = torch.max(rollout_probs_diff)
-                            rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
-                            rollout_probs_diff_std = torch.std(rollout_probs_diff)
-                            metrics.update(
-                                {
-                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
-                                }
-                            )
+                            debug_metrics = calculate_debug_metrics(batch)
+                            metrics.update(debug_metrics)
 
                             # This follows VERL's pattern: compute IS weights from old_log_probs vs rollout_log_probs
                             rollout_corr_config = getattr(self.config.algorithm, "rollout_correction", None)
@@ -438,17 +445,6 @@ class AgentSdkTrainer(RayPPOTrainer):
                     # re-pad batch size to world size for gradient update
                     batch = self._pad_dataproto_to_world_size(batch=batch)
 
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -461,18 +457,18 @@ class AgentSdkTrainer(RayPPOTrainer):
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+
+                        # save checkpoint
+                        if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # validate
-                    if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
-                        with marked_timer("testing", timing_raw, color="green"):
-                            val_metrics: dict = self._validate_agent()
-                        metrics.update(val_metrics)
-
-                    if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
 
                     # Visualize some sample trajectories
                     if batch is not None and len(batch) > 0:
@@ -483,6 +479,12 @@ class AgentSdkTrainer(RayPPOTrainer):
                             sample_indices = np.random.choice(batch_size, size=num_samples, replace=False)
                             for idx in sample_indices:
                                 self.visualize_trajectory_last_step(batch, sample_idx=idx, max_samples=1)
+
+                # validate (outside marked_timer("step") to avoid polluting timing stats)
+                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_metrics: dict = self._validate_agent()
+                    metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
                     self._stop_profiling(do_profile)
@@ -508,8 +510,10 @@ class AgentSdkTrainer(RayPPOTrainer):
                 for key, value in workflow_metrics.items():
                     metrics[f"batch/{key}"] = np.mean(value)
 
+                # Denominator should be the number of attempted tasks (including those dropped before 1st step),
+                # otherwise metrics are biased/inflated. Use max(1, ...) to guard against divide-by-zero.
                 for r in TerminationReason:
-                    metrics[f"batch/{r.value}"] = termination_counts[r.value] / len(set(new_batch.non_tensor_batch["episode_ids"]))
+                    metrics[f"batch/{r.value}"] = termination_counts[r.value] / max(1, num_tasks)
 
                 metrics["batch/num_tasks"] = num_tasks
 
@@ -534,6 +538,12 @@ class AgentSdkTrainer(RayPPOTrainer):
                         val_metrics = self._validate_agent()
                         pprint(f"Final validation metrics: {val_metrics}")
                         logger.log(data=val_metrics, step=self.global_steps)
+
+                    try:
+                        logger.finish()
+                    except Exception:
+                        pass  # skip errors during cleanup
+
                     return
 
     def _validate_agent(self):
@@ -552,7 +562,24 @@ class AgentSdkTrainer(RayPPOTrainer):
 
             test_batch.meta_info = {"validate": True}
 
+            # Keep a mapping from task_id -> data_source so we can account for dropped episodes.
+            base_data_sources = test_batch.non_tensor_batch.get("data_source", None)
+            if base_data_sources is None:
+                base_data_sources = ["unknown"] * len(test_batch)
+            task_to_source = dict(zip(test_batch.non_tensor_batch["task_ids"].tolist(), base_data_sources, strict=False))
+
             test_output_gen_batch = self.generate_trajectories(batch=test_batch)
+
+            # Account for dropped episodes in validation metrics to avoid inflated pass@k.
+            dropped_episodes = test_output_gen_batch.meta_info.get("dropped_episodes", [])
+            for ep in dropped_episodes:
+                uid = ep.get("task_id")
+                if uid is None:
+                    continue
+                is_correct_lst.append(False)
+                uid_lst.append(uid)
+                data_source_lst.append(task_to_source.get(uid, "unknown"))
+
             repeat_counts = test_output_gen_batch.meta_info["repeat_counts"]
             # need to repeat to make shape match
             test_batch = test_batch.sample_level_repeat(repeat_counts)
