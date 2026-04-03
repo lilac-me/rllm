@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>rllm Training Dashboard</title>
+  <meta name="description" content="Real-time monitoring dashboard for rllm SDK training — traces, datasets, episodes, sampling metrics, and PPO training curves." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    /* ============================================================
+       DESIGN TOKENS
+    ============================================================ */
+    :root {
+      --bg-base:      #09090b;
+      --bg-panel:     #111113;
+      --bg-card:      #18181b;
+      --bg-hover:     #1e1e22;
+      --bg-input:     #0f0f12;
+      --border:       rgba(255,255,255,.07);
+      --border-hi:    rgba(255,255,255,.14);
+
+      --accent:       #6366f1;   /* indigo */
+      --accent-lit:   #818cf8;
+      --accent2:      #22d3ee;   /* cyan */
+      --accent3:      #a78bfa;   /* violet */
+      --green:        #34d399;
+      --amber:        #fbbf24;
+      --red:          #f87171;
+      --muted:        #71717a;
+
+      --text-primary:   #fafafa;
+      --text-secondary: #a1a1aa;
+      --text-muted:     #52525b;
+
+      --radius:   10px;
+      --radius-lg:16px;
+      --shadow:   0 4px 24px rgba(0,0,0,.45);
+      --font:     'Inter', system-ui, sans-serif;
+      --mono:     'JetBrains Mono', monospace;
+    }
+
+    /* ============================================================
+       RESET & BASE
+    ============================================================ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { font-size: 14px; scroll-behavior: smooth; }
+    body {
+      font-family: var(--font);
+      background: var(--bg-base);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    a { color: var(--accent-lit); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { cursor: pointer; font-family: var(--font); }
+
+    /* ============================================================
+       LAYOUT
+    ============================================================ */
+    .layout { display: flex; height: 100vh; overflow: hidden; }
+
+    /* SIDEBAR */
+    .sidebar {
+      width: 230px;
+      flex-shrink: 0;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 0;
+      overflow-y: auto;
+    }
+    .sidebar-logo {
+      padding: 20px 18px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-logo .logo-icon {
+      width: 30px; height: 30px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .sidebar-logo .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; }
+    .sidebar-logo .sub { font-size: 10px; color: var(--muted); margin-top: 1px; }
+
+    .nav-section { padding: 12px 10px 4px; }
+    .nav-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); padding: 0 8px 6px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 9px;
+      padding: 8px 10px; border-radius: var(--radius);
+      color: var(--text-secondary);
+      font-size: 13px; font-weight: 500;
+      cursor: pointer;
+      transition: all .15s;
+      border: none; background: none; width: 100%; text-align: left;
+    }
+    .nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+    .nav-item.active { background: rgba(99,102,241,.18); color: var(--accent-lit); }
+    .nav-item .icon { width: 16px; text-align: center; font-size: 15px; }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 12px 14px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .status-dot {
+      display: inline-block; width: 7px; height: 7px;
+      border-radius: 50%; background: var(--green);
+      margin-right: 5px;
+      animation: pulse-dot 2s infinite;
+    }
+    @keyframes pulse-dot {
+      0%,100% { opacity: 1; } 50% { opacity: .4; }
+    }
+
+    /* MAIN CONTENT */
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .topbar {
+      position: sticky; top: 0; z-index: 10;
+      background: rgba(9,9,11,.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 52px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .topbar-title { font-size: 15px; font-weight: 600; }
+    .topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+    .content { padding: 24px; flex: 1; }
+
+    /* PAGES */
+    .page { display: none; }
+    .page.active { display: block; }
+
+    /* ============================================================
+       COMPONENTS
+    ============================================================ */
+
+    /* Stat cards */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 16px 18px;
+      position: relative; overflow: hidden;
+      transition: border-color .2s, transform .2s;
+    }
+    .stat-card:hover { border-color: var(--border-hi); transform: translateY(-1px); }
+    .stat-card::before {
+      content:''; position:absolute; top:0; left:0; right:0; height:2px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+    }
+    .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 8px; }
+    .stat-value { font-size: 26px; font-weight: 700; line-height: 1; }
+    .stat-sub { font-size: 11px; color: var(--text-secondary); margin-top: 5px; }
+
+    /* Card */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 18px 20px;
+      margin-bottom: 18px;
+    }
+    .card-title {
+      font-size: 13px; font-weight: 600;
+      margin-bottom: 14px;
+      display: flex; align-items: center; gap: 8px;
+      color: var(--text-primary);
+    }
+    .card-title .badge {
+      font-size: 10px; font-weight: 600;
+      background: rgba(99,102,241,.2);
+      color: var(--accent-lit);
+      border-radius: 4px; padding: 2px 6px;
+    }
+
+    /* Two-column layout */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; }
+    @media (max-width: 900px) {
+      .two-col, .three-col { grid-template-columns: 1fr; }
+    }
+
+    /* Chart wrapper */
+    .chart-wrap { position: relative; height: 200px; }
+    .chart-wrap-tall { position: relative; height: 280px; }
+
+    /* Table */
+    .tbl-wrap { overflow-x: auto; }
+    table {
+      width: 100%; border-collapse: collapse;
+      font-size: 12.5px;
+    }
+    thead th {
+      background: var(--bg-panel);
+      color: var(--text-secondary);
+      font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: .6px;
+      padding: 9px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+    tbody tr:hover { background: var(--bg-hover); cursor: pointer; }
+    tbody td { padding: 9px 12px; color: var(--text-secondary); vertical-align: middle; }
+    tbody td:first-child { color: var(--text-primary); font-weight: 500; }
+    .mono { font-family: var(--mono); font-size: 11.5px; }
+
+    /* Badge chips */
+    .chip {
+      display: inline-block;
+      padding: 2px 8px; border-radius: 20px;
+      font-size: 11px; font-weight: 600;
+      background: rgba(255,255,255,.07);
+    }
+    .chip-green { background: rgba(52,211,153,.15); color: var(--green); }
+    .chip-amber { background: rgba(251,191,36,.15); color: var(--amber); }
+    .chip-red   { background: rgba(248,113,113,.15); color: var(--red); }
+    .chip-blue  { background: rgba(99,102,241,.2);   color: var(--accent-lit); }
+    .chip-cyan  { background: rgba(34,211,238,.15);  color: var(--accent2); }
+
+    /* Inputs */
+    .form-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+    input[type=text], input[type=number], select {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text-primary);
+      padding: 7px 11px;
+      font-size: 12.5px;
+      font-family: var(--font);
+      outline: none;
+      transition: border-color .15s;
+      min-width: 140px;
+    }
+    input[type=text]:focus, input[type=number]:focus, select:focus {
+      border-color: var(--accent);
+    }
+    .btn {
+      padding: 7px 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-size: 12.5px; font-weight: 500;
+      transition: all .15s;
+    }
+    .btn:hover { background: var(--bg-hover); border-color: var(--border-hi); }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--accent-lit); border-color: var(--accent-lit); }
+
+    /* Pagination */
+    .pagination { display: flex; gap: 6px; align-items: center; justify-content: flex-end; margin-top: 14px; }
+
+    /* Empty state */
+    .empty {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--text-muted);
+    }
+    .empty .icon { font-size: 40px; margin-bottom: 12px; }
+    .empty p { font-size: 13px; }
+
+    /* ============================================================
+       TRACE DETAIL (chat bubbles)
+    ============================================================ */
+    .session-detail-header {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 20px;
+    }
+    .back-btn {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 20px; padding: 5px 12px;
+      font-size: 12px; color: var(--text-secondary);
+      cursor: pointer; transition: all .15s;
+    }
+    .back-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .step-card {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); margin-bottom: 14px;
+      overflow: hidden;
+    }
+    .step-header {
+      padding: 10px 16px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+      font-size: 12px; color: var(--text-secondary);
+    }
+    .step-header strong { color: var(--text-primary); }
+    .step-body { padding: 14px 16px; }
+
+    .bubble-wrap { margin-bottom: 12px; }
+    .bubble {
+      border-radius: 10px; padding: 10px 13px;
+      font-size: 12.5px; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word;
+      max-width: 90%;
+    }
+    .bubble-user { background: rgba(99,102,241,.15); border: 1px solid rgba(99,102,241,.25); margin-right: auto; }
+    .bubble-assistant { background: rgba(34,211,238,.09); border: 1px solid rgba(34,211,238,.18); margin-left: auto; }
+    .bubble-system { background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.15); font-size: 11.5px; color: var(--text-secondary); margin-right: auto; }
+    .bubble-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 4px; }
+
+    .reasoning-toggle { font-size: 11px; color: var(--accent-lit); cursor: pointer; margin-top: 6px; user-select: none; }
+    .reasoning-content { display: none; margin-top: 8px; background: rgba(161,161,170,.07); border-radius: 6px; padding: 8px 10px; font-size: 11.5px; color: var(--text-secondary); white-space: pre-wrap; }
+    .reasoning-content.open { display: block; }
+
+    /* ============================================================
+       DATASET BROWSER
+    ============================================================ */
+    .ds-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+    .ds-card {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 16px 18px;
+      cursor: pointer; transition: all .15s;
+    }
+    .ds-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(99,102,241,.15); }
+    .ds-card-name { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+    .ds-card-meta { font-size: 11.5px; color: var(--text-secondary); }
+
+    .field-bar-wrap { margin-bottom: 6px; }
+    .field-bar-label { font-size: 11px; color: var(--text-secondary); margin-bottom: 2px; }
+    .field-bar { height: 5px; background: var(--bg-panel); border-radius: 3px; overflow: hidden; }
+    .field-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 3px; }
+
+    /* ============================================================
+       TRAINING METRICS (View 5)
+    ============================================================ */
+    .metrics-banner {
+      background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.2);
+      border-radius: var(--radius); padding: 12px 16px;
+      font-size: 12px; color: var(--amber);
+      margin-bottom: 18px;
+    }
+
+    /* ============================================================
+       Scrollbar
+    ============================================================ */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 3px; }
+
+    /* ============================================================
+       Loader spinner
+    ============================================================ */
+    .spinner {
+      display: inline-block; width: 16px; height: 16px;
+      border: 2px solid var(--border-hi); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Toast */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 16px;
+      font-size: 12.5px; color: var(--text-primary);
+      box-shadow: var(--shadow);
+      opacity: 0; pointer-events: none;
+      transition: opacity .3s;
+      z-index: 9999;
+    }
+    #toast.show { opacity: 1; pointer-events: auto; }
+  </style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ── SIDEBAR ── -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-icon">🧠</div>
+      <div>
+        <div class="brand">rllm</div>
+        <div class="sub">Training Dashboard</div>
+      </div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Overview</div>
+      <button class="nav-item active" onclick="nav('overview')" id="nav-overview">
+        <span class="icon">📊</span> Overview
+      </button>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Data</div>
+      <button class="nav-item" onclick="nav('traces')" id="nav-traces">
+        <span class="icon">🔍</span> Traces
+      </button>
+      <button class="nav-item" onclick="nav('datasets')" id="nav-datasets">
+        <span class="icon">🗂️</span> Datasets
+      </button>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Training</div>
+      <button class="nav-item" onclick="nav('episodes')" id="nav-episodes">
+        <span class="icon">🎲</span> Episodes
+      </button>
+      <button class="nav-item" onclick="nav('sampling')" id="nav-sampling">
+        <span class="icon">⚡</span> Sampling
+      </button>
+      <button class="nav-item" onclick="nav('metrics')" id="nav-metrics">
+        <span class="icon">📈</span> PPO Metrics
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">Connecting…</span>
+    </div>
+  </aside>
+
+  <!-- ── MAIN ── -->
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-title" id="page-title">Overview</div>
+      <div class="topbar-actions">
+        <span id="last-refresh" style="font-size:11px;color:var(--muted)"></span>
+        <button class="btn" onclick="refreshCurrent()" title="Refresh">↺ Refresh</button>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- ══════════════════════════════════════════
+           PAGE: OVERVIEW
+      ══════════════════════════════════════════ -->
+      <div class="page active" id="page-overview">
+        <div class="stats-grid" id="stats-grid">
+          <div class="stat-card"><div class="stat-label">Total Traces</div><div class="stat-value" id="stat-total">—</div></div>
+          <div class="stat-card"><div class="stat-label">Avg Prompt Tokens</div><div class="stat-value" id="stat-pt">—</div></div>
+          <div class="stat-card"><div class="stat-label">Avg Completion Tokens</div><div class="stat-value" id="stat-ct">—</div></div>
+          <div class="stat-card"><div class="stat-label">Latest Trace</div><div class="stat-value" id="stat-latest" style="font-size:16px">—</div></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title">Finish Reason Distribution</div>
+            <div class="chart-wrap"><canvas id="chart-finish-reason"></canvas></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Traces by Namespace</div>
+            <div class="chart-wrap"><canvas id="chart-namespace"></canvas></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════
+           PAGE: TRACES
+      ══════════════════════════════════════════ -->
+      <div class="page" id="page-traces">
+        <div id="traces-list-view">
+          <div class="form-row">
+            <input type="text" id="filter-namespace" placeholder="Namespace…" />
+            <input type="text" id="filter-session" placeholder="Session name…" />
+            <select id="filter-since">
+              <option value="0">All time</option>
+              <option value="3600">Last 1h</option>
+              <option value="21600">Last 6h</option>
+              <option value="86400">Last 24h</option>
+            </select>
+            <button class="btn btn-primary" onclick="loadTraces(0)">🔍 Search</button>
+          </div>
+          <div class="card" style="padding:0">
+            <div class="tbl-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Session Name</th>
+                    <th>Model</th>
+                    <th>Namespace</th>
+                    <th>Prompt Tkns</th>
+                    <th>Completion Tkns</th>
+                    <th>Latency</th>
+                    <th>Finish</th>
+                    <th>Time</th>
+                  </tr>
+                </thead>
+                <tbody id="traces-tbody">
+                  <tr><td colspan="8" style="text-align:center;padding:32px;color:var(--muted)"><span class="spinner"></span> Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="pagination" id="traces-pagination"></div>
+        </div>
+
+        <!-- Session detail -->
+        <div id="session-detail-view" style="display:none">
+          <div class="session-detail-header">
+            <button class="back-btn" onclick="showTracesList()">← Back to list</button>
+            <h2 style="font-size:15px;font-weight:600" id="session-detail-title">Session</h2>
+          </div>
+          <div id="session-steps"></div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════
+           PAGE: DATASETS
+      ══════════════════════════════════════════ -->
+      <div class="page" id="page-datasets">
+        <div id="ds-list-view">
+          <div class="ds-list" id="ds-list"></div>
+        </div>
+        <div id="ds-detail-view" style="display:none">
+          <div class="session-detail-header">
+            <button class="back-btn" onclick="showDsList()">← Back</button>
+            <h2 style="font-size:15px;font-weight:600" id="ds-detail-title">Dataset</h2>
+          </div>
+          <div class="form-row" style="margin-bottom:12px">
+            <select id="ds-split-select" onchange="loadDsSplit()"></select>
+            <input type="text" id="ds-search" placeholder="Search…" />
+            <button class="btn btn-primary" onclick="loadDsSplit()">🔍 Filter</button>
+          </div>
+          <div class="two-col" style="margin-bottom:18px">
+            <div class="card" id="ds-field-stats"></div>
+            <div class="card">
+              <div class="card-title">Field Types</div>
+              <div class="chart-wrap"><canvas id="chart-ds-fields"></canvas></div>
+            </div>
+          </div>
+          <div class="card" style="padding:0">
+            <div class="tbl-wrap">
+              <table>
+                <thead id="ds-table-head"></thead>
+                <tbody id="ds-table-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="pagination" id="ds-pagination"></div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════
+           PAGE: EPISODES
+      ══════════════════════════════════════════ -->
+      <div class="page" id="page-episodes">
+        <div class="form-row">
+          <select id="ep-since">
+            <option value="0">All time</option>
+            <option value="3600">Last 1h</option>
+            <option value="21600">Last 6h</option>
+            <option value="86400" selected>Last 24h</option>
+          </select>
+          <button class="btn btn-primary" onclick="loadEpisodes()">↺ Refresh</button>
+        </div>
+
+        <div class="stats-grid" id="ep-stats-grid"></div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title">Finish Reason Distribution (Global)</div>
+            <div class="chart-wrap"><canvas id="chart-ep-finish"></canvas></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Steps per Task (Top 20)</div>
+            <div class="chart-wrap-tall"><canvas id="chart-ep-steps"></canvas></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Episode Table <span class="badge" id="ep-badge">0</span></div>
+          <div class="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Task ID</th>
+                  <th>Steps</th>
+                  <th>Avg Completion Tkns</th>
+                  <th>Max Completion Tkns</th>
+                  <th>Finish Reasons</th>
+                  <th>Last Seen</th>
+                </tr>
+              </thead>
+              <tbody id="ep-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════
+           PAGE: SAMPLING
+      ══════════════════════════════════════════ -->
+      <div class="page" id="page-sampling">
+        <div class="form-row">
+          <select id="samp-since">
+            <option value="0">All time</option>
+            <option value="3600">Last 1h</option>
+            <option value="21600" selected>Last 6h</option>
+            <option value="86400">Last 24h</option>
+          </select>
+          <input type="number" id="samp-limit" value="500" min="50" max="5000" style="width:90px" />
+          <button class="btn btn-primary" onclick="loadSampling()">↺ Refresh</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Request Latency Timeline (ms)</div>
+          <div class="chart-wrap-tall"><canvas id="chart-latency"></canvas></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title">Completion Token Distribution</div>
+            <div class="chart-wrap"><canvas id="chart-ct-hist"></canvas></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Prompt Token Distribution</div>
+            <div class="chart-wrap"><canvas id="chart-pt-hist"></canvas></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════
+           PAGE: PPO METRICS
+      ══════════════════════════════════════════ -->
+      <div class="page" id="page-metrics">
+        <div class="metrics-banner" id="metrics-banner" style="display:none">
+          ⚠️ No metrics found. Send metrics to <code style="font-family:var(--mono)">POST /api/metrics</code>
+          from your trainer, or enable <code style="font-family:var(--mono)">~/.rllm/metrics.jsonl</code> writing.
+        </div>
+
+        <div class="card">
+          <div class="card-title">Actor Entropy</div>
+          <div class="chart-wrap-tall"><canvas id="chart-entropy"></canvas></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title">Solve Distribution (none / partial / all)</div>
+            <div class="chart-wrap"><canvas id="chart-solve"></canvas></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Validation pass@1 by source</div>
+            <div class="chart-wrap-tall"><canvas id="chart-val"></canvas></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Termination Reasons over Steps</div>
+          <div class="chart-wrap-tall"><canvas id="chart-termination"></canvas></div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<div id="toast"></div>
+
+<script>
+/* ============================================================
+   UTILS
+============================================================ */
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function fmtNum(n) {
+  if (n === null || n === undefined) return '—';
+  return Number(n).toLocaleString();
+}
+function fmtMs(ms) {
+  if (!ms) return '—';
+  return ms < 1000 ? ms.toFixed(0)+'ms' : (ms/1000).toFixed(2)+'s';
+}
+function finishChip(fr) {
+  if (!fr) return '<span class="chip">—</span>';
+  const map = {stop:'chip-green', length:'chip-amber', error:'chip-red', timeout:'chip-red'};
+  const cls = map[fr] || 'chip-blue';
+  return `<span class="chip ${cls}">${fr}</span>`;
+}
+
+function toast(msg, dur=2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), dur);
+}
+
+async function apiFetch(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  } catch (e) {
+    toast('❌ ' + e.message);
+    throw e;
+  }
+}
+
+const PALETTE = ['#6366f1','#22d3ee','#a78bfa','#34d399','#fbbf24','#f87171','#60a5fa','#fb923c','#e879f9','#94a3b8'];
+const chartDefaults = {
+  color: '#a1a1aa',
+  borderColor: 'rgba(255,255,255,.07)',
+  plugins: {
+    legend: { labels: { color: '#a1a1aa', boxWidth: 11, font: {size:11} } },
+    tooltip: { backgroundColor: '#18181b', borderColor: 'rgba(255,255,255,.1)', borderWidth:1, titleColor:'#fafafa', bodyColor:'#a1a1aa' },
+  },
+  scales: {
+    x: { ticks:{ color:'#71717a', font:{size:10} }, grid:{ color:'rgba(255,255,255,.04)' } },
+    y: { ticks:{ color:'#71717a', font:{size:10} }, grid:{ color:'rgba(255,255,255,.06)' } },
+  },
+};
+Chart.defaults.color = '#a1a1aa';
+
+function makeChart(id, cfg) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const existing = Chart.getChart(el);
+  if (existing) existing.destroy();
+  return new Chart(el, cfg);
+}
+
+/* ============================================================
+   NAV
+============================================================ */
+const pages = ['overview','traces','datasets','episodes','sampling','metrics'];
+const pageTitles = {
+  overview:'Overview', traces:'Traces', datasets:'Datasets',
+  episodes:'Episodes', sampling:'Sampling', metrics:'PPO Metrics'
+};
+let currentPage = 'overview';
+
+function nav(page) {
+  currentPage = page;
+  pages.forEach(p => {
+    document.getElementById('page-'+p)?.classList.toggle('active', p===page);
+    document.getElementById('nav-'+p)?.classList.toggle('active', p===page);
+  });
+  document.getElementById('page-title').textContent = pageTitles[page] || page;
+  refreshCurrent();
+}
+
+function refreshCurrent() {
+  document.getElementById('last-refresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+  const fn = {
+    overview: loadOverview,
+    traces: loadTraces,
+    datasets: loadDatasets,
+    episodes: loadEpisodes,
+    sampling: loadSampling,
+    metrics: loadMetrics,
+  }[currentPage];
+  if (fn) fn(0);
+}
+
+/* ============================================================
+   STATUS PING
+============================================================ */
+async function checkStatus() {
+  try {
+    const data = await apiFetch('/api/stats');
+    const dot = document.getElementById('status-dot');
+    const txt = document.getElementById('status-text');
+    if (data.db_exists) {
+      dot.style.background = 'var(--green)';
+      txt.textContent = `DB: ${fmtNum(data.total_traces)} traces`;
+    } else {
+      dot.style.background = 'var(--amber)';
+      txt.textContent = 'DB not found';
+    }
+  } catch {
+    document.getElementById('status-dot').style.background = 'var(--red)';
+    document.getElementById('status-text').textContent = 'Offline';
+  }
+}
+
+/* ============================================================
+   OVERVIEW
+============================================================ */
+let chartFinishReason = null, chartNamespace = null;
+
+async function loadOverview() {
+  const data = await apiFetch('/api/stats');
+  if (!data.db_exists) {
+    document.getElementById('stat-total').textContent = 'No DB';
+    return;
+  }
+
+  document.getElementById('stat-total').textContent = fmtNum(data.total_traces);
+  document.getElementById('stat-pt').textContent = fmtNum(data.avg_prompt_tokens);
+  document.getElementById('stat-ct').textContent = fmtNum(data.avg_completion_tokens);
+  document.getElementById('stat-latest').textContent = fmtTime(data.latest_ts);
+
+  // Finish reason doughnut
+  const frLabels = Object.keys(data.finish_reasons || {});
+  const frValues = frLabels.map(k => data.finish_reasons[k]);
+  chartFinishReason = makeChart('chart-finish-reason', {
+    type: 'doughnut',
+    data: { labels: frLabels, datasets: [{ data: frValues, backgroundColor: PALETTE, borderWidth: 0 }] },
+    options: { ...chartDefaults, cutout: '65%', plugins: { ...chartDefaults.plugins } },
+  });
+
+  // Namespace bar
+  const nsData = (data.namespaces || []).slice(0, 10);
+  chartNamespace = makeChart('chart-namespace', {
+    type: 'bar',
+    data: {
+      labels: nsData.map(n => n.namespace),
+      datasets: [{ label: 'Traces', data: nsData.map(n => n.count), backgroundColor: PALETTE[0], borderRadius: 5 }]
+    },
+    options: { ...chartDefaults, indexAxis: 'y', plugins: { legend: { display: false }, tooltip: chartDefaults.plugins.tooltip } },
+  });
+}
+
+/* ============================================================
+   TRACES
+============================================================ */
+let tracesOffset = 0, tracesTotal = 0;
+const TRACES_PER_PAGE = 50;
+
+async function loadTraces(offset = 0) {
+  tracesOffset = offset;
+  const ns = document.getElementById('filter-namespace')?.value || '';
+  const sn = document.getElementById('filter-session')?.value || '';
+  const sinceVal = document.getElementById('filter-since')?.value || '0';
+  const since = sinceVal === '0' ? 0 : (Date.now()/1000 - parseInt(sinceVal));
+
+  const url = `/api/traces?namespace=${encodeURIComponent(ns)}&session_name=${encodeURIComponent(sn)}&since=${since}&limit=${TRACES_PER_PAGE}&offset=${offset}`;
+  const data = await apiFetch(url);
+  tracesTotal = data.total || 0;
+
+  const tbody = document.getElementById('traces-tbody');
+  if (!data.traces?.length) {
+    tbody.innerHTML = `<tr><td colspan="8"><div class="empty"><div class="icon">🔍</div><p>No traces found</p></div></td></tr>`;
+    document.getElementById('traces-pagination').innerHTML = '';
+    return;
+  }
+
+  tbody.innerHTML = data.traces.map(t => `
+    <tr onclick="loadSessionDetail('${escapeHtml(t.session_name || t.id)}')">
+      <td class="mono">${escapeHtml(t.session_name || '—')}</td>
+      <td>${escapeHtml(t.model || '—')}</td>
+      <td><span class="chip chip-blue">${escapeHtml(t.namespace || '—')}</span></td>
+      <td>${fmtNum(t.prompt_tokens)}</td>
+      <td>${fmtNum(t.completion_tokens)}</td>
+      <td>${fmtMs(t.latency_ms)}</td>
+      <td>${finishChip(t.finish_reason)}</td>
+      <td style="white-space:nowrap">${fmtTime(t.created_at)}</td>
+    </tr>
+  `).join('');
+
+  // Pagination
+  const totalPages = Math.ceil(tracesTotal / TRACES_PER_PAGE);
+  const currentPage = Math.floor(offset / TRACES_PER_PAGE);
+  renderPagination('traces-pagination', currentPage, totalPages, p => loadTraces(p * TRACES_PER_PAGE));
+}
+
+function renderPagination(containerId, current, total, onPage) {
+  const el = document.getElementById(containerId);
+  if (total <= 1) { el.innerHTML = ''; return; }
+  let html = '';
+  const start = Math.max(0, current - 2);
+  const end = Math.min(total - 1, current + 2);
+  if (start > 0) html += `<button class="btn" onclick="(${onPage.toString()})(0)">1</button><span style="color:var(--muted)">…</span>`;
+  for (let i = start; i <= end; i++) {
+    html += `<button class="btn ${i===current?'btn-primary':''}" onclick="(${onPage.toString()})(${i})">${i+1}</button>`;
+  }
+  if (end < total - 1) html += `<span style="color:var(--muted)">…</span><button class="btn" onclick="(${onPage.toString()})(${total-1})">${total}</button>`;
+  el.innerHTML = html;
+}
+
+function showTracesList() {
+  document.getElementById('traces-list-view').style.display = '';
+  document.getElementById('session-detail-view').style.display = 'none';
+}
+
+async function loadSessionDetail(sessionName) {
+  document.getElementById('traces-list-view').style.display = 'none';
+  const dv = document.getElementById('session-detail-view');
+  dv.style.display = '';
+  document.getElementById('session-detail-title').textContent = sessionName;
+  document.getElementById('session-steps').innerHTML = '<div style="text-align:center;padding:32px"><span class="spinner"></span></div>';
+
+  const data = await apiFetch(`/api/traces/session/${encodeURIComponent(sessionName)}`);
+  const steps = data.steps || [];
+
+  if (!steps.length) {
+    document.getElementById('session-steps').innerHTML = '<div class="empty"><div class="icon">📭</div><p>No steps found</p></div>';
+    return;
+  }
+
+  document.getElementById('session-steps').innerHTML = steps.map((s, idx) => {
+    const msgs = (s.input_messages || []).map(m => {
+      const role = m.role || 'user';
+      const cls = role === 'assistant' ? 'bubble-assistant' : role === 'system' ? 'bubble-system' : 'bubble-user';
+      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2);
+      return `<div class="bubble-wrap"><div class="bubble-label">${role}</div><div class="bubble ${cls}">${escapeHtml(content)}</div></div>`;
+    }).join('');
+
+    const reasoning = s.output_reasoning
+      ? `<div class="reasoning-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ Reasoning (click to expand)</div>
+         <div class="reasoning-content">${escapeHtml(s.output_reasoning)}</div>`
+      : '';
+
+    return `<div class="step-card">
+      <div class="step-header">
+        <strong>Step ${idx + 1}</strong>
+        <span>${finishChip(s.finish_reason)}</span>
+        <span style="margin-left:auto">⏱ ${fmtMs(s.latency_ms)}</span>
+        <span>📝 ${fmtNum(s.tokens?.prompt)} / ${fmtNum(s.tokens?.completion)} tkns</span>
+        <span style="color:var(--muted)">${fmtTime(s.created_at)}</span>
+      </div>
+      <div class="step-body">
+        ${msgs}
+        ${s.output_content ? `<div class="bubble-wrap"><div class="bubble-label">assistant</div><div class="bubble bubble-assistant">${escapeHtml(s.output_content)}</div>${reasoning}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ============================================================
+   DATASETS
+============================================================ */
+let currentDs = null, currentDsSplit = null, dsOffset = 0;
+
+async function loadDatasets() {
+  const data = await apiFetch('/api/datasets');
+  const list = document.getElementById('ds-list');
+  const datasets = data.datasets || [];
+
+  if (!datasets.length) {
+    list.innerHTML = '<div class="empty"><div class="icon">🗂️</div><p>No datasets registered</p></div>';
+    return;
+  }
+
+  list.innerHTML = datasets.map(ds => {
+    const splits = Object.entries(ds.splits || {}).map(([k, v]) => `${k}: ${fmtNum(v.num_examples)}`).join(', ');
+    return `<div class="ds-card" onclick="openDs('${escapeHtml(ds.name)}', ${JSON.stringify(ds).replace(/"/g,'&quot;')})">
+      <div class="ds-card-name">📦 ${escapeHtml(ds.name)}</div>
+      <div class="ds-card-meta" style="margin-bottom:6px">${escapeHtml(ds.metadata?.category || '')} — ${escapeHtml(ds.metadata?.source || '')}</div>
+      <div class="ds-card-meta">${splits}</div>
+    </div>`;
+  }).join('');
+}
+
+function openDs(name, dsObj) {
+  currentDs = name;
+  document.getElementById('ds-list-view').style.display = 'none';
+  document.getElementById('ds-detail-view').style.display = '';
+  document.getElementById('ds-detail-title').textContent = name;
+
+  const splitSel = document.getElementById('ds-split-select');
+  splitSel.innerHTML = Object.keys(dsObj.splits || {}).map(s => `<option value="${s}">${s}</option>`).join('');
+  currentDsSplit = splitSel.value;
+  loadDsSplit(0);
+}
+
+function showDsList() {
+  document.getElementById('ds-list-view').style.display = '';
+  document.getElementById('ds-detail-view').style.display = 'none';
+}
+
+async function loadDsSplit(offset = 0) {
+  dsOffset = offset;
+  currentDsSplit = document.getElementById('ds-split-select').value;
+  const search = document.getElementById('ds-search').value;
+  const url = `/api/datasets/${encodeURIComponent(currentDs)}/${encodeURIComponent(currentDsSplit)}?offset=${offset}&limit=20&search=${encodeURIComponent(search)}`;
+
+  const data = await apiFetch(url);
+  const fields = data.fields || [];
+  const rows = data.rows || [];
+
+  // Field stats card
+  const statsEl = document.getElementById('ds-field-stats');
+  statsEl.innerHTML = `<div class="card-title">Field Statistics</div>` + fields.map(f => {
+    const s = data.field_stats?.[f] || {};
+    const pct = Math.round((s.non_null_rate || 0) * 100);
+    return `<div class="field-bar-wrap">
+      <div class="field-bar-label"><b>${escapeHtml(f)}</b> <span style="color:var(--muted);float:right">${s.dtype || ''} · ${pct}% filled${s.mean_len ? ` · avg ${s.mean_len} chars` : ''}</span></div>
+      <div class="field-bar"><div class="field-bar-fill" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join('');
+
+  // Field type donut
+  const dtypes = {};
+  fields.forEach(f => {
+    const dt = data.field_stats?.[f]?.dtype || 'unknown';
+    dtypes[dt] = (dtypes[dt] || 0) + 1;
+  });
+  makeChart('chart-ds-fields', {
+    type: 'doughnut',
+    data: { labels: Object.keys(dtypes), datasets: [{ data: Object.values(dtypes), backgroundColor: PALETTE, borderWidth: 0 }] },
+    options: { ...chartDefaults, cutout: '55%' },
+  });
+
+  // Table header
+  document.getElementById('ds-table-head').innerHTML = `<tr>${fields.map(f => `<th>${escapeHtml(f)}</th>`).join('')}</tr>`;
+
+  // Table rows
+  document.getElementById('ds-table-body').innerHTML = rows.map(row =>
+    `<tr>${fields.map(f => {
+      const v = row[f];
+      const str = v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      return `<td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(str)}">${escapeHtml(str.slice(0, 120))}</td>`;
+    }).join('')}</tr>`
+  ).join('');
+
+  const totalPages = Math.ceil(data.total / 20);
+  const curPage = Math.floor(offset / 20);
+  renderPagination('ds-pagination', curPage, totalPages, p => loadDsSplit(p * 20));
+}
+
+/* ============================================================
+   EPISODES
+============================================================ */
+let chartEpFinish = null, chartEpSteps = null;
+
+async function loadEpisodes() {
+  const sinceVal = document.getElementById('ep-since')?.value || '0';
+  const since = sinceVal === '0' ? 0 : (Date.now()/1000 - parseInt(sinceVal));
+  const data = await apiFetch(`/api/episodes?since=${since}`);
+
+  const global = data.global || {};
+  const episodes = data.episodes || [];
+
+  // Stats
+  document.getElementById('ep-stats-grid').innerHTML = `
+    <div class="stat-card"><div class="stat-label">Total Tasks</div><div class="stat-value">${fmtNum(global.total_tasks)}</div></div>
+    <div class="stat-card"><div class="stat-label">Total Steps</div><div class="stat-value">${fmtNum(global.total_steps)}</div></div>
+  `;
+  document.getElementById('ep-badge').textContent = episodes.length;
+
+  // Finish reason global
+  const frDist = global.finish_reason_dist || {};
+  chartEpFinish = makeChart('chart-ep-finish', {
+    type: 'doughnut',
+    data: { labels: Object.keys(frDist), datasets: [{ data: Object.values(frDist), backgroundColor: PALETTE, borderWidth: 0 }] },
+    options: { ...chartDefaults, cutout: '60%' },
+  });
+
+  // Steps per task bar (top 20)
+  const top20 = episodes.slice(0, 20);
+  chartEpSteps = makeChart('chart-ep-steps', {
+    type: 'bar',
+    data: {
+      labels: top20.map(e => e.task_id.slice(0, 18)),
+      datasets: [{ label: 'Steps', data: top20.map(e => e.step_count), backgroundColor: PALETTE[0], borderRadius: 4 }]
+    },
+    options: { ...chartDefaults, indexAxis: 'y', plugins: { legend: { display: false }, tooltip: chartDefaults.plugins.tooltip } },
+  });
+
+  // Table
+  document.getElementById('ep-tbody').innerHTML = episodes.map(e => {
+    const frs = Object.entries(e.finish_reasons || {}).map(([k, v]) => `${finishChip(k)} ${v}`).join(' ');
+    return `<tr>
+      <td class="mono">${escapeHtml(e.task_id)}</td>
+      <td>${fmtNum(e.step_count)}</td>
+      <td>${fmtNum(e.avg_completion_tokens)}</td>
+      <td>${fmtNum(e.max_completion_tokens)}</td>
+      <td>${frs}</td>
+      <td>${fmtTime(e.last_created_at)}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ============================================================
+   SAMPLING
+============================================================ */
+async function loadSampling() {
+  const sinceVal = document.getElementById('samp-since')?.value || '0';
+  const since = sinceVal === '0' ? 0 : (Date.now()/1000 - parseInt(sinceVal));
+  const limit = document.getElementById('samp-limit')?.value || 500;
+
+  const data = await apiFetch(`/api/sampling?since=${since}&limit=${limit}`);
+  const timeline = data.timeline || [];
+
+  // Latency timeline (down-sample to 200 points)
+  const step = Math.max(1, Math.floor(timeline.length / 200));
+  const sampled = timeline.filter((_, i) => i % step === 0);
+  makeChart('chart-latency', {
+    type: 'line',
+    data: {
+      labels: sampled.map(p => fmtTime(p.ts)),
+      datasets: [{
+        label: 'Latency (ms)',
+        data: sampled.map(p => p.latency_ms),
+        borderColor: PALETTE[0], backgroundColor: 'rgba(99,102,241,.1)',
+        borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3,
+      }]
+    },
+    options: { ...chartDefaults, plugins: { legend: { display: false }, tooltip: chartDefaults.plugins.tooltip } },
+  });
+
+  // Histograms
+  function renderHist(canvasId, bins) {
+    if (!bins?.length) return;
+    makeChart(canvasId, {
+      type: 'bar',
+      data: {
+        labels: bins.map(b => b.bin_start),
+        datasets: [{ label: 'Count', data: bins.map(b => b.count), backgroundColor: PALETTE[1], borderRadius: 3, borderWidth: 0 }]
+      },
+      options: { ...chartDefaults, plugins: { legend: { display: false }, tooltip: chartDefaults.plugins.tooltip } },
+    });
+  }
+  renderHist('chart-ct-hist', data.completion_token_hist);
+  renderHist('chart-pt-hist', data.prompt_token_hist);
+}
+
+/* ============================================================
+   METRICS (View 5)
+============================================================ */
+async function loadMetrics() {
+  const data = await apiFetch('/api/metrics');
+  const steps = data.steps || [];
+
+  document.getElementById('metrics-banner').style.display = steps.length ? 'none' : '';
+
+  if (!steps.length) return;
+
+  const xs = steps.map(s => s.global_step ?? s.step ?? steps.indexOf(s));
+
+  // Entropy
+  makeChart('chart-entropy', {
+    type: 'line',
+    data: {
+      labels: xs,
+      datasets: [{ label: 'actor/entropy', data: steps.map(s => s['actor/entropy']), borderColor: PALETTE[0], backgroundColor: 'rgba(99,102,241,.1)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 }]
+    },
+    options: { ...chartDefaults },
+  });
+
+  // Solve distribution stacked
+  const solveNone = steps.map(s => s['batch/solve_none'] || 0);
+  const solvePartial = steps.map(s => s['batch/solve_partial'] || 0);
+  const solveAll = steps.map(s => s['batch/solve_all'] || 0);
+  makeChart('chart-solve', {
+    type: 'bar',
+    data: {
+      labels: xs,
+      datasets: [
+        { label: 'solve_none', data: solveNone, backgroundColor: PALETTE[5], stack: 'solve' },
+        { label: 'solve_partial', data: solvePartial, backgroundColor: PALETTE[4], stack: 'solve' },
+        { label: 'solve_all', data: solveAll, backgroundColor: PALETTE[3], stack: 'solve' },
+      ]
+    },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, x: { ...chartDefaults.scales.x, stacked: true }, y: { ...chartDefaults.scales.y, stacked: true } } },
+  });
+
+  // Validation pass@1 — collect keys
+  const valKeys = [...new Set(steps.flatMap(s => Object.keys(s).filter(k => k.startsWith('val/') && k.endsWith('/pass@1'))))];
+  makeChart('chart-val', {
+    type: 'line',
+    data: {
+      labels: xs,
+      datasets: valKeys.map((k, i) => ({
+        label: k, data: steps.map(s => s[k]),
+        borderColor: PALETTE[i % PALETTE.length], backgroundColor: 'transparent',
+        tension: 0.3, borderWidth: 2, pointRadius: 2
+      }))
+    },
+    options: { ...chartDefaults },
+  });
+
+  // Termination reasons stacked
+  const termKeys = [...new Set(steps.flatMap(s => Object.keys(s).filter(k => k.startsWith('batch/') && !['batch/solve_none','batch/solve_partial','batch/solve_all','batch/num_tasks'].includes(k))))];
+  makeChart('chart-termination', {
+    type: 'bar',
+    data: {
+      labels: xs,
+      datasets: termKeys.map((k, i) => ({
+        label: k.replace('batch/',''), data: steps.map(s => s[k] || 0),
+        backgroundColor: PALETTE[(i+2) % PALETTE.length], stack: 'term'
+      }))
+    },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, x: { ...chartDefaults.scales.x, stacked: true }, y: { ...chartDefaults.scales.y, stacked: true } } },
+  });
+}
+
+/* ============================================================
+   ESCAPE HTML
+============================================================ */
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#039;');
+}
+
+/* ============================================================
+   BOOT
+============================================================ */
+window.addEventListener('DOMContentLoaded', () => {
+  checkStatus();
+  loadOverview();
+  // Auto-refresh
+  setInterval(checkStatus, 10000);
+  setInterval(() => {
+    if (currentPage === 'overview') loadOverview();
+    if (currentPage === 'traces') loadTraces(tracesOffset);
+    if (currentPage === 'episodes') loadEpisodes();
+    if (currentPage === 'sampling') loadSampling();
+  }, 10000);
+  setInterval(() => {
+    if (currentPage === 'metrics') loadMetrics();
+  }, 30000);
+});
+</script>
+</body>
+</html>
