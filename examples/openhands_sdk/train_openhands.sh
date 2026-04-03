@@ -35,6 +35,8 @@ export RAY_DEBUG_POST_MORTEM=1
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
+export OPENHANDS_IMAGE=openhands-triton-env:v1
+
 export HYDRA_FULL_ERROR=1
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -58,7 +60,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-ghcr.io/openhands/agent-server:full3}"
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/g00841271/Qwen3-8B}"
-export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-5}"
+export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-2}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 
 # ------------------------------------------------------------------------------
@@ -66,7 +68,7 @@ export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
 N_GPUS="${N_GPUS:-8}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
@@ -132,13 +134,15 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
+    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=8 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=2 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
     \
@@ -157,9 +161,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     \
-    rllm.agent.max_steps=30 \
-    rllm.stepwise_advantage.enable=True \
-    rllm.stepwise_advantage.mode=per_step \
+    rllm.stepwise_advantage.enable=False \
     rllm.compact_filtering.enable=True \
     rllm.compact_filtering.mask_max_prompt_length_exceeded=True \
     rllm.compact_filtering.mask_max_response_length_exceeded=True \
@@ -178,12 +180,13 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     trainer.test_freq=10 \
     trainer.total_epochs=50 \
     \
-    rllm.sdk.proxy.host=127.0.0.1 \
+    rllm.sdk.proxy.host=0.0.0.0 \
     trainer.device=npu \
     rllm.sdk.proxy.port=${PROXY_PORT} \
-    rllm.sdk.proxy.mode=external \
+    rllm.sdk.proxy.mode=subprocess \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
-    rllm.workflow.n_parallel_tasks=1
+    rllm.workflow.n_parallel_tasks=16
 
 
 # pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true
+    # rllm.stepwise_advantage.mode=per_step \

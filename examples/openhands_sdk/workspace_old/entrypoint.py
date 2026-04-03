@@ -9,13 +9,13 @@ No inner sandbox is created — the container itself IS the execution environmen
 Configuration via environment variables (set by openhands_agent.py):
 
     LLM_BASE_URL        Proxied rllm LiteLLM URL with embedded metadata slug.
+                        All LLM calls route here for rllm session tracking.
     LLM_API_KEY         API key for the proxy (default: EMPTY)
-    LLM_MODEL           Model name on the LiteLLM proxy
+    LLM_MODEL           Model name on LiteLLM proxy
+                        (default: openai/openhands-model)
     TASK_INSTRUCTION    Task text; falls back to reading INSTRUCTIONS.md
     WORKSPACE_BASE      Workspace directory (default: /opt/workspace)
     MAX_ITERATIONS      Max agent iterations (default: 30)
-    NPU_OPERATOR_TASK   1 = operator / kernel task prompt
-    OPERATOR_BACKEND    triton | ascendc (for task_scope hint)
 
 Exit codes:
     0   Completed
@@ -26,46 +26,16 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, get_logger
 from openhands.sdk.context import Skill
-from openhands.sdk.context.skills import load_project_skills, load_skills_from_dir
 from openhands.sdk.tool import Tool
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
 
 logger = get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Hardcoded short system prompt (replaces SDK default system_prompt.j2)
-# ---------------------------------------------------------------------------
-
-_HARDCODED_SYSTEM_PROMPT_J2 = """You are a helpful assistant. Use the provided tools to complete the task. Be concise.
-"""
-
-_MINIMAL_SYSTEM_J2_PATH = "/tmp/rllm_minimal_system.j2"
-
-
-def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
-    """Merge AGENTS.md / .agents/skills with inline task_scope (see merge_skills_example.py)."""
-    ws = Path(workspace_base)
-    skills: list = []
-
-    if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
-        loaded = load_project_skills(workspace_dir=str(ws))
-        if loaded:
-            skills.extend(loaded if isinstance(loaded, list) else list(loaded))
-
-    agents_skills_root = ws / ".agents" / "skills"
-    if agents_skills_root.is_dir():
-        _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
-        skills.extend(agent_skills.values())
-
-    skills.append(task_scope)
-    return skills
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +48,8 @@ LLM_MODEL: str = os.environ.get("LLM_MODEL", "openai/openhands-model")
 WORKSPACE_BASE: str = os.environ.get("WORKSPACE_BASE", "/opt/workspace")
 MAX_ITERATIONS: int = int(os.environ.get("MAX_ITERATIONS", "30"))
 NPU_OPERATOR_TASK: bool = os.environ.get("NPU_OPERATOR_TASK", "0") in ("1", "true", "True", "yes")
-OPERATOR_BACKEND: str = os.environ.get("OPERATOR_BACKEND", "triton")
 
+# Task instruction: env var takes priority, then fall back to INSTRUCTIONS.md
 TASK_INSTRUCTION: str = os.environ.get("TASK_INSTRUCTION", "")
 if not TASK_INSTRUCTION:
     _md = os.path.join(WORKSPACE_BASE, "INSTRUCTIONS.md")
@@ -97,9 +67,6 @@ if not TASK_INSTRUCTION:
     logger.error("No task instruction provided. Exiting.")
     sys.exit(1)
 
-with open(_MINIMAL_SYSTEM_J2_PATH, "w", encoding="utf-8") as _f:
-    _f.write(_HARDCODED_SYSTEM_PROMPT_J2)
-
 logger.info("LLM_BASE_URL : %s...", LLM_BASE_URL[:80])
 logger.info("LLM_MODEL    : %s", LLM_MODEL)
 logger.info("WORKSPACE    : %s", WORKSPACE_BASE)
@@ -111,50 +78,46 @@ logger.info("TASK         : %.120s", TASK_INSTRUCTION)
 # Build OpenHands SDK objects
 # ---------------------------------------------------------------------------
 
+# LLM — LLM_BASE_URL already contains the rllm metadata slug, so every
+# call the agent makes is automatically attributed to this training session.
 llm = LLM(
     usage_id="rllm-openhands",
     model=LLM_MODEL,
     api_key=SecretStr(LLM_API_KEY),
     base_url=LLM_BASE_URL if LLM_BASE_URL else None,
-    max_output_tokens=4096,
+    max_output_tokens=MAX_ITERATIONS * 2048,  # generous upper bound
 )
 
-if NPU_OPERATOR_TASK:
-    _task_scope = (
-        f"You are a custom kernel / operator agent (backend hint: {OPERATOR_BACKEND}). "
-        "Follow AGENTS.md and INSTRUCTIONS.md. Implement under src/triton/ or src/ascendc/ as directed. "
-        "Do not modify tools/. Run `bash tools/operator_pipeline.sh` after changes; "
-        "iterate until metrics.json reports success. Summarize results when done."
-    )
-else:
-    _task_scope = (
+# AgentContext — inject a skill that scopes the agent to the task
+_task_scope = (
+    "You are a custom kernel / operator development agent. "
+    "Follow INSTRUCTIONS.md: implement C++ in the workspace, run the provided "
+    "profiler script, and fix issues until profiling reports success. "
+    "When done, summarize what you accomplished."
+    if NPU_OPERATOR_TASK
+    else (
         "You are a software engineering agent. "
         "Complete the task described in the TASK section. "
         "Work inside the provided workspace directory. "
         "When done, summarize what you accomplished."
     )
-
-_task_skill = Skill(
-    name="task_scope",
-    content=_task_scope,
-    trigger=None,
 )
-
-try:
-    _merged_skills = merge_workspace_skills(WORKSPACE_BASE, _task_skill)
-except Exception:
-    logger.exception("merge_workspace_skills failed; falling back to task_scope only")
-    _merged_skills = [_task_skill]
-
 agent_context = AgentContext(
-    skills=_merged_skills,
-    load_public_skills=False,
+    skills=[
+        Skill(
+            name="task_scope",
+            content=_task_scope,
+            trigger=None,  # always active
+        )
+    ],
     system_message_suffix=(
         f"Workspace directory: {WORKSPACE_BASE}. "
         f"Maximum iterations budget: {MAX_ITERATIONS}."
     ),
 )
 
+# Agent with standard coding tools.
+# No sandbox / DockerWorkspace — the container itself is the sandbox.
 agent = Agent(
     llm=llm,
     tools=[
@@ -162,9 +125,9 @@ agent = Agent(
         Tool(name=FileEditorTool.name),
     ],
     agent_context=agent_context,
-    system_prompt_filename=_MINIMAL_SYSTEM_J2_PATH,
 )
 
+# Conversation rooted in the workspace (mounted from the host)
 conversation = Conversation(
     agent=agent,
     workspace=WORKSPACE_BASE,
@@ -182,6 +145,7 @@ if __name__ == "__main__":
         conversation.send_message(TASK_INSTRUCTION)
         conversation.run()
 
+        # Log cost for observability
         if llm.metrics is not None:
             cost = llm.metrics.accumulated_cost
             logger.info("EXAMPLE_COST: %s", cost)

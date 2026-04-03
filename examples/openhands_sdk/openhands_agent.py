@@ -40,6 +40,7 @@ from urllib.parse import urlparse, urlunparse
 from typing import Any
 
 from rllm.types import Trajectory
+from rllm.sdk.proxy.metadata_slug import assemble_routing_metadata, build_proxied_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -161,26 +162,34 @@ _CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
 _SLUG_PREFIX = "rllm1:"
 
 
-def _encode_metadata_slug(metadata: dict) -> str:
-    body = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
-    encoded = base64.urlsafe_b64encode(body.encode("utf-8")).rstrip(b"=")
-    return f"{_SLUG_PREFIX}{encoded.decode('ascii')}"
+# def _encode_metadata_slug_fallback(metadata: dict) -> str:
+#     body = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+#     encoded = base64.urlsafe_b64encode(body.encode("utf-8")).rstrip(b"=")
+#     return f"{_SLUG_PREFIX}{encoded.decode('ascii')}"
 
 
-def _build_proxied_base_url(base_url: str, metadata: dict) -> str:
-    slug = _encode_metadata_slug(metadata)
-    parsed = urlparse(base_url)
-    path = parsed.path.rstrip("/")
-    has_v1 = path.endswith("/v1")
-    if has_v1:
-        path = path[:-3]
-    new_path = f"{path}/meta/{slug}"
-    if has_v1:
-        new_path += "/v1"
-    if not new_path.startswith("/"):
-        new_path = "/" + new_path
-    rebuilt = parsed._replace(path=new_path)
-    return urlunparse(rebuilt)
+# def _build_proxied_base_url_fallback(base_url: str, metadata: dict) -> str:
+#     slug = _encode_metadata_slug_fallback(metadata)
+#     parsed = urlparse(base_url)
+#     path = parsed.path.rstrip("/")
+#     has_v1 = path.endswith("/v1")
+#     if has_v1:
+#         path = path[:-3]
+#     new_path = f"{path}/meta/{slug}"
+#     if has_v1:
+#         new_path += "/v1"
+#     if not new_path.startswith("/"):
+#         new_path = "/" + new_path
+#     rebuilt = parsed._replace(path=new_path)
+#     return urlunparse(rebuilt)
+
+
+def _trace_label_from_routing_metadata(metadata: dict[str, Any]) -> str:
+    uids = metadata.get("session_uids") or []
+    if uids:
+        return str(uids[-1])[:18]
+    name = metadata.get("session_name")
+    return str(name or "none")[:18]
 
 
 def _to_container_url(url: str) -> str:
@@ -218,29 +227,77 @@ def _setup_workspace(task: dict[str, Any]) -> str:
 # Reward evaluation
 # ---------------------------------------------------------------------------
 
+# def _default_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
+#     if _is_npu_operator_task(task):
+#         return _npu_operator_reward(task, workspace_dir, output)
+#     test_target = task.get("test_file") or task.get("test_dir")
+#     if test_target:
+#         test_path = os.path.join(workspace_dir, test_target)
+#         if os.path.exists(test_path):
+#             try:
+#                 result = subprocess.run(
+#                     ["python", "-m", "pytest", test_path, "-x", "-q", "--tb=no"],
+#                     capture_output=True, cwd=workspace_dir, timeout=60,
+#                 )
+#                 return 1.0 if result.returncode == 0 else 0.0
+#             except subprocess.TimeoutExpired:
+#                 return 0.0
+
+#     success_keywords = task.get("success_keywords", [])
+#     if success_keywords:
+#         if any(kw.lower() in output.lower() for kw in success_keywords):
+#             return 1.0
+
+#     logger.warning("[openhands] No evaluation criteria in task; reward=0.0")
+#     return 0.0
+
+import random  # 必须引入 random 库
+from typing import Any
+import os
+import subprocess
+
 def _default_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
-    if _is_npu_operator_task(task):
-        return _npu_operator_reward(task, workspace_dir, output)
-    test_target = task.get("test_file") or task.get("test_dir")
-    if test_target:
-        test_path = os.path.join(workspace_dir, test_target)
-        if os.path.exists(test_path):
-            try:
-                result = subprocess.run(
-                    ["python", "-m", "pytest", test_path, "-x", "-q", "--tb=no"],
-                    capture_output=True, cwd=workspace_dir, timeout=60,
-                )
-                return 1.0 if result.returncode == 0 else 0.0
-            except subprocess.TimeoutExpired:
-                return 0.0
+    # 如果你希望整个函数在任何情况下都只返回随机值，
+    # 可以直接在函数开头返回：return random.random()
+    
+    # if _is_npu_operator_task(task):
+    #     return _npu_operator_reward(task, workspace_dir, output)
 
-    success_keywords = task.get("success_keywords", [])
-    if success_keywords:
-        if any(kw.lower() in output.lower() for kw in success_keywords):
-            return 1.0
+    # test_target = task.get("test_file") or task.get("test_dir")
+    # if test_target:
+    #     test_path = os.path.join(workspace_dir, test_target)
+    #     if os.path.exists(test_path):
+    #         try:
+    #             subprocess.run(
+    #                 ["python", "-m", "pytest", test_path, "-x", "-q", "--tb=no"],
+    #                 capture_output=True, cwd=workspace_dir, timeout=60,
+    #             )
+    #             # 原本这里成功返回 1.0，失败返回 0.0
+    #             # 现在统一返回 0 到 1 之间的随机浮点数
+    #             return random.random() 
+    #         except subprocess.TimeoutExpired:
+    #             return random.random()
 
-    logger.warning("[openhands] No evaluation criteria in task; reward=0.0")
-    return 0.0
+    # success_keywords = task.get("success_keywords", [])
+    # if success_keywords:
+    #     if any(kw.lower() in output.lower() for kw in success_keywords):
+    #         return random.random()
+
+    # 原本兜底返回 0.0，现在也改为随机
+    return random.random()
+
+
+def _routing_metadata_for_rollout(
+    explicit_uids: list[str] | None,
+    explicit_name: str | None,
+) -> dict[str, Any]:
+    """Slug payload: ``assemble_routing_metadata`` + optional ``_rllm_proxy_session_*`` overrides."""
+    extra: dict[str, Any] = {}
+    if explicit_uids is not None:
+        extra["session_uids"] = list(explicit_uids)
+    if explicit_name is not None:
+        extra["session_name"] = explicit_name
+    return assemble_routing_metadata(extra=extra if extra else None)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +320,7 @@ def _run_openhands_container(
         instruction:  Task instruction (also written to INSTRUCTIONS.md).
     """
     container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
-    breakpoint()
+    # breakpoint()
     cmd = [
         "docker", "run",
         "--rm",
@@ -285,7 +342,7 @@ def _run_openhands_container(
     
     cmd.extend([
             "-e", "http_proxy=", 
-            "-e", "https_proxy=", 
+            "-e", "https_proxy=",
             "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1"
         ])
 
@@ -295,8 +352,10 @@ def _run_openhands_container(
         # The host workspace dir is mounted; the agent operates directly
         # inside the container — no inner sandbox is created.
         "-e", "WORKSPACE_BASE=/opt/workspace",
-        "-v", f"{workspace}:/opt/workspace",
-        "--entrypoint", f"/app/rllm_entrypoint.py",
+        # "-v", f"{workspace}:/opt/workspace",
+        "-v", f"/home/g00841271/rllm-071/examples/openhands_sdk/workspace_debug:/opt/workspace",
+        # "--entrypoint", f"/app/rllm_entrypoint.py",
+        "--entrypoint", f"/opt/workspace/entrypoint.py",
         # --- Agent iterations ---
         "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
 
@@ -395,6 +454,11 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     Returns:
         List with one trajectory dict: {name, steps, reward}.
     """
+    slug_uids = kwargs.get("_rllm_proxy_session_uids")
+    slug_name = kwargs.get("_rllm_proxy_session_name")
+    if slug_uids is not None and not isinstance(slug_uids, list):
+        slug_uids = list(slug_uids) if slug_uids else None
+    
     task, config = _rollout_task_and_config(args, kwargs)
     
     # Raw proxy URL — rllm passes this before any slug is applied
@@ -403,15 +467,29 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     # Generate a unique session identifier for this rollout.
     # Encoding it in the URL lets the rllm proxy associate every OpenHands
     # LLM call with this specific training episode.
-    session_uid = str(uuid.uuid4())
-    metadata: dict[str, Any] = {
-        "session_uids": [session_uid],
-        "session_name": f"openhands-{session_uid[:8]}",
-    }
+    # session_uid = str(uuid.uuid4())
+    # metadata: dict[str, Any] = {
+    #     "session_uids": [session_uid],
+    #     "session_name": f"openhands-{session_uid[:8]}",
+    # }
+    
+    
+    # breakpoint()
+    
+    metadata = _routing_metadata_for_rollout(slug_uids, slug_name)
+    trace_label = _trace_label_from_routing_metadata(metadata)
+    _uids = metadata.get("session_uids") or []
+    logger.info(
+        "[openhands] proxy slug: n_uids=%d session_name=%r trace_tail=%s",
+        len(_uids),
+        metadata.get("session_name"),
+        _uids[-1][-12:] if _uids else "",
+    )
 
     # Build the proxied URL with embedded metadata slug.
     # _build_proxied_base_url inlines the same logic as rllm.sdk.proxy.
-    proxied_url = _build_proxied_base_url(proxy_url, metadata)
+    # proxied_url = _build_proxied_base_url(proxy_url, metadata)
+    proxied_url = build_proxied_base_url(proxy_url, metadata)
 
     # Rewrite localhost/127.0.0.1 → host.docker.internal so the URL is
     # reachable from inside the OpenHands Docker container.
@@ -428,11 +506,11 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         )
         reward = _default_reward(task, workspace, output)
         logger.info(
-            "[openhands] session=%s reward=%.2f instruction=%s",
-            session_uid[:8], reward, instruction[:80],
+            "[openhands] trace_label=%s reward=%.2f instruction=%s",
+            trace_label, reward, instruction[:80],
         )
     except Exception:
-        logger.exception("[openhands] Rollout failed (session=%s)", session_uid[:8])
+        logger.exception("[openhands] Rollout failed (trace_label=%s)", trace_label)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
