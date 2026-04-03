@@ -52,6 +52,7 @@ class AgentSdkTrainer(RayPPOTrainer):
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
+        val_reward_fn=None,
         agent_run_func: Callable = None,
     ):
         """Initialize AgentSdkTrainer.
@@ -63,6 +64,7 @@ class AgentSdkTrainer(RayPPOTrainer):
             resource_pool_manager: Manages GPU resources across workers.
             ray_worker_group_cls: Ray worker group class (default: RayWorkerGroup).
             processor: Optional processor for multi-modal (VLM) inputs.
+            val_reward_fn: Optional reward function used during validation.
             agent_run_func: Agent workflow function to execute during rollouts.
         """
         super().__init__(
@@ -73,6 +75,8 @@ class AgentSdkTrainer(RayPPOTrainer):
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
         )
+
+        self.val_reward_fn = val_reward_fn
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
@@ -182,7 +186,7 @@ class AgentSdkTrainer(RayPPOTrainer):
         self.checkpoint_manager.update_weights(self.global_steps)
 
         start_time = time.time()
-        if self.config.trainer.get("val_before_train", True):
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate_agent()
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
