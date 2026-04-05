@@ -10,8 +10,8 @@
 #
 # Build (from repo root):
 #   docker build -t rllm-openhands \
-#       -f examples/openhands-sdk/workspace/Dockerfile \
-#       examples/openhands-sdk/workspace
+#       -f examples/openhands_sdk/workspace/Dockerfile \
+#       examples/openhands_sdk/workspace
 #
 # Run (example):
 #   docker run --rm \
@@ -21,6 +21,8 @@
 #     -e TASK_INSTRUCTION="Fix the failing test in src/utils.py" \
 #     -e WORKSPACE_BASE=/opt/workspace \
 #     -e MAX_ITERATIONS=30 \
+#     -e OBSERVER_API_URL="http://host.docker.internal:8765" \
+#     -e OBSERVER_SESSION_ID="my-session-001" \
 #     -v /path/to/repo:/opt/workspace \
 #     --add-host host.docker.internal:host-gateway \
 #     rllm-openhands
@@ -29,9 +31,13 @@
 FROM ghcr.io/all-hands-ai/openhands:0.28
 
 # ---------------------------------------------------------------------------
-# Copy rllm entrypoint
+# Copy rllm entrypoint shell + observability sub-package
 # ---------------------------------------------------------------------------
 COPY entrypoint.py /app/rllm_entrypoint.py
+COPY rllm_entrypoint/ /app/rllm_entrypoint/
+
+# Make the entrypoint script executable
+RUN chmod +x /app/rllm_entrypoint.py
 
 # ---------------------------------------------------------------------------
 # Default workspace (overridden at runtime via WORKSPACE_BASE env var)

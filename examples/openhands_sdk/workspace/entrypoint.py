@@ -2,197 +2,62 @@
 """
 rllm OpenHands entrypoint — runs inside the OpenHands Docker container.
 
-Launched by openhands_agent.py (rllm side) via ``docker run``.
-Uses the new OpenHands Python SDK (LLM, Agent, Conversation, Tool) directly.
-No inner sandbox is created — the container itself IS the execution environment.
+This file is the container ENTRYPOINT (thin shell). All logic lives in
+the ``rllm_entrypoint`` package located next to this file.
 
 Configuration via environment variables (set by openhands_agent.py):
 
-    LLM_BASE_URL        Proxied rllm LiteLLM URL with embedded metadata slug.
-    LLM_API_KEY         API key for the proxy (default: EMPTY)
-    LLM_MODEL           Model name on the LiteLLM proxy
-    TASK_INSTRUCTION    Task text; falls back to reading INSTRUCTIONS.md
-    WORKSPACE_BASE      Workspace directory (default: /opt/workspace)
-    MAX_ITERATIONS      Max agent iterations (default: 30)
-    NPU_OPERATOR_TASK   1 = operator / kernel task prompt
-    OPERATOR_BACKEND    triton | ascendc (for task_scope hint)
+    LLM_BASE_URL            Proxied rllm LiteLLM URL with embedded metadata slug.
+    LLM_API_KEY             API key for the proxy (default: EMPTY)
+    LLM_MODEL               Model name on the LiteLLM proxy
+    TASK_INSTRUCTION        Task text; falls back to reading INSTRUCTIONS.md
+    WORKSPACE_BASE          Workspace directory (default: /opt/workspace)
+    MAX_ITERATIONS          Max agent iterations (default: 30)
+    NPU_OPERATOR_TASK       1 = operator / kernel task prompt
+    OPERATOR_BACKEND        triton | ascendc (for task_scope hint)
+
+Observability & control (all optional):
+
+    OBSERVER_API_URL        Base URL of external observer REST gateway.
+                            If unset, the container runs standalone (no upload).
+                            e.g. http://host.docker.internal:8765
+    OBSERVER_SESSION_ID     Unique ID for this session (default: random UUID).
+    OBSERVER_SESSION_LABEL  Human-readable label (default: first 12 chars of ID).
+    OBSERVER_UPLOAD_INTERVAL    State upload period in seconds (default: 5.0).
+    OBSERVER_PAUSE_POLL_INTERVAL Pause poll period in seconds (default: 2.0).
+    OBSERVER_EXTRA_METADATA     JSON string with arbitrary metadata to include.
 
 Exit codes:
-    0   Completed
+    0   Completed successfully
     1   Fatal error
 """
-
 from __future__ import annotations
 
-import os
+import logging
 import sys
-from pathlib import Path
-
-from pydantic import SecretStr
-
-from openhands.sdk import LLM, Agent, AgentContext, Conversation, get_logger
-from openhands.sdk.context import Skill
-from openhands.sdk.context.skills import load_project_skills, load_skills_from_dir
-from openhands.sdk.tool import Tool
-from openhands.tools.file_editor import FileEditorTool
-from openhands.tools.terminal import TerminalTool
-
-logger = get_logger(__name__)
+import os
 
 # ---------------------------------------------------------------------------
-# Hardcoded short system prompt (replaces SDK default system_prompt.j2)
+# Logging setup (before importing anything else so SDK loggers inherit this)
 # ---------------------------------------------------------------------------
 
-_HARDCODED_SYSTEM_PROMPT_J2 = """You are a helpful assistant. Use the provided tools to complete the task. Be concise.
-"""
-
-_MINIMAL_SYSTEM_J2_PATH = "/tmp/rllm_minimal_system.j2"
-
-
-def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
-    """Merge AGENTS.md / .agents/skills with inline task_scope (see merge_skills_example.py)."""
-    ws = Path(workspace_base)
-    skills: list = []
-
-    if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
-        loaded = load_project_skills(workspace_dir=str(ws))
-        if loaded:
-            skills.extend(loaded if isinstance(loaded, list) else list(loaded))
-
-    agents_skills_root = ws / ".agents" / "skills"
-    if agents_skills_root.is_dir():
-        _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
-        skills.extend(agent_skills.values())
-
-    skills.append(task_scope)
-    return skills
-
-
-# ---------------------------------------------------------------------------
-# Read configuration from environment
-# ---------------------------------------------------------------------------
-
-LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "")
-LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "EMPTY")
-LLM_MODEL: str = os.environ.get("LLM_MODEL", "openai/openhands-model")
-WORKSPACE_BASE: str = os.environ.get("WORKSPACE_BASE", "/opt/workspace")
-MAX_ITERATIONS: int = int(os.environ.get("MAX_ITERATIONS", "30"))
-NPU_OPERATOR_TASK: bool = os.environ.get("NPU_OPERATOR_TASK", "0") in ("1", "true", "True", "yes")
-OPERATOR_BACKEND: str = os.environ.get("OPERATOR_BACKEND", "triton")
-
-TASK_INSTRUCTION: str = os.environ.get("TASK_INSTRUCTION", "")
-if not TASK_INSTRUCTION:
-    _md = os.path.join(WORKSPACE_BASE, "INSTRUCTIONS.md")
-    if os.path.exists(_md):
-        with open(_md) as _f:
-            _lines = [l for l in _f.read().splitlines()
-                      if l.strip() and not l.startswith("#")]
-        TASK_INSTRUCTION = "\n".join(_lines).strip()
-
-if not LLM_BASE_URL:
-    logger.error("LLM_BASE_URL is not set. Exiting.")
-    sys.exit(1)
-
-if not TASK_INSTRUCTION:
-    logger.error("No task instruction provided. Exiting.")
-    sys.exit(1)
-
-with open(_MINIMAL_SYSTEM_J2_PATH, "w", encoding="utf-8") as _f:
-    _f.write(_HARDCODED_SYSTEM_PROMPT_J2)
-
-logger.info("LLM_BASE_URL : %s...", LLM_BASE_URL[:80])
-logger.info("LLM_MODEL    : %s", LLM_MODEL)
-logger.info("WORKSPACE    : %s", WORKSPACE_BASE)
-logger.info("MAX_ITER     : %d", MAX_ITERATIONS)
-logger.info("TASK         : %.120s", TASK_INSTRUCTION)
-
-
-# ---------------------------------------------------------------------------
-# Build OpenHands SDK objects
-# ---------------------------------------------------------------------------
-
-llm = LLM(
-    usage_id="rllm-openhands",
-    model=LLM_MODEL,
-    api_key=SecretStr(LLM_API_KEY),
-    base_url=LLM_BASE_URL if LLM_BASE_URL else None,
-    max_output_tokens=4096,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
 )
 
-if NPU_OPERATOR_TASK:
-    _task_scope = (
-        f"You are a custom kernel / operator agent (backend hint: {OPERATOR_BACKEND}). "
-        "Follow AGENTS.md and INSTRUCTIONS.md. Implement under src/triton/ or src/ascendc/ as directed. "
-        "Do not modify tools/. Run `bash tools/operator_pipeline.sh` after changes; "
-        "iterate until metrics.json reports success. Summarize results when done."
-    )
-else:
-    _task_scope = (
-        "You are a software engineering agent. "
-        "Complete the task described in the TASK section. "
-        "Work inside the provided workspace directory. "
-        "When done, summarize what you accomplished."
-    )
+# Ensure the package directory is importable when running the script directly.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-_task_skill = Skill(
-    name="task_scope",
-    content=_task_scope,
-    trigger=None,
-)
-
-try:
-    _merged_skills = merge_workspace_skills(WORKSPACE_BASE, _task_skill)
-except Exception:
-    logger.exception("merge_workspace_skills failed; falling back to task_scope only")
-    _merged_skills = [_task_skill]
-
-agent_context = AgentContext(
-    skills=_merged_skills,
-    load_public_skills=False,
-    system_message_suffix=(
-        f"Workspace directory: {WORKSPACE_BASE}. "
-        f"Maximum iterations budget: {MAX_ITERATIONS}."
-    ),
-)
-
-agent = Agent(
-    llm=llm,
-    tools=[
-        Tool(name=TerminalTool.name),
-        Tool(name=FileEditorTool.name),
-    ],
-    agent_context=agent_context,
-    system_prompt_filename=_MINIMAL_SYSTEM_J2_PATH,
-)
-
-conversation = Conversation(
-    agent=agent,
-    workspace=WORKSPACE_BASE,
-    max_iteration_per_run=MAX_ITERATIONS,
-)
-
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Run
+# Entry
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    exit_code = 0
-    try:
-        conversation.send_message(TASK_INSTRUCTION)
-        conversation.run()
-
-        if llm.metrics is not None:
-            cost = llm.metrics.accumulated_cost
-            logger.info("EXAMPLE_COST: %s", cost)
-
-        logger.info("Conversation completed successfully.")
-
-    except KeyboardInterrupt:
-        logger.warning("Interrupted.")
-        exit_code = 1
-    except Exception:
-        logger.exception("Unhandled exception in entrypoint.")
-        exit_code = 1
-
-    sys.exit(exit_code)
+    from rllm_entrypoint.runner import run
+    sys.exit(run())
