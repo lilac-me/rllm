@@ -187,14 +187,8 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self._response_code = 0
         self._ts_end = self._ts_start
         self._session_id_for_log: str | None = None
-        # DEBUG: self.path / self.command do NOT exist yet here — they are set
-        # by parse_request() which runs inside super().handle_one_request().
-        # Use raw_requestline (always available) for the pre-parse log.
-        try:
-            _raw = self.raw_requestline.decode("iso-8859-1", errors="replace").strip()
-        except Exception:
-            _raw = "?"
-        logger.debug("[gateway] --> %s  client=%s", _raw, self._client_ip())
+        # NOTE: raw_requestline / self.path / self.command are ALL populated
+        # inside super().handle_one_request(). Nothing can be logged before that.
         try:
             super().handle_one_request()
         finally:
@@ -204,7 +198,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
             _path = getattr(self, "path",    None) or "?"
             _path_clean = _path.split("?")[0] if "?" in _path else _path
             logger.debug(
-                "[gateway] <-- %s %s  status=%d  body=%db  %.1fms  client=%s",
+                "[gateway] %s %s  status=%d  body=%db  %.1fms  client=%s",
                 _cmd,
                 _path_clean,
                 self._response_code,
