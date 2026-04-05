@@ -176,6 +176,9 @@ class GatewayDB:
             self._local.conn = self._open()
         return self._local.conn
 
+    def close(self):
+        pass
+
     # ── Session ───────────────────────────────────────────────────────────
 
     def upsert_session(

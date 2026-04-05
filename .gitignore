@@ -226,3 +226,5 @@ gcp-key.json
 extra-info
 *.parquet
 litellm_proxy_config_autogen.yaml
+
+*.db

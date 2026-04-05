@@ -37,6 +37,18 @@ import logging
 import sys
 import os
 
+os.environ["LLM_BASE_URL"] = "https://api.silra.cn/v1"
+os.environ["LLM_API_KEY"] = "sk-ZkzodY0fm4YmAqEuplsBLcLT9mX44wLlLpBXEhgnHOPGJIFn"
+os.environ["LLM_MODEL"] = "openai/glm-4.7"
+os.environ["TASK_INSTRUCTION"] = "Write an add operator in Ascend-triton."
+os.environ["WORKSPACE_BASE"] = "/data/home/3120235672/huawei-intern/code_agent/rllm/examples/openhands_sdk/workspace/agent_workdirs"
+os.environ["MAX_ITERATIONS"] = "2"
+os.environ["NPU_OPERATOR_TASK"] = "1"
+os.environ["OPERATOR_BACKEND"] = "triton"
+
+os.environ["OBSERVER_API_URL"] = "127.0.0.1:8858"
+
+
 # ---------------------------------------------------------------------------
 # Logging setup (before importing anything else so SDK loggers inherit this)
 # ---------------------------------------------------------------------------
