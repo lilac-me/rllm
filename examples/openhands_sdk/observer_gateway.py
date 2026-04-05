@@ -187,21 +187,26 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self._response_code = 0
         self._ts_end = self._ts_start
         self._session_id_for_log: str | None = None
-        # DEBUG: log every inbound request immediately
-        logger.debug(
-            "[gateway] --> %s %s  client=%s",
-            getattr(self, "command", "?"),
-            self.path,
-            self._client_ip(),
-        )
+        # DEBUG: self.path / self.command do NOT exist yet here — they are set
+        # by parse_request() which runs inside super().handle_one_request().
+        # Use raw_requestline (always available) for the pre-parse log.
+        try:
+            _raw = self.raw_requestline.decode("iso-8859-1", errors="replace").strip()
+        except Exception:
+            _raw = "?"
+        logger.debug("[gateway] --> %s  client=%s", _raw, self._client_ip())
         try:
             super().handle_one_request()
         finally:
             elapsed_ms = (self._ts_end - self._ts_start) * 1000
+            # getattr guards: parse_request() may not have run if connection was bad
+            _cmd  = getattr(self, "command", None) or "?"
+            _path = getattr(self, "path",    None) or "?"
+            _path_clean = _path.split("?")[0] if "?" in _path else _path
             logger.debug(
                 "[gateway] <-- %s %s  status=%d  body=%db  %.1fms  client=%s",
-                getattr(self, "command", "?"),
-                self.path.split("?")[0],
+                _cmd,
+                _path_clean,
                 self._response_code,
                 self._body_bytes,
                 elapsed_ms,
@@ -210,8 +215,8 @@ class ObserverHandler(BaseHTTPRequestHandler):
             if _db is not None:
                 try:
                     _db.log_request(
-                        method=self.command or "",
-                        path=self.path.split("?")[0],
+                        method=_cmd,
+                        path=_path_clean,
                         client_ip=self._client_ip(),
                         received_at=self._ts_start,
                         status_code=self._response_code,
