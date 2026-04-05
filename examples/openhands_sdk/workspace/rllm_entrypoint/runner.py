@@ -4,9 +4,16 @@ runner.py — Main conversation execution logic for the rllm entrypoint.
 Responsibilities:
   1. Build OpenHands SDK objects (LLM, Agent, Conversation).
   2. Wire the event callback into the Conversation.
-  3. Start background threads (uploader, pause controller).
+  3. Start background pause controller thread.
   4. Run the conversation loop, honoring pause/resume signals.
-  5. Report final metrics and clean up background threads.
+  5. Emit lifecycle events (startup / heartbeat / evaluate / finish).
+  6. Report final metrics and clean up background threads.
+
+v2 (event-driven):
+  The StateUploader background thread has been removed.  Instead, each
+  OpenHands SDK event is pushed to the gateway immediately inside the
+  event callback.  Heartbeats are emitted from a lightweight timer thread
+  so the gateway always has a liveness signal even during long LLM calls.
 """
 from __future__ import annotations
 
@@ -14,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -22,10 +30,15 @@ from pydantic import SecretStr
 
 from rllm_entrypoint.api_client import ObserverClient
 from rllm_entrypoint.config import cfg
-from rllm_entrypoint.events import make_event_callback
+from rllm_entrypoint.events import (
+    make_event_callback,
+    push_evaluate_event,
+    push_finish_event,
+    push_heartbeat_event,
+    push_startup_event,
+)
 from rllm_entrypoint.pause_ctrl import PauseController
 from rllm_entrypoint.state import AgentPhase, RunState
-from rllm_entrypoint.uploader import StateUploader
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +106,47 @@ def _safe_env_snapshot() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Heartbeat timer
+# ---------------------------------------------------------------------------
+
+class _HeartbeatTimer:
+    """Periodically emits a HeartbeatEvent via push_heartbeat_event().
+
+    Uses a daemon thread so it never blocks program exit.
+    """
+
+    def __init__(self, client: ObserverClient, run_state: RunState, interval_s: float = 15.0) -> None:
+        self._client = client
+        self._state = run_state
+        self._interval = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="rllm-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        if self._client._enabled:
+            self._thread.start()
+            logger.info("[heartbeat] Timer started (interval=%.1fs)", self._interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def join(self, timeout: float = 5.0) -> None:
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(timeout=self._interval):
+            try:
+                push_heartbeat_event(self._client, self._state)
+            except Exception:
+                logger.debug("[heartbeat] push failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
 
@@ -156,24 +210,29 @@ def run() -> int:
     # ── Initialise RunState ───────────────────────────────────────────────
     run_state = build_run_state()
 
-    # ── Initialise observer infrastructure ────────────────────────────────
+    # ── Initialise observer client ────────────────────────────────────────
     client = ObserverClient(
         base_url=cfg.observer_api_url,
         session_id=cfg.session_id,
     )
-    uploader = StateUploader(run_state, client, interval_s=cfg.upload_interval_s)
-    pause_ctrl = PauseController(run_state, client, poll_interval_s=cfg.pause_poll_interval_s)
 
-    uploader.start()
+    # ── Push startup lifecycle event ──────────────────────────────────────
+    push_startup_event(client, run_state)
+
+    # ── Start heartbeat timer ─────────────────────────────────────────────
+    heartbeat = _HeartbeatTimer(
+        client=client,
+        run_state=run_state,
+        interval_s=cfg.upload_interval_s,   # reuse the existing interval config
+    )
+    heartbeat.start()
+
+    # ── Start pause controller ────────────────────────────────────────────
+    pause_ctrl = PauseController(run_state, client, poll_interval_s=cfg.pause_poll_interval_s)
     pause_ctrl.start()
 
-    # ── Build event callback ──────────────────────────────────────────────
-    user_event_cb = make_event_callback(run_state)
-
-    # Wrap callback to also trigger an uploader flush on every event
-    def _event_cb(event: Any) -> None:
-        user_event_cb(event)
-        uploader.trigger()
+    # ── Build event callback (event-driven push) ──────────────────────────
+    _event_cb = make_event_callback(run_state, client)
 
     # ── Build OpenHands SDK objects ───────────────────────────────────────
     llm = LLM(
@@ -289,13 +348,26 @@ def run() -> int:
             break
 
         # Log LLM cost
+        cost = 0.0
+        llm_calls = run_state.total_llm_calls
         if llm.metrics is not None:
-            cost = llm.metrics.accumulated_cost
-            run_state.update_metrics(cost=float(cost or 0.0), llm_calls=run_state.total_llm_calls)
+            cost = float(llm.metrics.accumulated_cost or 0.0)
+            run_state.update_metrics(cost=cost, llm_calls=llm_calls)
             logger.info("EXAMPLE_COST: %s", cost)
 
-        logger.info("Conversation completed. Status=%s", conversation.state.execution_status.value)
+        exec_status = conversation.state.execution_status.value
+        logger.info("Conversation completed. Status=%s", exec_status)
         run_state.set_phase(AgentPhase.FINISHED)
+
+        # ── Evaluation event ──────────────────────────────────────────────
+        push_evaluate_event(
+            client,
+            run_state,
+            status=exec_status,
+            cost=cost,
+            llm_calls=llm_calls,
+            iterations=run_state.iteration,
+        )
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
@@ -309,9 +381,21 @@ def run() -> int:
         exit_code = 1
     finally:
         run_state.set_running(False)
-        # Stop background threads and do one final upload
+
+        # ── Finish event (always) ─────────────────────────────────────────
+        try:
+            push_finish_event(
+                client,
+                run_state,
+                exit_code=exit_code,
+                reason="error" if exit_code != 0 else "completed",
+            )
+        except Exception:
+            logger.debug("[runner] push_finish_event failed", exc_info=True)
+
+        # ── Stop background threads ───────────────────────────────────────
+        heartbeat.stop()
         pause_ctrl.stop()
-        uploader.stop()
-        uploader.join(timeout=10)
+        heartbeat.join(timeout=5)
 
     return exit_code

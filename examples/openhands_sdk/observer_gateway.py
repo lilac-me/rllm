@@ -187,12 +187,28 @@ class ObserverHandler(BaseHTTPRequestHandler):
         self._response_code = 0
         self._ts_end = self._ts_start
         self._session_id_for_log: str | None = None
+        # DEBUG: log every inbound request immediately
+        logger.debug(
+            "[gateway] --> %s %s  client=%s",
+            getattr(self, "command", "?"),
+            self.path,
+            self._client_ip(),
+        )
         try:
             super().handle_one_request()
         finally:
+            elapsed_ms = (self._ts_end - self._ts_start) * 1000
+            logger.debug(
+                "[gateway] <-- %s %s  status=%d  body=%db  %.1fms  client=%s",
+                getattr(self, "command", "?"),
+                self.path.split("?")[0],
+                self._response_code,
+                self._body_bytes,
+                elapsed_ms,
+                self._client_ip(),
+            )
             if _db is not None:
                 try:
-                    elapsed_ms = (self._ts_end - self._ts_start) * 1000
                     _db.log_request(
                         method=self.command or "",
                         path=self.path.split("?")[0],
@@ -402,13 +418,22 @@ class ObserverHandler(BaseHTTPRequestHandler):
         client_ip = self._client_ip()
         now = time.time()
 
+        # DEBUG: summarise incoming state
+        phase = body.get("phase", "?")
+        iteration = body.get("iteration", "?")
+        is_running = body.get("is_running", "?")
+        new_events = body.get("events", [])
+        logger.debug(
+            "[gateway] POST state  session=%s  phase=%s  iter=%s  running=%s  embedded_events=%d  from=%s",
+            session_id, phase, iteration, is_running, len(new_events), client_ip,
+        )
+
         # Update in-memory live state
         sess = _get_or_create(session_id)
         with _SESSION_LOCK:
             sess["state"] = body
             sess["updated_at"] = now
             # Merge events into RAM ring buffer
-            new_events = body.get("events", [])
             if new_events:
                 existing_ids = {e.get("event_id") for e in sess["events"]}
                 for ev in new_events:
@@ -422,7 +447,6 @@ class ObserverHandler(BaseHTTPRequestHandler):
         if _db:
             label = body.get("session_label", "")
             meta = body.get("extra_metadata", {})
-            is_first = sess["state"] is body   # always True here, but harmless
             _db.upsert_session(
                 session_id, label=label, metadata=meta, first_state=True
             )
@@ -431,7 +455,6 @@ class ObserverHandler(BaseHTTPRequestHandler):
             if new_events:
                 _db.save_events(session_id, new_events, client_ip=client_ip)
 
-        logger.debug("[gateway] State snapshot saved for session %s", session_id)
         self._send_json(200, {"ok": True})
 
     def _handle_list_snapshots(self, session_id: str) -> None:
@@ -492,6 +515,15 @@ class ObserverHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
 
+        # DEBUG: show every inbound event
+        event_type = body.get("event_type", "?")
+        summary = body.get("summary", "")
+        client_ip = self._client_ip()
+        logger.debug(
+            "[gateway] POST event  session=%s  type=%s  summary=%s  from=%s",
+            session_id, event_type, summary[:120], client_ip,
+        )
+
         sess = _get_or_create(session_id)
         with _SESSION_LOCK:
             sess["events"].append(body)
@@ -500,7 +532,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
                 sess["events"] = sess["events"][-_MAX_MEM_EVENTS:]
 
         if _db:
-            _db.save_events(session_id, [body], client_ip=self._client_ip())
+            _db.save_events(session_id, [body], client_ip=client_ip)
 
         self._send_json(200, {"ok": True})
 
@@ -520,6 +552,11 @@ class ObserverHandler(BaseHTTPRequestHandler):
         sess = _get_or_create(session_id)
         with _SESSION_LOCK:
             ctrl = dict(sess["control"])
+        # DEBUG: log control poll result
+        logger.debug(
+            "[gateway] GET control  session=%s  pause=%s  resume=%s  from=%s",
+            session_id, ctrl.get("pause"), ctrl.get("resume"), self._client_ip(),
+        )
         # Log as an outbound poll
         if _db:
             _db.log_control(
@@ -599,6 +636,10 @@ def serve(
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    logger.debug(
+        "[gateway] Log level set to %s — DEBUG output is active", log_level.upper()
     )
 
     # Initialise persistence
