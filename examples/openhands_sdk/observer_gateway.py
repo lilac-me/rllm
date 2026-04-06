@@ -80,7 +80,7 @@ import queue
 import re
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -1089,7 +1089,11 @@ def serve(
     else:
         logger.warning("Dashboard directory not found at %s — static serving disabled", _dash)
 
-    server = HTTPServer((host, port), ObserverHandler)
+    # ThreadingHTTPServer: each connection runs in its own thread.
+    # This is REQUIRED for SSE — the blocking q.get() in _handle_sse_stream
+    # would otherwise stall the entire server.
+    server = ThreadingHTTPServer((host, port), ObserverHandler)
+    server.daemon_threads = True   # threads terminate when main thread exits
     logger.info("Observer gateway listening on http://%s:%d", host, port)
     logger.info("DB: %s", db_path)
     logger.info("─" * 60)
