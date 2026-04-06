@@ -341,131 +341,308 @@ async function loadRawState() {
   if (el) el.textContent = JSON.stringify(state, null, 2);
 }
 
+// ── Payload cache & batch loader ─────────────────────────────────────────
+const _payloadCache = new Map(); // dbId → payload
+
+async function batchLoadPayloads(events) {
+  const toLoad = events.filter(e => e.id && !_payloadCache.has(e.id)).slice(0, 60);
+  if (!toLoad.length) return;
+  await Promise.all(toLoad.map(async (ev) => {
+    try {
+      const p = await API.events.payload(AppState.currentSessionId, ev.id);
+      _payloadCache.set(ev.id, p);
+    } catch (_) {
+      _payloadCache.set(ev.id, ev); // fallback
+    }
+  }));
+}
+
 // ── Commands tab ──────────────────────────────────────────────────────────
 async function loadCommands() {
   const container = document.getElementById('commands-content');
   if (!container) return;
+  container.innerHTML = '<div class="tab-loading"><div class="spinner"></div><span>Loading actions…</span></div>';
 
-  // First try state.command_history (populated for finished sessions)
-  const state = await API.state(AppState.currentSessionId).catch(() => null);
-  const cmds = state?.command_history || [];
-
-  if (cmds.length) {
-    const rows = cmds.map(c => {
-      const ok = (c.exit_code ?? 0) === 0;
-      return `<tr>
-        <td class="cmd-text">${escHtml(c.cmd || c.command || '')}</td>
-        <td><span class="${ok ? 'badge-ok' : 'badge-err'}">${c.exit_code ?? '?'}</span></td>
-        <td class="output-preview">${escHtml(String(c.stdout || c.output || '').slice(0, 150))}</td>
-      </tr>`;
-    }).join('');
-    container.innerHTML = `<table class="data-table"><thead><tr><th>Command</th><th>Exit</th><th>Output preview</th></tr></thead><tbody>${rows}</tbody></table>`;
-    return;
-  }
-
-  // Fallback: derive from loaded timeline events (ActionEvent + ObservationEvent pairs)
-  const actions = AppState.currentEvents.filter(e => e.event_type === 'ActionEvent');
-  const obsMap = {};
-  AppState.currentEvents.filter(e => e.event_type === 'ObservationEvent').forEach(e => {
-    // ObservationEvent summary paired to preceding action by index proximity
-    obsMap[e.id] = e;
-  });
-
-  if (!actions.length) {
-    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><p>No commands yet</p><small>Commands appear after the agent executes tool actions</small></div>';
-    return;
-  }
-
-  // Build action+observation pairs from the flat events list
+  // Gather ActionEvent + ObservationEvent from timeline
   const allEvts = AppState.currentEvents;
-  const rows = [];
+  const actionEvts = allEvts.filter(e => e.event_type === 'ActionEvent');
+
+  if (!actionEvts.length) {
+    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><p>No tool actions yet</p><small>Actions appear as the agent executes tool calls</small></div>';
+    return;
+  }
+
+  // Batch-load payloads for actions + following observations
+  const obsEvts = allEvts.filter(e => e.event_type === 'ObservationEvent');
+  await batchLoadPayloads([...actionEvts, ...obsEvts]);
+
+  // Build pairs: each ActionEvent → find next ObservationEvent
+  const cards = [];
   for (let i = 0; i < allEvts.length; i++) {
     const ev = allEvts[i];
     if (ev.event_type !== 'ActionEvent') continue;
-    const parsed = EventCards.parseSummary(ev.summary);
-    const tool = parsed.tool || '?';
-    const thought = parsed.text || '';
-    // Find the next ObservationEvent
-    let obs = null;
-    for (let j = i + 1; j < Math.min(i + 3, allEvts.length); j++) {
-      if (allEvts[j].event_type === 'ObservationEvent') { obs = allEvts[j]; break; }
-    }
-    const obsParsed = obs ? EventCards.parseSummary(obs.summary) : null;
-    const obsText = obsParsed ? obsParsed.text : '';
+    const payload = _payloadCache.get(ev.id) || ev;
+    const raw = payload.raw || {};
+    const action = raw.action || {};
+    const toolCall = raw.tool_call || {};
+    const thought = (raw.thought && raw.thought[0] && raw.thought[0].text) || '';
+    const toolName = raw.tool_name || action.kind?.replace('Action', '') || '?';
     const ts = EventCards.fmtAbsTime(ev.timestamp_str || ev.received_at);
-    rows.push(`<tr>
-      <td><span class="ev-tool-badge" style="font-size:11px">${escHtml(tool)}</span></td>
-      <td class="cmd-text" title="${escHtml(thought)}">${escHtml(thought.slice(0, 100))}</td>
-      <td class="output-preview" title="${escHtml(obsText)}">${escHtml(obsText.slice(0, 120))}</td>
-      <td class="ev-time">${ts}</td>
-    </tr>`);
+
+    // Parse action params from tool_call.arguments or action object
+    let argsObj = {};
+    try { argsObj = JSON.parse(toolCall.arguments || '{}'); } catch (_) {}
+    // Merge with action fields as fallback
+    const mergedArgs = { ...action, ...argsObj };
+    delete mergedArgs.kind;
+
+    // Build params display: command, path, query — all non-null fields
+    const paramLines = Object.entries(mergedArgs)
+      .filter(([, v]) => v != null && v !== '' && !['file_text','old_str','new_str','insert_line','view_range'].includes(_))
+      .map(([k, v]) => ({ key: k, val: String(v) }));
+    const hasBodyContent = ['file_text','old_str','new_str'].some(k => mergedArgs[k] != null);
+
+    // Find paired ObservationEvent
+    let obs = null, obsPayload = null;
+    for (let j = i + 1; j < Math.min(i + 4, allEvts.length); j++) {
+      if (allEvts[j].event_type === 'ObservationEvent') {
+        obs = allEvts[j];
+        obsPayload = _payloadCache.get(obs.id) || obs;
+        break;
+      }
+    }
+    const obsRaw = obsPayload?.raw || {};
+    const obsContent = (obsRaw.observation?.content && obsRaw.observation.content[0]?.text)
+      || EventCards.parseSummary(obs?.summary || '').text || '';
+    const obsIsError = obsRaw.observation?.is_error || false;
+
+    // Make unique card id
+    const cardId = `cmd-card-${ev.id}`;
+    cards.push({ ev, payload, toolName, thought, paramLines, hasBodyContent, mergedArgs, obsContent, obsIsError, ts, cardId, obs });
   }
 
-  if (!rows.length) {
-    container.innerHTML = '<div class="empty-state"><p>No tool actions found in timeline</p></div>';
-    return;
+  container.innerHTML = '';
+
+  for (const { ev, payload, toolName, thought, paramLines, hasBodyContent, mergedArgs, obsContent, obsIsError, ts, cardId, obs } of cards) {
+    const card = document.createElement('div');
+    card.className = 'cmd-card';
+    card.id = cardId;
+
+    // Primary line: tool + key param
+    const primaryParam = paramLines.find(p => ['command','path','query','code'].includes(p.key));
+    const primaryVal = primaryParam ? primaryParam.val : (paramLines[0]?.val || '');
+
+    const paramRowsHtml = paramLines.map(({ key, val }) => `
+      <div class="cmd-param-row">
+        <span class="cmd-param-key">${escHtml(key)}</span>
+        <span class="cmd-param-val">${escHtml(val.slice(0, 300))}</span>
+      </div>`).join('');
+
+    const bodyFields = ['file_text','new_str'].filter(k => mergedArgs[k] != null);
+    const bodyHtml = bodyFields.map(k => `
+      <div class="cmd-body-block">
+        <div class="cmd-body-label">${k}</div>
+        <pre class="cmd-body-pre">${escHtml(String(mergedArgs[k]).slice(0, 2000))}</pre>
+      </div>`).join('');
+
+    const oldStrHtml = mergedArgs.old_str != null ? `
+      <div class="cmd-body-block">
+        <div class="cmd-body-label">old_str (to replace)</div>
+        <pre class="cmd-body-pre cmd-body-del">${escHtml(String(mergedArgs.old_str).slice(0, 1000))}</pre>
+      </div>` : '';
+
+    card.innerHTML = `
+      <div class="cmd-card-header">
+        <span class="cmd-tool-badge">${escHtml(toolName)}</span>
+        <span class="cmd-primary-param" title="${escHtml(primaryVal)}">${escHtml(primaryVal.slice(0, 120))}</span>
+        <span class="cmd-ts">${ts}</span>
+        <button class="cmd-detail-btn" title="View full payload">detail</button>
+      </div>
+      <div class="cmd-params">${paramRowsHtml}</div>
+      ${hasBodyContent ? `
+        <details class="cmd-body-details">
+          <summary class="cmd-body-summary">content changes</summary>
+          ${oldStrHtml}${bodyHtml}
+        </details>` : ''}
+      ${thought ? `
+        <details class="cmd-thought-details">
+          <summary class="cmd-thought-summary">💭 thought</summary>
+          <div class="cmd-thought-text">${escHtml(thought.slice(0, 1000))}</div>
+        </details>` : ''}
+      ${obsContent ? `
+        <div class="cmd-result${obsIsError ? ' cmd-result--error' : ''}">
+          <span class="cmd-result-label">${obsIsError ? '✗ error' : '✓ result'}</span>
+          <span class="cmd-result-text" title="${escHtml(obsContent)}">${escHtml(obsContent.slice(0, 300))}</span>
+        </div>` : ''}`;
+
+    card.querySelector('.cmd-detail-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openDrawer(ev);
+    });
+    card.addEventListener('click', () => openDrawer(ev));
+    container.appendChild(card);
   }
-  container.innerHTML = `<table class="data-table"><thead><tr><th>Tool</th><th>Action / Thought</th><th>Result preview</th><th>Time</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
 }
 
 // ── LLM Context tab ───────────────────────────────────────────────────────
 async function loadLLMContext() {
   const container = document.getElementById('llm-context-content');
   if (!container) return;
+  container.innerHTML = '<div class="tab-loading"><div class="spinner"></div><span>Building conversation…</span></div>';
 
-  // First try state.llm_context_snapshot (finished sessions with EvaluateEvent)
-  const state = await API.state(AppState.currentSessionId).catch(() => null);
-  const msgs = state?.llm_context_snapshot || [];
-  if (msgs.length) {
-    container.innerHTML = msgs.map(m => {
-      const role = m.role || 'unknown';
-      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      return `<div class="llm-msg ${role}"><div class="llm-role">${role}</div><div class="llm-content">${escHtml(content.slice(0, 600))}${content.length > 600 ? '…' : ''}</div></div>`;
-    }).join('');
-    return;
-  }
-
-  // Fallback: build from timeline events — SystemPromptEvent + MessageEvent
-  const contextEvents = AppState.currentEvents.filter(e =>
-    ['SystemPromptEvent', 'MessageEvent'].includes(e.event_type)
+  const allEvts = AppState.currentEvents;
+  const relevantEvts = allEvts.filter(e =>
+    ['SystemPromptEvent','ActionEvent','ObservationEvent','MessageEvent'].includes(e.event_type)
   );
 
-  if (!contextEvents.length) {
-    // Try loading full payload of the first SystemPromptEvent from DB
-    const sysEvt = AppState.currentEvents.find(e => e.event_type === 'SystemPromptEvent');
-    if (sysEvt && sysEvt.id) {
-      try {
-        const payload = await API.events.payload(AppState.currentSessionId, sysEvt.id);
-        const raw = payload.raw || {};
-        const parts = [];
-        if (raw.system_prompt) {
-          const sysText = raw.system_prompt.text || JSON.stringify(raw.system_prompt);
-          parts.push(`<div class="llm-msg system"><div class="llm-role">system prompt</div><div class="llm-content">${escHtml(sysText.slice(0, 1000))}${sysText.length > 1000 ? '…' : ''}</div></div>`);
-        }
-        if (raw.dynamic_context) {
-          const dynText = raw.dynamic_context.text || JSON.stringify(raw.dynamic_context);
-          parts.push(`<div class="llm-msg system"><div class="llm-role">dynamic context</div><div class="llm-content">${escHtml(dynText.slice(0, 600))}${dynText.length > 600 ? '…' : ''}</div></div>`);
-        }
-        if (raw.tools && raw.tools.length) {
-          const toolList = raw.tools.map(t => `<span class="ev-tool-badge" style="font-size:11px">${escHtml(t.title || t.name || '')}</span>`).join(' ');
-          parts.push(`<div class="llm-msg system"><div class="llm-role">tools (${raw.tools.length})</div><div class="llm-content">${toolList}</div></div>`);
-        }
-        if (parts.length) { container.innerHTML = parts.join(''); return; }
-      } catch (_) {}
-    }
-    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>No LLM context available yet</p><small>Context appears after the agent receives its system prompt</small></div>';
+  if (!relevantEvts.length) {
+    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>No conversation data yet</p><small>Conversation appears after the agent receives its system prompt and starts acting</small></div>';
     return;
   }
 
-  container.innerHTML = contextEvents.map(ev => {
-    const { prefix, text } = EventCards.parseSummary(ev.summary);
-    const role = ev.source === 'agent' ? 'assistant' : (ev.event_type === 'SystemPromptEvent' ? 'system' : 'user');
+  // Batch-load payloads for all relevant events
+  await batchLoadPayloads(relevantEvts);
+
+  container.innerHTML = '';
+  const iterCounts = {};
+
+  for (let i = 0; i < allEvts.length; i++) {
+    const ev = allEvts[i];
+    if (!['SystemPromptEvent','ActionEvent','ObservationEvent','MessageEvent'].includes(ev.event_type)) continue;
+
+    const payload = _payloadCache.get(ev.id) || ev;
+    const raw = payload.raw || {};
     const ts = EventCards.fmtAbsTime(ev.timestamp_str || ev.received_at);
-    return `<div class="llm-msg ${role}">
-      <div class="llm-role">${ev.event_type.replace('Event','')} · ${ev.source} · ${ts}</div>
-      <div class="llm-content">${escHtml(text.slice(0, 600))}${text.length > 600 ? '…' : ''}</div>
-    </div>`;
-  }).join('');
+
+    if (ev.event_type === 'SystemPromptEvent') {
+      // System Prompt block
+      const sysText = raw.system_prompt?.text || '[No system prompt text]';
+      const dynText = raw.dynamic_context?.text || '';
+      const tools = (raw.tools || []).map(t => t.title || t.name || '').filter(Boolean);
+      const el = document.createElement('div');
+      el.className = 'conv-turn conv-system';
+      el.innerHTML = `
+        <div class="conv-turn-header">
+          <span class="conv-role-badge role-system">SYSTEM</span>
+          <span class="conv-ts">${ts}</span>
+          <button class="conv-detail-btn">detail</button>
+        </div>
+        <details class="conv-block-details" open>
+          <summary class="conv-block-summary">System Prompt</summary>
+          <div class="conv-text">${escHtml(sysText.slice(0, 600))}${sysText.length > 600 ? '…' : ''}</div>
+        </details>
+        ${dynText ? `
+        <details class="conv-block-details">
+          <summary class="conv-block-summary">Dynamic Context</summary>
+          <div class="conv-text">${escHtml(dynText.slice(0, 600))}${dynText.length > 600 ? '…' : ''}</div>
+        </details>` : ''}
+        ${tools.length ? `
+        <div class="conv-tools-row">
+          <span class="conv-tools-label">tools:</span>
+          ${tools.map(t => `<span class="ev-tool-badge">${escHtml(t)}</span>`).join('')}
+        </div>` : ''}`;
+      el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
+      container.appendChild(el);
+
+    } else if (ev.event_type === 'ActionEvent') {
+      // LLM turn: includes reasoning + thought + tool call
+      const toolName = raw.tool_name || raw.action?.kind?.replace('Action','') || '?';
+      const thoughts = (raw.thought || []).map(t => t.text || '').join('\n').trim();
+      const reasoning = raw.reasoning_content || '';
+      const toolCall = raw.tool_call || {};
+      let argsObj = {};
+      try { argsObj = JSON.parse(toolCall.arguments || '{}'); } catch (_) {}
+      const action = raw.action || {};
+      // Merge for display
+      const displayArgs = { ...action, ...argsObj };
+      delete displayArgs.kind;
+      const argsLines = Object.entries(displayArgs)
+        .filter(([, v]) => v != null && v !== '')
+        .map(([k, v]) => ({ k, v: String(v) }));
+
+      const iterKey = ev.event_id?.slice(0, 8) || i;
+      const iterNum = Object.keys(iterCounts).length + 1;
+      iterCounts[iterKey] = true;
+
+      const el = document.createElement('div');
+      el.className = 'conv-turn conv-assistant';
+      el.innerHTML = `
+        <div class="conv-turn-header">
+          <span class="conv-role-badge role-assistant">ASSISTANT</span>
+          <span class="conv-iter-badge">turn ${iterNum}</span>
+          <span class="conv-tool-tag">${escHtml(toolName)}</span>
+          <span class="conv-ts">${ts}</span>
+          <button class="conv-detail-btn">detail</button>
+        </div>
+        ${reasoning ? `
+        <details class="conv-block-details">
+          <summary class="conv-block-summary">🧠 Reasoning (${reasoning.length} chars)</summary>
+          <div class="conv-reasoning">${escHtml(reasoning.slice(0, 2000))}${reasoning.length > 2000 ? '…' : ''}</div>
+        </details>` : ''}
+        ${thoughts ? `
+        <div class="conv-thought">
+          <span class="conv-thought-icon">💬</span>
+          <div class="conv-thought-text">${escHtml(thoughts.slice(0, 600))}${thoughts.length > 600 ? '…' : ''}</div>
+        </div>` : ''}
+        <div class="conv-tool-call">
+          <div class="conv-tool-call-header">
+            <span class="conv-tool-call-label">⚡ ${escHtml(toolName)}</span>
+          </div>
+          <div class="conv-args">${argsLines.map(({ k, v }) => `
+            <div class="conv-arg-row">
+              <span class="conv-arg-key">${escHtml(k)}</span>
+              <span class="conv-arg-val" title="${escHtml(v)}">${escHtml(v.slice(0, 400))}</span>
+            </div>`).join('')}
+          </div>
+        </div>`;
+      el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
+      el.addEventListener('click', (e) => { if (!e.target.closest('.conv-detail-btn') && !e.target.closest('details') && !e.target.closest('summary')) openDrawer(ev); });
+      container.appendChild(el);
+
+    } else if (ev.event_type === 'ObservationEvent') {
+      // Tool result turn
+      const obsRaw = raw.observation || {};
+      const content = (obsRaw.content && obsRaw.content[0]?.text) || EventCards.parseSummary(ev.summary).text || '';
+      const isError = obsRaw.is_error || false;
+      const toolName = raw.tool_name || '?';
+
+      const el = document.createElement('div');
+      el.className = `conv-turn conv-tool-result${isError ? ' conv-tool-error' : ''}`;
+      el.innerHTML = `
+        <div class="conv-turn-header">
+          <span class="conv-role-badge role-tool">TOOL</span>
+          <span class="conv-tool-tag">${escHtml(toolName)}</span>
+          ${isError ? '<span class="conv-error-badge">ERROR</span>' : ''}
+          <span class="conv-ts">${ts}</span>
+          <button class="conv-detail-btn">detail</button>
+        </div>
+        <details class="conv-block-details" ${content.length < 400 ? 'open' : ''}>
+          <summary class="conv-block-summary">Result (${content.length} chars)</summary>
+          <pre class="conv-result-pre">${escHtml(content.slice(0, 3000))}${content.length > 3000 ? '\n…[truncated]' : ''}</pre>
+        </details>`;
+      el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
+      container.appendChild(el);
+
+    } else if (ev.event_type === 'MessageEvent') {
+      const { text } = EventCards.parseSummary(ev.summary);
+      const role = ev.source === 'agent' ? 'assistant' : 'user';
+      const el = document.createElement('div');
+      el.className = `conv-turn conv-${role}`;
+      el.innerHTML = `
+        <div class="conv-turn-header">
+          <span class="conv-role-badge role-${role}">${role.toUpperCase()}</span>
+          <span class="conv-ts">${ts}</span>
+          <button class="conv-detail-btn">detail</button>
+        </div>
+        <div class="conv-thought"><div class="conv-thought-text">${escHtml(text.slice(0, 600))}</div></div>`;
+      el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
+      container.appendChild(el);
+    }
+  }
+
+  if (!container.children.length) {
+    container.innerHTML = '<div class="empty-state"><p>No conversation data</p></div>';
+  }
 }
 
 function escHtml(s) {
@@ -650,6 +827,7 @@ async function selectSession(sessionId) {
   }
 
   AppState.currentSessionId = sessionId;
+  _payloadCache.clear(); // clear stale payloads from previous session
 
   // UI: show session view
   document.getElementById('welcome-view')?.classList.add('hidden');
