@@ -5,9 +5,9 @@ from rllm OpenHands containers and serves the observability dashboard.
 Run with:
     python observer_gateway.py [--host HOST] [--port PORT] [--db PATH]
 
-Default: http://0.0.0.0:8858   db: ./observer_data.db
+Default: http://0.0.0.0:18858   db: ./observer_data.db
 
-Dashboard: http://localhost:8858/
+Dashboard: http://localhost:18858/
 
 ─────────────────────────────────────────────────────────────────────────────
 REST API
@@ -1061,7 +1061,7 @@ class ObserverHandler(BaseHTTPRequestHandler):
 
 def serve(
     host: str = "0.0.0.0",
-    port: int = 8858,
+    port: int = 18858,
     db_path: str = "observer_data.db",
     log_level: str = "INFO",
 ) -> None:
@@ -1120,7 +1120,7 @@ def serve(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="rllm OpenHands Observer Gateway")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8858, help="Bind port (default: 8858)")
+    parser.add_argument("--port", type=int, default=18858, help="Bind port (default: 18858)")
     parser.add_argument(
         "--db", default="observer_data.db",
         help="SQLite database path (default: observer_data.db in CWD)"

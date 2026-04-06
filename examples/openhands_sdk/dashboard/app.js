@@ -171,6 +171,7 @@ function renderSessionList(sessions) {
     const cost = s.accumulated_cost ? `$${Number(s.accumulated_cost).toFixed(4)}` : '';
     const uptime = s.uptime_seconds ? fmtUptime(s.uptime_seconds) : '';
     const label = s.label || s.session_id;
+    const timeStr = fmtDateTime(s.created_at || s.updated_at);
     const item = document.createElement('div');
     item.className = `session-item ${phaseClass}${s.session_id === AppState.currentSessionId ? ' active' : ''}`;
     item.dataset.sid = s.session_id;
@@ -178,6 +179,7 @@ function renderSessionList(sessions) {
       <div class="session-item-header">
         <div class="phase-dot ${phaseClass}"></div>
         <div class="session-item-label" title="${label}">${label}</div>
+        ${timeStr ? `<span class="session-item-time">${timeStr}</span>` : ''}
       </div>
       <div class="session-item-meta">
         <span>iter <span class="session-meta-val">${s.iteration || 0}</span></span>
@@ -199,6 +201,16 @@ function fmtUptime(s) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   return `${Math.floor(s / 3600)}h`;
+}
+
+function fmtDateTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  if (isNaN(d)) return '';
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 // ── KPI panel ─────────────────────────────────────────────────────────────
@@ -331,33 +343,128 @@ async function loadRawState() {
 
 // ── Commands tab ──────────────────────────────────────────────────────────
 async function loadCommands() {
-  const state = await API.state(AppState.currentSessionId).catch(() => null);
   const container = document.getElementById('commands-content');
   if (!container) return;
+
+  // First try state.command_history (populated for finished sessions)
+  const state = await API.state(AppState.currentSessionId).catch(() => null);
   const cmds = state?.command_history || [];
-  if (!cmds.length) { container.innerHTML = '<div class="empty-state"><p>No commands recorded</p></div>'; return; }
-  const rows = cmds.map(c => {
-    const ok = (c.exit_code || 0) === 0;
-    return `<tr>
-      <td class="cmd-text">${escHtml(c.cmd || c.command || '')}</td>
-      <td><span class="${ok ? 'badge-ok' : 'badge-err'}">${c.exit_code ?? '?'}</span></td>
-      <td class="output-preview">${escHtml(String(c.stdout || '').slice(0, 100))}</td>
-    </tr>`;
-  }).join('');
-  container.innerHTML = `<table class="data-table"><thead><tr><th>Command</th><th>Exit</th><th>Output preview</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  if (cmds.length) {
+    const rows = cmds.map(c => {
+      const ok = (c.exit_code ?? 0) === 0;
+      return `<tr>
+        <td class="cmd-text">${escHtml(c.cmd || c.command || '')}</td>
+        <td><span class="${ok ? 'badge-ok' : 'badge-err'}">${c.exit_code ?? '?'}</span></td>
+        <td class="output-preview">${escHtml(String(c.stdout || c.output || '').slice(0, 150))}</td>
+      </tr>`;
+    }).join('');
+    container.innerHTML = `<table class="data-table"><thead><tr><th>Command</th><th>Exit</th><th>Output preview</th></tr></thead><tbody>${rows}</tbody></table>`;
+    return;
+  }
+
+  // Fallback: derive from loaded timeline events (ActionEvent + ObservationEvent pairs)
+  const actions = AppState.currentEvents.filter(e => e.event_type === 'ActionEvent');
+  const obsMap = {};
+  AppState.currentEvents.filter(e => e.event_type === 'ObservationEvent').forEach(e => {
+    // ObservationEvent summary paired to preceding action by index proximity
+    obsMap[e.id] = e;
+  });
+
+  if (!actions.length) {
+    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><p>No commands yet</p><small>Commands appear after the agent executes tool actions</small></div>';
+    return;
+  }
+
+  // Build action+observation pairs from the flat events list
+  const allEvts = AppState.currentEvents;
+  const rows = [];
+  for (let i = 0; i < allEvts.length; i++) {
+    const ev = allEvts[i];
+    if (ev.event_type !== 'ActionEvent') continue;
+    const parsed = EventCards.parseSummary(ev.summary);
+    const tool = parsed.tool || '?';
+    const thought = parsed.text || '';
+    // Find the next ObservationEvent
+    let obs = null;
+    for (let j = i + 1; j < Math.min(i + 3, allEvts.length); j++) {
+      if (allEvts[j].event_type === 'ObservationEvent') { obs = allEvts[j]; break; }
+    }
+    const obsParsed = obs ? EventCards.parseSummary(obs.summary) : null;
+    const obsText = obsParsed ? obsParsed.text : '';
+    const ts = EventCards.fmtAbsTime(ev.timestamp_str || ev.received_at);
+    rows.push(`<tr>
+      <td><span class="ev-tool-badge" style="font-size:11px">${escHtml(tool)}</span></td>
+      <td class="cmd-text" title="${escHtml(thought)}">${escHtml(thought.slice(0, 100))}</td>
+      <td class="output-preview" title="${escHtml(obsText)}">${escHtml(obsText.slice(0, 120))}</td>
+      <td class="ev-time">${ts}</td>
+    </tr>`);
+  }
+
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty-state"><p>No tool actions found in timeline</p></div>';
+    return;
+  }
+  container.innerHTML = `<table class="data-table"><thead><tr><th>Tool</th><th>Action / Thought</th><th>Result preview</th><th>Time</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
 }
 
 // ── LLM Context tab ───────────────────────────────────────────────────────
 async function loadLLMContext() {
-  const state = await API.state(AppState.currentSessionId).catch(() => null);
   const container = document.getElementById('llm-context-content');
   if (!container) return;
+
+  // First try state.llm_context_snapshot (finished sessions with EvaluateEvent)
+  const state = await API.state(AppState.currentSessionId).catch(() => null);
   const msgs = state?.llm_context_snapshot || [];
-  if (!msgs.length) { container.innerHTML = '<div class="empty-state"><p>No LLM context snapshot</p></div>'; return; }
-  container.innerHTML = msgs.map(m => {
-    const role = m.role || 'unknown';
-    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-    return `<div class="llm-msg ${role}"><div class="llm-role">${role}</div><div class="llm-content">${escHtml(content.slice(0, 600))}${content.length > 600 ? '…' : ''}</div></div>`;
+  if (msgs.length) {
+    container.innerHTML = msgs.map(m => {
+      const role = m.role || 'unknown';
+      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+      return `<div class="llm-msg ${role}"><div class="llm-role">${role}</div><div class="llm-content">${escHtml(content.slice(0, 600))}${content.length > 600 ? '…' : ''}</div></div>`;
+    }).join('');
+    return;
+  }
+
+  // Fallback: build from timeline events — SystemPromptEvent + MessageEvent
+  const contextEvents = AppState.currentEvents.filter(e =>
+    ['SystemPromptEvent', 'MessageEvent'].includes(e.event_type)
+  );
+
+  if (!contextEvents.length) {
+    // Try loading full payload of the first SystemPromptEvent from DB
+    const sysEvt = AppState.currentEvents.find(e => e.event_type === 'SystemPromptEvent');
+    if (sysEvt && sysEvt.id) {
+      try {
+        const payload = await API.events.payload(AppState.currentSessionId, sysEvt.id);
+        const raw = payload.raw || {};
+        const parts = [];
+        if (raw.system_prompt) {
+          const sysText = raw.system_prompt.text || JSON.stringify(raw.system_prompt);
+          parts.push(`<div class="llm-msg system"><div class="llm-role">system prompt</div><div class="llm-content">${escHtml(sysText.slice(0, 1000))}${sysText.length > 1000 ? '…' : ''}</div></div>`);
+        }
+        if (raw.dynamic_context) {
+          const dynText = raw.dynamic_context.text || JSON.stringify(raw.dynamic_context);
+          parts.push(`<div class="llm-msg system"><div class="llm-role">dynamic context</div><div class="llm-content">${escHtml(dynText.slice(0, 600))}${dynText.length > 600 ? '…' : ''}</div></div>`);
+        }
+        if (raw.tools && raw.tools.length) {
+          const toolList = raw.tools.map(t => `<span class="ev-tool-badge" style="font-size:11px">${escHtml(t.title || t.name || '')}</span>`).join(' ');
+          parts.push(`<div class="llm-msg system"><div class="llm-role">tools (${raw.tools.length})</div><div class="llm-content">${toolList}</div></div>`);
+        }
+        if (parts.length) { container.innerHTML = parts.join(''); return; }
+      } catch (_) {}
+    }
+    container.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>No LLM context available yet</p><small>Context appears after the agent receives its system prompt</small></div>';
+    return;
+  }
+
+  container.innerHTML = contextEvents.map(ev => {
+    const { prefix, text } = EventCards.parseSummary(ev.summary);
+    const role = ev.source === 'agent' ? 'assistant' : (ev.event_type === 'SystemPromptEvent' ? 'system' : 'user');
+    const ts = EventCards.fmtAbsTime(ev.timestamp_str || ev.received_at);
+    return `<div class="llm-msg ${role}">
+      <div class="llm-role">${ev.event_type.replace('Event','')} · ${ev.source} · ${ts}</div>
+      <div class="llm-content">${escHtml(text.slice(0, 600))}${text.length > 600 ? '…' : ''}</div>
+    </div>`;
   }).join('');
 }
 
@@ -769,7 +876,21 @@ async function init() {
   initLabelEdit();
   initKeyboard();
 
-  document.getElementById('refresh-btn')?.addEventListener('click', refreshSessions);
+  document.getElementById('refresh-btn')?.addEventListener('click', () => {
+    refreshSessions();
+    toast('Refreshed', '', 1200);
+  });
+
+  // Theme toggle
+  const themeBtn = document.getElementById('theme-btn');
+  const applyTheme = (light) => {
+    document.body.classList.toggle('theme-light', light);
+    localStorage.setItem('oh-theme', light ? 'light' : 'dark');
+  };
+  applyTheme(localStorage.getItem('oh-theme') === 'light');
+  themeBtn?.addEventListener('click', () => {
+    applyTheme(!document.body.classList.contains('theme-light'));
+  });
 
   // Initial load
   await refreshSessions();
