@@ -307,8 +307,8 @@ function initTabs() {
       const panel = document.getElementById(`tab-panel-${btn.dataset.tab}`);
       if (panel) { panel.classList.remove('hidden'); panel.classList.add('active'); }
       if (btn.dataset.tab === 'state') loadRawState();
-      if (btn.dataset.tab === 'commands') loadCommands();
-      if (btn.dataset.tab === 'llm-context') loadLLMContext();
+      if (btn.dataset.tab === 'commands') safeTabLoad(loadCommands, 'commands-content', 'Commands')();
+      if (btn.dataset.tab === 'llm-context') safeTabLoad(loadLLMContext, 'llm-context-content', 'LLMContext')();
       if (btn.dataset.tab === 'config') loadConfig();
     });
   });
@@ -347,15 +347,29 @@ const _payloadCache = new Map(); // dbId → payload
 async function batchLoadPayloads(events) {
   const toLoad = events.filter(e => e.id && !_payloadCache.has(e.id)).slice(0, 60);
   if (!toLoad.length) return;
-  await Promise.all(toLoad.map(async (ev) => {
+  await Promise.allSettled(toLoad.map(async (ev) => {
     try {
       const p = await API.events.payload(AppState.currentSessionId, ev.id);
       _payloadCache.set(ev.id, p);
     } catch (_) {
-      _payloadCache.set(ev.id, ev); // fallback
+      _payloadCache.set(ev.id, ev); // fallback to list event data
     }
   }));
 }
+
+// Safe wrapper: prevents spinner hang on any JS error
+function safeTabLoad(fn, containerId, label) {
+  return async function loadSafe() {
+    const container = document.getElementById(containerId);
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`[${label}]`, e);
+      if (container) container.innerHTML = `<div class="empty-state"><p style="color:var(--red)">Error: ${escHtml(e.message)}</p><small>Check browser console for details</small></div>`;
+    }
+  };
+}
+
 
 // ── Commands tab ──────────────────────────────────────────────────────────
 async function loadCommands() {
@@ -398,7 +412,7 @@ async function loadCommands() {
 
     // Build params display: command, path, query — all non-null fields
     const paramLines = Object.entries(mergedArgs)
-      .filter(([, v]) => v != null && v !== '' && !['file_text','old_str','new_str','insert_line','view_range'].includes(_))
+      .filter(([k, v]) => v != null && v !== '' && !['file_text','old_str','new_str','insert_line','view_range'].includes(k))
       .map(([k, v]) => ({ key: k, val: String(v) }));
     const hasBodyContent = ['file_text','old_str','new_str'].some(k => mergedArgs[k] != null);
 
@@ -557,7 +571,7 @@ async function loadLLMContext() {
       const displayArgs = { ...action, ...argsObj };
       delete displayArgs.kind;
       const argsLines = Object.entries(displayArgs)
-        .filter(([, v]) => v != null && v !== '')
+        .filter(([_k, v]) => v != null && v !== '')
         .map(([k, v]) => ({ k, v: String(v) }));
 
       const iterKey = ev.event_id?.slice(0, 8) || i;
