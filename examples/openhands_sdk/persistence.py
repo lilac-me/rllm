@@ -28,6 +28,7 @@ Schema (all tables keyed by session_id for per-instance isolation):
         received_at     REAL   (server-side unix timestamp)
         summary         TEXT
         payload         TEXT   (JSON)
+        visible         INTEGER  (1=visible, 0=hidden; default 1)
 
     request_log
         id              INTEGER PRIMARY KEY AUTOINCREMENT
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS events (
     timestamp_str   TEXT NOT NULL DEFAULT '',
     received_at     REAL NOT NULL,
     summary         TEXT NOT NULL DEFAULT '',
-    payload         TEXT NOT NULL DEFAULT '{}'
+    payload         TEXT NOT NULL DEFAULT '{}',
+    visible         INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -153,8 +155,21 @@ class GatewayDB:
         conn = self._open()
         conn.executescript(_SCHEMA)
         conn.commit()
+        # Live migration: add `visible` column if missing on older DBs
+        self._migrate(conn)
         conn.close()
         logger.info("[db] Opened SQLite database at %s", self._path)
+
+    # ── Schema migration ──────────────────────────────────────────────────
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Apply schema migrations for backward compatibility."""
+        # Check whether 'visible' column exists in events
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "visible" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
+            conn.commit()
+            logger.info("[db] Migration: added 'visible' column to events table")
 
     # ── Connection management ─────────────────────────────────────────────
 
@@ -220,19 +235,65 @@ class GatewayDB:
             finally:
                 conn.close()
 
+    def update_session_label(self, session_id: str, label: str) -> bool:
+        """Update the human-readable label of a session. Returns True if found."""
+        with self._write_lock:
+            conn = self._open()
+            try:
+                cur = conn.execute(
+                    "UPDATE sessions SET label = ? WHERE session_id = ?",
+                    (label, session_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                return False
+            finally:
+                conn.close()
+
     def list_sessions(self) -> list[dict[str, Any]]:
+        """List all sessions enriched with event counts and error counts."""
         conn = self._read_conn()
         rows = conn.execute(
-            "SELECT * FROM sessions ORDER BY last_seen_at DESC"
+            """
+            SELECT
+                s.session_id,
+                s.label,
+                s.created_at,
+                s.last_seen_at,
+                s.first_state_at,
+                s.metadata,
+                COUNT(e.id) AS event_count,
+                SUM(CASE WHEN e.event_type = 'AgentErrorEvent' THEN 1 ELSE 0 END) AS error_count
+            FROM sessions s
+            LEFT JOIN events e ON s.session_id = e.session_id
+            GROUP BY s.session_id
+            ORDER BY s.last_seen_at DESC
+            """
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["metadata"] = json.loads(d.get("metadata") or "{}")
+            except Exception:
+                d["metadata"] = {}
+            result.append(d)
+        return result
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         conn = self._read_conn()
         row = conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["metadata"] = json.loads(d.get("metadata") or "{}")
+        except Exception:
+            d["metadata"] = {}
+        return d
 
     def delete_session(self, session_id: str) -> bool:
         """Remove a session and all associated data."""
@@ -361,8 +422,8 @@ class GatewayDB:
                     cur = conn.execute(
                         """INSERT OR IGNORE INTO events
                            (session_id, event_id, event_type, source,
-                            timestamp_str, received_at, summary, payload)
-                           VALUES (?,?,?,?,?,?,?,?)""",
+                            timestamp_str, received_at, summary, payload, visible)
+                           VALUES (?,?,?,?,?,?,?,?,1)""",
                         (session_id, event_id, event_type, source,
                          timestamp_str, now, summary, payload_json),
                     )
@@ -375,6 +436,23 @@ class GatewayDB:
                 conn.close()
         return inserted
 
+    def update_event_visibility(self, event_db_id: int, visible: bool) -> bool:
+        """Toggle the visibility flag of an event. Returns True if found."""
+        val = 1 if visible else 0
+        with self._write_lock:
+            conn = self._open()
+            try:
+                cur = conn.execute(
+                    "UPDATE events SET visible = ? WHERE id = ?",
+                    (val, event_db_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                return False
+            finally:
+                conn.close()
+
     def list_events(
         self,
         session_id: str,
@@ -382,6 +460,7 @@ class GatewayDB:
         event_type: str | None = None,
         since: float | None = None,
         offset: int = 0,
+        visible: bool | None = None,  # None=all, True=visible only, False=hidden only
     ) -> list[dict[str, Any]]:
         conn = self._read_conn()
         conditions = ["session_id = ?"]
@@ -392,11 +471,15 @@ class GatewayDB:
         if since:
             conditions.append("received_at >= ?")
             params.append(since)
+        if visible is True:
+            conditions.append("visible = 1")
+        elif visible is False:
+            conditions.append("visible = 0")
         where = " AND ".join(conditions)
         params += [limit, offset]
         rows = conn.execute(
             f"""SELECT id, event_id, event_type, source, timestamp_str,
-                       received_at, summary
+                       received_at, summary, visible
                 FROM events WHERE {where}
                 ORDER BY received_at ASC, id ASC
                 LIMIT ? OFFSET ?""",
@@ -540,7 +623,7 @@ class GatewayDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # ── Global stats ──────────────────────────────────────────────────────
+    # ── KPI / Stats ────────────────────────────────────────────────────────
 
     def get_global_stats(self) -> dict[str, Any]:
         conn = self._read_conn()
@@ -576,4 +659,99 @@ class GatewayDB:
                     (session_id,),
                 ).fetchall()
             },
+        }
+
+    def get_session_kpi(self, session_id: str) -> dict[str, Any]:
+        """Aggregated KPI fields for the dashboard panel.
+
+        Returns timing metrics, event rates, and phase transitions derived
+        from the events table.  Live fields (cost, iteration, phase) are
+        intentionally omitted — the caller (gateway) merges them from the
+        in-memory state.
+        """
+        conn = self._read_conn()
+
+        # --- basic counts ---
+        counts_row = conn.execute(
+            """SELECT
+                COUNT(*) AS total_events,
+                SUM(CASE WHEN event_type='ActionEvent' THEN 1 ELSE 0 END) AS action_count,
+                SUM(CASE WHEN event_type='ObservationEvent' THEN 1 ELSE 0 END) AS observation_count,
+                SUM(CASE WHEN event_type='LLMCompletionLogEvent' THEN 1 ELSE 0 END) AS llm_completion_count,
+                SUM(CASE WHEN event_type='AgentErrorEvent' THEN 1 ELSE 0 END) AS error_count,
+                SUM(CASE WHEN event_type='HeartbeatEvent' THEN 1 ELSE 0 END) AS heartbeat_count,
+                MIN(received_at) AS first_event_at,
+                MAX(received_at) AS last_event_at
+            FROM events WHERE session_id=?""",
+            (session_id,),
+        ).fetchone()
+
+        total = counts_row["total_events"] or 0
+        first_at = counts_row["first_event_at"]
+        last_at = counts_row["last_event_at"]
+        duration = (last_at - first_at) if (first_at and last_at and last_at > first_at) else 0
+        events_per_minute = round((total / duration * 60), 2) if duration > 0 else 0.0
+
+        # --- event_type breakdown ---
+        breakdown = {
+            row["event_type"]: row["cnt"]
+            for row in conn.execute(
+                "SELECT event_type, COUNT(*) AS cnt FROM events WHERE session_id=? GROUP BY event_type",
+                (session_id,),
+            ).fetchall()
+        }
+
+        # --- phase transitions ---
+        # Extract from HeartbeatEvent and lifecycle event payloads.
+        # We select event_type + received_at + payload for phase-carrying events,
+        # then parse phase field from JSON payload, deduplicating consecutive identical phases.
+        phase_rows = conn.execute(
+            """SELECT event_type, received_at, payload
+               FROM events
+               WHERE session_id=?
+                 AND event_type IN (
+                   'StartupEvent','HeartbeatEvent','ActionEvent','ObservationEvent',
+                   'MessageEvent','PauseEvent','EvaluateEvent','FinishEvent'
+                 )
+               ORDER BY received_at ASC""",
+            (session_id,),
+        ).fetchall()
+
+        # Map event_type → inferred phase (fallback if payload lacks explicit phase)
+        _phase_map = {
+            "StartupEvent": "initializing",
+            "ActionEvent": "executing_command",
+            "ObservationEvent": "waiting_for_reply",
+            "MessageEvent": "waiting_for_reply",
+            "PauseEvent": "paused",
+            "EvaluateEvent": "finished",
+            "FinishEvent": "finished",
+        }
+
+        phase_transitions: list[dict[str, Any]] = []
+        last_phase = None
+        for pr in phase_rows:
+            try:
+                pl = json.loads(pr["payload"])
+                phase = pl.get("phase") or _phase_map.get(pr["event_type"], "")
+            except Exception:
+                phase = _phase_map.get(pr["event_type"], "")
+            if phase and phase != last_phase:
+                phase_transitions.append({"phase": phase, "at": pr["received_at"]})
+                last_phase = phase
+
+        return {
+            "session_id": session_id,
+            "total_events": total,
+            "action_count": counts_row["action_count"] or 0,
+            "observation_count": counts_row["observation_count"] or 0,
+            "llm_completion_count": counts_row["llm_completion_count"] or 0,
+            "error_count": counts_row["error_count"] or 0,
+            "heartbeat_count": counts_row["heartbeat_count"] or 0,
+            "event_type_breakdown": breakdown,
+            "first_event_at": first_at,
+            "last_event_at": last_at,
+            "duration_seconds": round(duration, 2),
+            "events_per_minute": events_per_minute,
+            "phase_transitions": phase_transitions,
         }

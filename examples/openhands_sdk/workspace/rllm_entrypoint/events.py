@@ -214,18 +214,32 @@ def make_event_callback(
 # ---------------------------------------------------------------------------
 
 def push_startup_event(client: "ObserverClient", run_state: RunState) -> None:
-    """Emit a 'startup' lifecycle event when the container starts."""
-    ev = _make_lifecycle_event(
-        "StartupEvent",
-        summary="[Startup] Container initialised and runner started",
-        session_id=run_state.session_id,
-        session_label=getattr(run_state, "session_label", ""),
-        llm_model=getattr(run_state, "llm_model", ""),
-        llm_base_url=getattr(run_state, "llm_base_url", ""),
-        workspace_base=getattr(run_state, "workspace_base", ""),
-        max_iterations=getattr(run_state, "max_iterations", 0),
-        task_preview=getattr(run_state, "task_instruction", "")[:300],
-    )
+    """Emit a 'startup' lifecycle event when the container starts.
+
+    Carries the full static config so the gateway can populate the session
+    record and an initial state_snapshot without a separate /state push.
+    """
+    with run_state._lock:
+        ev = _make_lifecycle_event(
+            "StartupEvent",
+            summary="[Startup] Container initialised and runner started",
+            # Identity
+            session_id=run_state.session_id,
+            session_label=run_state.session_label,
+            # Config
+            llm_model=run_state.llm_model,
+            llm_base_url=run_state.llm_base_url,
+            workspace_base=run_state.workspace_base,
+            max_iterations=run_state.max_iterations,
+            # Task
+            task_preview=run_state.task_instruction[:500],
+            task_instruction=run_state.task_instruction,
+            # Environment
+            env_vars=dict(run_state.env_vars),
+            extra_metadata=dict(run_state.extra_metadata),
+            # Timing
+            start_time=run_state.start_time,
+        )
     logger.info("[events] Pushing StartupEvent")
     client.push_event(ev)
 
@@ -236,6 +250,11 @@ def push_heartbeat_event(client: "ObserverClient", run_state: RunState) -> None:
         phase = run_state.phase.value if hasattr(run_state.phase, "value") else str(run_state.phase)
         iteration = run_state.iteration
         is_running = run_state.is_running
+        uptime = run_state.uptime_seconds() if callable(getattr(run_state, "uptime_seconds", None)) else 0
+        conv_id = run_state.conversation_id
+        conv_status = run_state.conversation_execution_status
+        cost = run_state.accumulated_cost
+        llm_calls = run_state.total_llm_calls
 
     ev = _make_lifecycle_event(
         "HeartbeatEvent",
@@ -243,9 +262,13 @@ def push_heartbeat_event(client: "ObserverClient", run_state: RunState) -> None:
         phase=phase,
         iteration=iteration,
         is_running=is_running,
-        uptime_seconds=run_state.uptime_seconds if hasattr(run_state, "uptime_seconds") else 0,
+        uptime_seconds=uptime,
+        conversation_id=conv_id,
+        conversation_execution_status=conv_status,
+        accumulated_cost=cost,
+        total_llm_calls=llm_calls,
     )
-    logger.debug("[events] Pushing HeartbeatEvent (phase=%s iter=%d)", phase, iteration)
+    logger.debug("[events] Pushing HeartbeatEvent (phase=%s iter=%d uptime=%.1fs)", phase, iteration, uptime)
     client.push_event(ev)
 
 
@@ -259,7 +282,19 @@ def push_evaluate_event(
     iterations: int = 0,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """Emit an evaluation/summary event at conversation end."""
+    """Emit an evaluation/summary event at conversation end.
+
+    Carries the full command_history and llm_context_snapshot so the
+    gateway has a complete picture of what the agent did.
+    """
+    with run_state._lock:
+        conv_id = run_state.conversation_id
+        conv_status = run_state.conversation_execution_status
+        cmd_history = list(run_state.command_history)
+        llm_ctx = list(run_state.llm_context_snapshot)
+        last_error = run_state.last_error
+        uptime = run_state.uptime_seconds() if callable(getattr(run_state, "uptime_seconds", None)) else 0
+
     ev = _make_lifecycle_event(
         "EvaluateEvent",
         summary=f"[Evaluate] status={status} cost={cost:.4f} llm_calls={llm_calls} iterations={iterations}",
@@ -267,9 +302,15 @@ def push_evaluate_event(
         accumulated_cost=cost,
         total_llm_calls=llm_calls,
         iterations=iterations,
+        conversation_id=conv_id,
+        conversation_execution_status=conv_status,
+        command_history=cmd_history,
+        llm_context_snapshot=llm_ctx,
+        last_error=last_error,
+        uptime_seconds=uptime,
         **(extra or {}),
     )
-    logger.info("[events] Pushing EvaluateEvent (status=%s cost=%.4f)", status, cost)
+    logger.info("[events] Pushing EvaluateEvent (status=%s cost=%.4f llm_calls=%d)", status, cost, llm_calls)
     client.push_event(ev)
 
 
@@ -280,10 +321,19 @@ def push_finish_event(
     exit_code: int,
     reason: str = "",
 ) -> None:
-    """Emit a 'finish' lifecycle event as the last thing the container does."""
-    with run_state._lock:
-        phase = run_state.phase.value if hasattr(run_state.phase, "value") else str(run_state.phase)
-        iteration = run_state.iteration
+    """Emit a 'finish' lifecycle event as the last thing the container does.
+
+    Carries the complete final RunState snapshot so the gateway has a
+    full picture even if the container exits immediately after.
+    """
+    # Grab the full state snapshot under the lock
+    try:
+        state_snapshot = run_state.to_dict()
+    except Exception:
+        state_snapshot = {}
+
+    phase = state_snapshot.get("phase", "finished")
+    iteration = state_snapshot.get("iteration", 0)
 
     ev = _make_lifecycle_event(
         "FinishEvent",
@@ -292,6 +342,8 @@ def push_finish_event(
         phase=phase,
         iteration=iteration,
         reason=reason,
+        # Full final snapshot embedded for gateway state_snapshots table
+        final_state=state_snapshot,
     )
     logger.info("[events] Pushing FinishEvent (exit_code=%d, reason=%s)", exit_code, reason)
     client.push_event(ev)
