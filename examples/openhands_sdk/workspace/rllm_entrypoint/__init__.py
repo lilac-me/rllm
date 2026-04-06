@@ -9,7 +9,4 @@ Package structure:
     pause_ctrl.py   — Background pause-poller thread
     runner.py       — Main conversation runner logic
 
-Note: uploader.py (background state-uploader) is deprecated and no longer
-used. Events are now pushed directly in the event callback (event-driven
-model), with a lightweight heartbeat timer in runner.py for liveness.
 """

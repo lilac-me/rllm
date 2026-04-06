@@ -258,18 +258,19 @@ def run() -> int:
             "When done, summarize what you accomplished."
         )
 
-    task_skill = Skill(name="task_scope", content=_task_scope, trigger=None)
 
-    try:
-        merged_skills = _merge_workspace_skills(cfg.workspace_base, task_skill)
-    except Exception:
-        logger.exception("merge_workspace_skills failed; falling back to task_scope only")
-        merged_skills = [task_skill]
+    # task_skill = Skill(name="task_scope", content=_task_scope, trigger=None)
+    # try:
+    #     merged_skills = _merge_workspace_skills(cfg.workspace_base, task_skill)
+    # except Exception:
+    #     logger.exception("merge_workspace_skills failed; falling back to task_scope only")
+    #     merged_skills = [task_skill]
 
     agent_context = AgentContext(
-        skills=merged_skills,
+        # skills=merged_skills,
         load_public_skills=False,
         system_message_suffix=(
+            _task_scope +
             f"Workspace directory: {cfg.workspace_base}. "
             f"Maximum iterations budget: {cfg.max_iterations}. "
             f"Session ID: {cfg.session_id}."
