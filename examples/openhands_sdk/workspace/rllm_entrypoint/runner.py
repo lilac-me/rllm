@@ -40,6 +40,8 @@ from rllm_entrypoint.events import (
 from rllm_entrypoint.pause_ctrl import PauseController
 from rllm_entrypoint.state import AgentPhase, RunState
 
+from openhands.sdk.context.skills import load_project_skills, load_skills_from_dir
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -60,30 +62,22 @@ def _write_system_prompt() -> None:
 # Workspace skill merging (kept here to avoid monolithic entrypoint)
 # ---------------------------------------------------------------------------
 
-def _merge_workspace_skills(workspace_base: str, task_skill: Any) -> list:
-    from openhands.sdk.context import Skill
-    from openhands.sdk.context.skills import load_project_skills, load_skills_from_dir
-
+def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
+    """Merge AGENTS.md + .agents/skills/* + inline task_scope."""
     ws = Path(workspace_base)
     skills: list = []
 
     if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
-        try:
-            loaded = load_project_skills(work_dir=str(ws))
-            if loaded:
-                skills.extend(loaded if isinstance(loaded, list) else list(loaded))
-        except Exception:
-            logger.exception("load_project_skills failed")
+        loaded = load_project_skills(workspace_dir=str(ws))
+        if loaded:
+            skills.extend(loaded if isinstance(loaded, list) else list(loaded))
 
     agents_skills_root = ws / ".agents" / "skills"
     if agents_skills_root.is_dir():
-        try:
-            _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
-            skills.extend(agent_skills.values())
-        except Exception:
-            logger.exception("load_skills_from_dir failed")
+        _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
+        skills.extend(agent_skills.values())
 
-    skills.append(task_skill)
+    skills.append(task_scope)
     return skills
 
 
@@ -160,10 +154,13 @@ def build_run_state() -> RunState:
         llm_model=cfg.llm_model,
         llm_base_url=cfg.llm_base_url,
         max_iterations=cfg.max_iterations,
+        ops_name=cfg.operator_name,
+        ops_arch=cfg.operator_arch,
         is_running=False,
         phase=AgentPhase.INITIALIZING,
         env_vars=_safe_env_snapshot(),
         extra_metadata=_parse_extra_metadata(),
+        
     )
     return state
 
@@ -243,31 +240,30 @@ def run() -> int:
         max_output_tokens=4096,
     )
 
-    if cfg.npu_operator_task:
-        _task_scope = (
-            f"You are a custom kernel / operator agent (backend hint: {cfg.operator_backend}). "
-            "Follow AGENTS.md and INSTRUCTIONS.md. Implement under src/triton/ or src/ascendc/ as directed. "
-            "Do not modify tools/. Run `bash tools/operator_pipeline.sh` after changes; "
-            "iterate until metrics.json reports success. Summarize results when done."
-        )
-    else:
-        _task_scope = (
-            "You are a software engineering agent. "
-            "Complete the task described in the TASK section. "
-            "Work inside the provided workspace directory. "
-            "When done, summarize what you accomplished."
-        )
+    _task_scope = (
+    "You are a Triton-Ascend kernel generation agent. "
+    f"Target architecture: {cfg.operator_backend}. "
+    "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
+    f"Implement ModelNew with @triton.jit kernels in src/{cfg.operatpr_name}_triton_ascend_impl.py. "
+    "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
+    f"Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name {cfg.operatpr_name}. "
+    "Iterate until metrics.json reports success. Summarize results when done."
+)
 
+    _task_skill = Skill(
+        name="task_scope",
+        content=_task_scope,
+        trigger=None,
+    )
 
-    # task_skill = Skill(name="task_scope", content=_task_scope, trigger=None)
-    # try:
-    #     merged_skills = _merge_workspace_skills(cfg.workspace_base, task_skill)
-    # except Exception:
-    #     logger.exception("merge_workspace_skills failed; falling back to task_scope only")
-    #     merged_skills = [task_skill]
+    try:
+        _merged_skills = merge_workspace_skills(cfg.workspace_base, _task_skill)
+    except Exception:
+        logger.exception("merge_workspace_skills failed; falling back to task_scope only")
+        _merged_skills = [_task_skill]
 
     agent_context = AgentContext(
-        # skills=merged_skills,
+        skills=_merged_skills,
         load_public_skills=False,
         system_message_suffix=(
             _task_scope +

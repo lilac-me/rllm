@@ -1,19 +1,13 @@
 # 当前任务
 
-（由 host 侧写入或环境变量 `TASK_INSTRUCTION` 覆盖；此处为默认占位。）
+（此文件由 host 侧动态生成，运行时会被覆写为具体的任务内容。以下为格式说明。）
 
-## 默认步骤
+## 任务格式（KernelBench）
 
-1. 在 `src/triton/` 或 `src/ascendc/`（见任务指定后端）完成算子实现。
-2. 运行统一流水线：
+任务文件以 `src/{op_name}.py` 形式存在，包含 `Model`（PyTorch 参考）、`get_inputs()`、`get_init_inputs()`。
 
-   ```bash
-   bash tools/operator_pipeline.sh
-   ```
+## 要求
 
-3. 确认 `metrics.json` 中 `"success": true`（且 `compile_ok`、`correctness_ok` 为 true）。
-4. 失败时根据终端输出与 JSON 中的 `error` 字段迭代修复。
-
-## 后端切换
-
-设置环境变量 `OPERATOR_BACKEND` 为 `triton` 或 `ascendc`（可在 `tools/env.sh` 或容器 `docker run -e` 中设置）。未设置时脚本内默认值见 `tools/env.sh`。
+1. 在 `src/{op_name}_triton_ascend_impl.py` 中实现 `ModelNew` 类。
+2. 运行 `bash tools/operator_pipeline.sh --op_name <op_name>` 验证。
+3. 迭代修复直到 `metrics.json` 报 `"success": true`。

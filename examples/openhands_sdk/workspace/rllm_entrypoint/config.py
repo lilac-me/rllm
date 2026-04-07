@@ -23,6 +23,8 @@ class EntrypointConfig:
     max_iterations: int
     npu_operator_task: bool
     operator_backend: str
+    operatpr_name: str
+    operator_arch: str
     task_instruction: str
 
     # ── Observability / control REST gateway ────────────────────────────────
@@ -62,6 +64,8 @@ def _load() -> EntrypointConfig:
     max_iterations = int(os.environ.get("MAX_ITERATIONS", "30"))
     npu_operator_task = os.environ.get("NPU_OPERATOR_TASK", "0") in ("1", "true", "True", "yes")
     operator_backend = os.environ.get("OPERATOR_BACKEND", "triton")
+    operator_name: str = os.environ.get("OPERATOR_NAME", "operator")
+    operator_arch: str = os.environ.get("OPERATOR_ARCH", "ascend910b1")
 
     # Resolve task instruction: env var → INSTRUCTIONS.md fallback
     task_instruction = os.environ.get("TASK_INSTRUCTION", "")
@@ -93,6 +97,8 @@ def _load() -> EntrypointConfig:
         max_iterations=max_iterations,
         npu_operator_task=npu_operator_task,
         operator_backend=operator_backend,
+        operator_name=operator_name,
+        operator_arch=operator_arch,
         task_instruction=task_instruction,
         observer_api_url=observer_api_url,
         upload_interval_s=upload_interval_s,

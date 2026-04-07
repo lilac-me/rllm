@@ -46,11 +46,11 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # vLLM / CUDA
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -59,7 +59,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Custom rllm-openhands image (built from workspace/Dockerfile).
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
-export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-ghcr.io/openhands/agent-server:full3}"
+export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:openhands-triton-env:v1}"
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/g00841271/Qwen3-8B}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-2}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
@@ -77,7 +77,7 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-openhands-ppo}"
 
 echo "=== rllm + OpenHands (container-based) ==="
 echo "  Model           : ${MODEL_PATH}"
-echo "  GPUs            : ${N_GPUS}"
+echo "  N_GPUS (trainer) : ${N_GPUS}"
 echo "  Proxy port      : ${PROXY_PORT}"
 echo "  OpenHands image : ${OPENHANDS_IMAGE}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
