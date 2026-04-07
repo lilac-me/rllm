@@ -446,29 +446,29 @@ async function loadCommands() {
     const primaryParam = paramLines.find(p => ['command','path','query','code'].includes(p.key));
     const primaryVal = primaryParam ? primaryParam.val : (paramLines[0]?.val || '');
 
-    const paramRowsHtml = paramLines.map(({ key, val }) => `
+      const paramRowsHtml = paramLines.map(({ key, val }) => `
       <div class="cmd-param-row">
         <span class="cmd-param-key">${escHtml(key)}</span>
-        <span class="cmd-param-val">${escHtml(val.slice(0, 300))}</span>
+        <span class="cmd-param-val">${escHtml(val)}</span>
       </div>`).join('');
 
     const bodyFields = ['file_text','new_str'].filter(k => mergedArgs[k] != null);
     const bodyHtml = bodyFields.map(k => `
       <div class="cmd-body-block">
         <div class="cmd-body-label">${k}</div>
-        <pre class="cmd-body-pre">${escHtml(String(mergedArgs[k]).slice(0, 2000))}</pre>
+        <pre class="cmd-body-pre">${escHtml(String(mergedArgs[k]))}</pre>
       </div>`).join('');
 
     const oldStrHtml = mergedArgs.old_str != null ? `
       <div class="cmd-body-block">
         <div class="cmd-body-label">old_str (to replace)</div>
-        <pre class="cmd-body-pre cmd-body-del">${escHtml(String(mergedArgs.old_str).slice(0, 1000))}</pre>
+        <pre class="cmd-body-pre cmd-body-del">${escHtml(String(mergedArgs.old_str))}</pre>
       </div>` : '';
 
     card.innerHTML = `
       <div class="cmd-card-header">
         <span class="cmd-tool-badge">${escHtml(toolName)}</span>
-        <span class="cmd-primary-param" title="${escHtml(primaryVal)}">${escHtml(primaryVal.slice(0, 120))}</span>
+        <span class="cmd-primary-param" title="${escHtml(primaryVal)}">${escHtml(primaryVal)}</span>
         <span class="cmd-ts">${ts}</span>
         <button class="cmd-detail-btn" title="View full payload">detail</button>
       </div>
@@ -481,12 +481,12 @@ async function loadCommands() {
       ${thought ? `
         <details class="cmd-thought-details">
           <summary class="cmd-thought-summary">💭 thought</summary>
-          <div class="cmd-thought-text">${escHtml(thought.slice(0, 1000))}</div>
+          <div class="cmd-thought-text">${escHtml(thought)}</div>
         </details>` : ''}
       ${obsContent ? `
         <div class="cmd-result${obsIsError ? ' cmd-result--error' : ''}">
           <span class="cmd-result-label">${obsIsError ? '✗ error' : '✓ result'}</span>
-          <span class="cmd-result-text" title="${escHtml(obsContent)}">${escHtml(obsContent.slice(0, 300))}</span>
+          <span class="cmd-result-text" title="${escHtml(obsContent)}">${escHtml(obsContent)}</span>
         </div>` : ''}`;
 
     card.querySelector('.cmd-detail-btn')?.addEventListener('click', (e) => {
@@ -543,12 +543,12 @@ async function loadLLMContext() {
         </div>
         <details class="conv-block-details" open>
           <summary class="conv-block-summary">System Prompt</summary>
-          <div class="conv-text">${escHtml(sysText.slice(0, 600))}${sysText.length > 600 ? '…' : ''}</div>
+          <div class="conv-text">${escHtml(sysText)}</div>
         </details>
         ${dynText ? `
         <details class="conv-block-details">
           <summary class="conv-block-summary">Dynamic Context</summary>
-          <div class="conv-text">${escHtml(dynText.slice(0, 600))}${dynText.length > 600 ? '…' : ''}</div>
+          <div class="conv-text">${escHtml(dynText)}</div>
         </details>` : ''}
         ${tools.length ? `
         <div class="conv-tools-row">
@@ -591,12 +591,12 @@ async function loadLLMContext() {
         ${reasoning ? `
         <details class="conv-block-details">
           <summary class="conv-block-summary">🧠 Reasoning (${reasoning.length} chars)</summary>
-          <div class="conv-reasoning">${escHtml(reasoning.slice(0, 2000))}${reasoning.length > 2000 ? '…' : ''}</div>
+          <div class="conv-reasoning">${escHtml(reasoning)}</div>
         </details>` : ''}
         ${thoughts ? `
         <div class="conv-thought">
           <span class="conv-thought-icon">💬</span>
-          <div class="conv-thought-text">${escHtml(thoughts.slice(0, 600))}${thoughts.length > 600 ? '…' : ''}</div>
+          <div class="conv-thought-text">${escHtml(thoughts)}</div>
         </div>` : ''}
         <div class="conv-tool-call">
           <div class="conv-tool-call-header">
@@ -605,7 +605,7 @@ async function loadLLMContext() {
           <div class="conv-args">${argsLines.map(({ k, v }) => `
             <div class="conv-arg-row">
               <span class="conv-arg-key">${escHtml(k)}</span>
-              <span class="conv-arg-val" title="${escHtml(v)}">${escHtml(v.slice(0, 400))}</span>
+              <span class="conv-arg-val" title="${escHtml(v)}">${escHtml(v)}</span>
             </div>`).join('')}
           </div>
         </div>`;
@@ -632,7 +632,7 @@ async function loadLLMContext() {
         </div>
         <details class="conv-block-details" ${content.length < 400 ? 'open' : ''}>
           <summary class="conv-block-summary">Result (${content.length} chars)</summary>
-          <pre class="conv-result-pre">${escHtml(content.slice(0, 3000))}${content.length > 3000 ? '\n…[truncated]' : ''}</pre>
+          <pre class="conv-result-pre">${escHtml(content)}</pre>
         </details>`;
       el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
       container.appendChild(el);
@@ -648,7 +648,7 @@ async function loadLLMContext() {
           <span class="conv-ts">${ts}</span>
           <button class="conv-detail-btn">detail</button>
         </div>
-        <div class="conv-thought"><div class="conv-thought-text">${escHtml(text.slice(0, 600))}</div></div>`;
+        <div class="conv-thought"><div class="conv-thought-text">${escHtml(text)}</div></div>`;
       el.querySelector('.conv-detail-btn')?.addEventListener('click', () => openDrawer(ev));
       container.appendChild(el);
     }
@@ -859,7 +859,7 @@ async function selectSession(sessionId) {
   const labelDisplay = document.getElementById('session-label-display');
   if (labelDisplay) labelDisplay.textContent = label;
   const headerSid = document.getElementById('header-session-id');
-  if (headerSid) headerSid.textContent = sessionId.slice(0, 16) + '…';
+  if (headerSid) headerSid.textContent = sessionId;
   const headerModel = document.getElementById('header-llm-model');
   if (headerModel) headerModel.textContent = sess.llm_model || '';
 

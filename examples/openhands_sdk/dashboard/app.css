@@ -162,7 +162,7 @@ pre { font-family: var(--font-mono); }
 .session-item.paused::before { background: var(--amber); content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%); width: 3px; height: 60%; border-radius: 0 2px 2px 0; }
 
 .session-item-header { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
-.session-item-label { font-weight: 500; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item-label { font-weight: 500; font-size: 13px; flex: 1; white-space: normal; word-break: break-word; }
 .phase-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .phase-dot.running { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
 .phase-dot.finished { background: var(--gray); }
@@ -180,7 +180,7 @@ pre { font-family: var(--font-mono); }
 .session-item-meta { display: flex; gap: 10px; font-size: 11px; color: var(--text-muted); }
 .session-meta-val { color: var(--text-secondary); }
 .session-item-tags { display: flex; gap: 4px; margin-top: 5px; flex-wrap: wrap; }
-.tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: var(--bg-base); color: var(--text-muted); border: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: var(--bg-base); color: var(--text-muted); border: 1px solid var(--border); white-space: normal; word-break: break-word; }
 
 .empty-state {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -225,8 +225,8 @@ kbd {
 .session-header-main { flex: 1; min-width: 0; }
 .session-title-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
 .session-title {
-  font-size: 16px; font-weight: 600; cursor: pointer; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; max-width: 400px;
+  font-size: 16px; font-weight: 600; cursor: pointer;
+  white-space: normal; word-break: break-word;
 }
 .session-title:hover { color: var(--text-accent); }
 .session-title-edit {
@@ -238,7 +238,7 @@ kbd {
 .meta-chip {
   font-size: 11px; padding: 2px 7px; background: var(--bg-elevated);
   border: 1px solid var(--border); border-radius: 3px; color: var(--text-secondary);
-  font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+  font-family: var(--font-mono); white-space: normal; word-break: break-word;
 }
 .live-chip { background: var(--green-dim) !important; color: var(--green) !important; border-color: rgba(16,185,129,0.3) !important; display: flex !important; align-items: center; gap: 5px; }
 .pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 1.5s infinite; }
@@ -282,7 +282,7 @@ kbd {
 .kpi-card:last-child { border-right: none; }
 .kpi-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 4px; }
 .kpi-value { font-size: 20px; font-weight: 700; font-family: var(--font-mono); line-height: 1; margin-bottom: 3px; }
-.kpi-sub { font-size: 10px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi-sub { font-size: 10px; color: var(--text-muted); white-space: normal; word-break: break-word; }
 .kpi-card--error .kpi-value { color: var(--red); }
 .kpi-card--error.kpi-card:has(.kpi-value:not(:empty)) { background: var(--red-dim); }
 
@@ -423,7 +423,7 @@ kbd {
 .ev-header { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 .ev-type { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ev-color, var(--gray)); }
 .ev-source { font-size: 10px; color: var(--text-muted); }
-.ev-summary { font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ev-summary { font-size: 12px; color: var(--text-secondary); white-space: normal; word-break: break-word; }
 .ev-summary em { font-style: normal; background: rgba(129,140,248,0.2); color: var(--text-accent); border-radius: 2px; padding: 0 2px; }
 .ev-meta { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
 .ev-time { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); }
@@ -477,7 +477,7 @@ kbd {
 .exit-ok { color: var(--green); font-family: var(--font-mono); }
 .exit-err { color: var(--red); font-family: var(--font-mono); }
 .cmd-text { font-family: var(--font-mono); color: var(--cyan); }
-.output-preview { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.output-preview { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; }
 .badge-ok { padding: 1px 6px; border-radius: 3px; background: var(--green-dim); color: var(--green); font-size: 10px; font-weight: 600; }
 .badge-err { padding: 1px 6px; border-radius: 3px; background: var(--red-dim); color: var(--red); font-size: 10px; font-weight: 600; }
 
@@ -521,8 +521,8 @@ kbd {
   display: flex; align-items: center; gap: 8px; padding: 12px 14px;
   border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--bg-elevated);
 }
-.drawer-type-badge { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 6px; border-radius: 3px; white-space: nowrap; }
-.drawer-summary { flex: 1; font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-type-badge { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 6px; border-radius: 3px; white-space: normal; word-break: break-word; }
+.drawer-summary { flex: 1; font-size: 12px; color: var(--text-secondary); white-space: normal; word-break: break-word; }
 .drawer-close { width: 24px; height: 24px; border-radius: 4px; color: var(--text-muted); font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .drawer-close:hover { background: var(--bg-hover); color: var(--text-primary); }
 .drawer-meta { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
@@ -618,7 +618,7 @@ kbd {
 }
 .cmd-primary-param {
   font-size: 12px; color: var(--cyan); font-family: var(--font-mono);
-  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  flex: 1; white-space: normal; word-break: break-word; min-width: 0;
 }
 .cmd-ts { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); flex-shrink: 0; margin-left: auto; }
 .cmd-detail-btn {
@@ -657,7 +657,7 @@ kbd {
 .cmd-body-pre {
   font-size: 11px; font-family: var(--font-mono); color: var(--text-secondary);
   white-space: pre-wrap; word-break: break-word; background: var(--bg-base);
-  padding: 8px; border-radius: var(--radius-sm); max-height: 300px; overflow-y: auto; line-height: 1.5;
+  padding: 8px; border-radius: var(--radius-sm); overflow-y: auto; line-height: 1.5;
 }
 .cmd-body-del { color: var(--red); background: var(--red-dim); }
 
@@ -685,7 +685,7 @@ kbd {
 .cmd-result--error .cmd-result-label { color: var(--red); }
 .cmd-result-text {
   font-size: 11px; font-family: var(--font-mono); color: var(--text-secondary);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+  white-space: pre-wrap; word-break: break-word; flex: 1;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -755,7 +755,7 @@ kbd {
 .conv-reasoning {
   padding: 8px 14px 10px; font-size: 11px; color: var(--text-muted);
   white-space: pre-wrap; word-break: break-word; line-height: 1.6;
-  font-family: var(--font-mono); max-height: 300px; overflow-y: auto;
+  font-family: var(--font-mono);
   background: var(--bg-base);
 }
 
@@ -784,7 +784,7 @@ kbd {
 .conv-arg-val {
   padding: 5px 14px; font-size: 11px; font-family: var(--font-mono);
   color: var(--cyan); border-bottom: 1px solid var(--border);
-  word-break: break-all; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  word-break: break-all; line-height: 1.5; white-space: pre-wrap;
 }
 .conv-arg-row:last-child .conv-arg-key,
 .conv-arg-row:last-child .conv-arg-val { border-bottom: none; }

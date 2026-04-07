@@ -96,9 +96,9 @@ window.EventCards = (() => {
       return `
         <div class="ev-header-detail">
           ${tool ? `<span class="ev-tool-badge">${_esc(tool)}</span>` : ''}
-          ${actionCmd ? `<span class="ev-action-cmd">${_esc(_trunc(actionCmd, 80))}</span>` : ''}
+          ${actionCmd ? `<span class="ev-action-cmd">${_esc(actionCmd)}</span>` : ''}
         </div>
-        <div class="ev-thought">${_esc(_trunc(thought, 200))}</div>`;
+        <div class="ev-thought">${_esc(thought)}</div>`;
     },
     ObservationEvent(ev) {
       const { tool, text } = parseSummary(ev.summary);
@@ -111,7 +111,7 @@ window.EventCards = (() => {
           ${tool ? `<span class="ev-tool-badge">${_esc(tool)}</span>` : ''}
           ${isError ? `<span class="ev-error-badge">ERROR</span>` : ''}
         </div>
-        <div class="ev-obs-content${isError ? ' ev-summary--error' : ''}">${_esc(_trunc(content, 200))}</div>`;
+        <div class="ev-obs-content${isError ? ' ev-summary--error' : ''}">${_esc(content)}</div>`;
     },
     HeartbeatEvent(ev) {
       const { text } = parseSummary(ev.summary);
@@ -130,7 +130,7 @@ window.EventCards = (() => {
       return `
         <div class="ev-thought">${_esc(text)}</div>
         ${model ? `<div class="ev-header-detail"><span class="ev-tool-badge">${_esc(model)}</span></div>` : ''}
-        ${task ? `<div class="ev-obs-content">${_esc(_trunc(task, 120))}</div>` : ''}`;
+        ${task ? `<div class="ev-obs-content">${_esc(task)}</div>` : ''}`;
     },
     SystemPromptEvent(ev) {
       const raw = ev.raw || {};
@@ -138,9 +138,9 @@ window.EventCards = (() => {
       const sysText = raw.system_prompt && raw.system_prompt.text ? raw.system_prompt.text : '';
       const dynText = raw.dynamic_context && raw.dynamic_context.text ? raw.dynamic_context.text : '';
       return `
-        <div class="ev-thought">${sysText ? _esc(_trunc(sysText, 120)) : 'System prompt'}</div>
+        <div class="ev-thought">${sysText ? _esc(sysText) : 'System prompt'}</div>
         ${tools.length ? `<div class="ev-header-detail">${tools.map(t => `<span class="ev-tool-badge">${_esc(t)}</span>`).join('')}</div>` : ''}
-        ${dynText ? `<div class="ev-obs-content">${_esc(_trunc(dynText, 100))}</div>` : ''}`;
+        ${dynText ? `<div class="ev-obs-content">${_esc(dynText)}</div>` : ''}`;
     },
     EvaluateEvent(ev) {
       const { text } = parseSummary(ev.summary);
@@ -155,7 +155,7 @@ window.EventCards = (() => {
           ${calls ? `<span class="ev-kv-chip">${calls}</span>` : ''}
           ${iters ? `<span class="ev-kv-chip">${iters}</span>` : ''}
         </div>
-        ${text ? `<div class="ev-thought">${_esc(_trunc(text, 120))}</div>` : ''}`;
+        ${text ? `<div class="ev-thought">${_esc(text)}</div>` : ''}`;
     },
     FinishEvent(ev) {
       const { text } = parseSummary(ev.summary);
@@ -164,13 +164,13 @@ window.EventCards = (() => {
         <div class="ev-header-detail">
           <span class="ev-tool-badge ev-exit-${ok ? 'ok' : 'err'}">exit ${ev.exit_code ?? 0}</span>
         </div>
-        <div class="ev-thought${ok ? '' : ' ev-summary--error'}">${_esc(_trunc(text || ev.reason || '', 160))}</div>`;
+        <div class="ev-thought${ok ? '' : ' ev-summary--error'}">${_esc(text || ev.reason || '')}</div>`;
     },
     AgentErrorEvent(ev) {
       const { text } = parseSummary(ev.summary);
       const raw = ev.raw || {};
       const err = raw.error || text || ev.summary || '';
-      return `<div class="ev-obs-content ev-summary--error">${_esc(_trunc(err, 220))}</div>`;
+      return `<div class="ev-obs-content ev-summary--error">${_esc(err)}</div>`;
     },
     LLMCompletionLogEvent(ev) {
       const { text } = parseSummary(ev.summary);
@@ -184,11 +184,11 @@ window.EventCards = (() => {
           ${tokens ? `<span class="ev-kv-chip">${tokens}</span>` : ''}
           ${cost ? `<span class="ev-kv-chip">${cost}</span>` : ''}
         </div>
-        ${text ? `<div class="ev-thought">${_esc(_trunc(text, 120))}</div>` : ''}`;
+        ${text ? `<div class="ev-thought">${_esc(text)}</div>` : ''}`;
     },
     ConversationStateUpdateEvent(ev) {
       const { text } = parseSummary(ev.summary);
-      return `<div class="ev-header-detail"><span class="ev-kv-chip">${_esc(_trunc(text, 100))}</span></div>`;
+      return `<div class="ev-header-detail"><span class="ev-kv-chip">${_esc(text)}</span></div>`;
     },
     default(ev) {
       const { prefix, tool, text } = parseSummary(ev.summary);
@@ -197,7 +197,7 @@ window.EventCards = (() => {
           ${prefix ? `<span class="ev-tool-badge">${_esc(prefix)}</span>` : ''}
           ${tool ? `<span class="ev-kv-chip">${_esc(tool)}</span>` : ''}
         </div>
-        ${text ? `<div class="ev-thought">${_esc(_trunc(text, 200))}</div>` : ''}`;
+        ${text ? `<div class="ev-thought">${_esc(text)}</div>` : ''}`;
     },
   };
 
@@ -280,10 +280,10 @@ _s.textContent = `
 .ev-id { font-size:10px; color:var(--text-muted); font-family:var(--font-mono); }
 .ev-header-detail { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:3px; align-items:center; }
 .ev-tool-badge { font-size:10px; font-weight:600; padding:1px 6px; background:color-mix(in srgb,var(--ev-color,var(--gray)) 15%,transparent); color:var(--ev-color,var(--gray)); border:1px solid color-mix(in srgb,var(--ev-color,var(--gray)) 30%,transparent); border-radius:3px; font-family:var(--font-mono); }
-.ev-kv-chip { font-size:10px; padding:1px 6px; background:var(--bg-base); border:1px solid var(--border); border-radius:10px; color:var(--text-secondary); font-family:var(--font-mono); white-space:nowrap; }
-.ev-action-cmd { font-size:10px; font-family:var(--font-mono); color:var(--cyan); background:var(--bg-base); padding:1px 6px; border-radius:3px; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.ev-thought { font-size:12px; color:var(--text-secondary); line-height:1.5; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
-.ev-obs-content { font-size:11px; color:var(--text-muted); font-family:var(--font-mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; }
+.ev-kv-chip { font-size:10px; padding:1px 6px; background:var(--bg-base); border:1px solid var(--border); border-radius:10px; color:var(--text-secondary); font-family:var(--font-mono); white-space:normal; word-break:break-word; }
+.ev-action-cmd { font-size:10px; font-family:var(--font-mono); color:var(--cyan); background:var(--bg-base); padding:1px 6px; border-radius:3px; white-space:pre-wrap; word-break:break-word; }
+.ev-thought { font-size:12px; color:var(--text-secondary); line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+.ev-obs-content { font-size:11px; color:var(--text-muted); font-family:var(--font-mono); white-space:pre-wrap; word-break:break-word; margin-top:2px; }
 .ev-hb-row { display:flex; flex-wrap:wrap; gap:4px; }
 .ev-kv-chip.phase-waiting_for_reply { background:var(--purple-dim); color:var(--purple); border-color:rgba(139,92,246,.3); }
 .ev-kv-chip.phase-executing_command { background:var(--cyan-dim); color:var(--cyan); border-color:rgba(6,182,212,.3); }
