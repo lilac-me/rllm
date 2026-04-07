@@ -10,45 +10,122 @@
 输出:
     与本脚本同目录下的 mock_npu_operator.parquet
 
-每行 extra_info 含 instruction 与 scenario=npu_operator，rollout 侧据此布置
-mock profiling 脚本与 NPU 风格 reward。
+每行 extra_info 含 op_name / task_code / arch / instruction / scenario=npu_operator，
+rollout 侧据此布置 workspace 并计算 reward。
+
+完整字段说明见同目录 TRAINING_DATA.md。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import textwrap
 
 import pandas as pd
 
 _MOCK_TASKS = [
     {
+        "op_name": "vector_add",
+        "arch": "ascend910b1",
         "instruction": (
-            "Implement an Ascend C custom operator 'VectorAdd' that adds two "
-            "FP16 vectors element-wise. The input tensors are 1-D with size N. "
-            "Optimise tiling for the Ascend AI Core pipeline."
+            "Implement a Triton kernel 'vector_add' that adds two FP16 "
+            "vectors element-wise on Ascend 910B."
         ),
+        "task_code": textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                    return a + b
+
+            def get_inputs():
+                return [torch.randn(4096, dtype=torch.float16), torch.randn(4096, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
     },
     {
+        "op_name": "matmul",
+        "arch": "ascend910b1",
         "instruction": (
-            "Implement an Ascend C custom operator 'MatMul' that multiplies "
-            "two FP16 matrices of size M×K and K×N. Handle tiling across "
-            "the cube unit and vector unit properly."
+            "Implement a Triton kernel 'matmul' that multiplies two FP16 "
+            "matrices of shape (M, K) and (K, N) on Ascend 910B."
         ),
+        "task_code": textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                    return torch.matmul(a, b)
+
+            def get_inputs():
+                return [torch.randn(512, 256, dtype=torch.float16), torch.randn(256, 512, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
     },
     {
+        "op_name": "softmax",
+        "arch": "ascend910b1",
         "instruction": (
-            "Implement an Ascend C custom operator 'Softmax' that computes "
-            "softmax over the last dimension of a 2-D FP16 tensor. Ensure "
-            "numerical stability using the max-subtraction trick."
+            "Implement a Triton kernel 'softmax' that computes softmax over "
+            "the last dimension of a 2-D FP16 tensor on Ascend 910B."
         ),
+        "task_code": textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return torch.softmax(x, dim=-1)
+
+            def get_inputs():
+                return [torch.randn(128, 1024, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
     },
     {
+        "op_name": "layer_norm",
+        "arch": "ascend910b1",
         "instruction": (
-            "Implement an Ascend C custom operator 'LayerNorm' that performs "
-            "layer normalisation on a 2-D FP16 tensor along the last dimension. "
-            "Include learnable affine parameters gamma and beta."
+            "Implement a Triton kernel 'layer_norm' that performs layer "
+            "normalisation along the last dimension of a 2-D FP16 tensor "
+            "on Ascend 910B."
         ),
+        "task_code": textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.ln = nn.LayerNorm(512)
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return self.ln(x.float()).half()
+
+            def get_inputs():
+                return [torch.randn(64, 512, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
     },
 ]
 
@@ -61,6 +138,9 @@ def create_parquet(output_path: str) -> None:
         extra_info = {
             "instruction": instruction,
             "scenario": "npu_operator",
+            "op_name": task["op_name"],
+            "arch": task["arch"],
+            "task_code": task["task_code"],
         }
         rows.append({"prompt": prompt, "extra_info": extra_info})
 
