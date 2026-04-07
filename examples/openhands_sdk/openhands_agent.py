@@ -27,6 +27,7 @@ Environment Variables:
 
 from __future__ import annotations
 
+import time
 import base64
 import json
 import logging
@@ -38,6 +39,7 @@ import tempfile
 import uuid
 from urllib.parse import urlparse, urlunparse
 from typing import Any
+from pathlib import Path
 
 from rllm.types import Trajectory
 from rllm.sdk.proxy.metadata_slug import assemble_routing_metadata, build_proxied_base_url
@@ -60,30 +62,29 @@ _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
 # NPU operator workspace setup
 # ---------------------------------------------------------------------------
 
-_SDK_DIR = os.path.dirname(os.path.abspath(__file__))
-_WORKSPACE_PKG = os.path.join(_SDK_DIR, "workspace")
-_OPERATOR_SEED_NAMES = (
-    "AGENTS.md",
-    "INSTRUCTIONS.md",
-    ".agents",
-    "tools",
-    "src",
-)
+
+# _OPERATOR_SEED_NAMES = (
+#     "AGENTS.md",
+#     "INSTRUCTIONS.md",
+#     ".agents",
+#     "tools",
+#     "src",
+# )
 
 
-def _chmod_executable_scripts(directory: str) -> None:
-    """Recursively set +x on .sh and .py files under *directory*."""
-    for root, _, files in os.walk(directory):
-        for name in files:
-            if name.endswith((".sh", ".py")):
-                path = os.path.join(root, name)
-                try:
-                    os.chmod(
-                        path,
-                        os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
-                    )
-                except OSError:
-                    pass
+# def _chmod_executable_scripts(directory: str) -> None:
+#     """Recursively set +x on .sh and .py files under *directory*."""
+#     for root, _, files in os.walk(directory):
+#         for name in files:
+#             if name.endswith((".sh", ".py")):
+#                 path = os.path.join(root, name)
+#                 try:
+#                     os.chmod(
+#                         path,
+#                         os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
+#                     )
+#                 except OSError:
+#                     pass
 
 
 # ---------------------------------------------------------------------------
@@ -177,38 +178,43 @@ _NPU_INSTRUCTION_TEMPLATE = """# 当前任务
 
 
 def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
-    workspace = tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-")
+    pwd = Path(__file__).parent
+    _WORKSPACE_PKG = pwd / "workspace"
+    workspace = tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-", dir=pwd/"workspace_temp")
     op_name = task.get("op_name", "operator")
     arch = task.get("arch", "ascend910b1")
     instruction = task.get("instruction", "Implement a simple vector_add-style operator.")
     task_code = task.get("task_code", "")
 
-    for name in _OPERATOR_SEED_NAMES:
-        src = os.path.join(_WORKSPACE_PKG, name)
-        dst = os.path.join(workspace, name)
-        if not os.path.exists(src):
-            continue
-        if os.path.isdir(src):
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
-    _chmod_executable_scripts(os.path.join(workspace, "tools"))
+
+    shutil.copytree(_WORKSPACE_PKG, workspace, dirs_exist_ok=True)
+
+    # for name in _OPERATOR_SEED_NAMES:
+    #     src = os.path.join(_WORKSPACE_PKG, name)
+    #     dst = os.path.join(workspace, name)
+    #     if not os.path.exists(src):
+    #         continue
+    #     if os.path.isdir(src):
+    #         shutil.copytree(src, dst)
+    #     else:
+    #         shutil.copy2(src, dst)
+    # _chmod_executable_scripts(os.path.join(workspace, "tools"))
 
     if _OPENHANDS_MOCK_PIPELINE:
-        mock_path = os.path.join(workspace, "tools", "operator_pipeline.sh")
+        mock_path = os.path.join(workspace, "agent_workdir", "tools", "operator_pipeline.sh")
         with open(mock_path, "w") as f:
             f.write(_MOCK_PIPELINE_SCRIPT)
         os.chmod(mock_path, 0o755)
 
-    with open(os.path.join(workspace, "INSTRUCTIONS.md"), "w") as f:
+    with open(os.path.join(workspace, "agent_workdir", "INSTRUCTIONS.md"), "w") as f:
         f.write(_NPU_INSTRUCTION_TEMPLATE.format(op_name=op_name, arch=arch, instruction=instruction))
 
     if task_code:
-        src_dir = os.path.join(workspace, "src")
+        src_dir = os.path.join(workspace, "agent_workdir", "src")
         os.makedirs(src_dir, exist_ok=True)
         with open(os.path.join(src_dir, f"{op_name}.py"), "w") as f:
             f.write(task_code)
-
+    # breakpoint()
     return workspace
 
 
@@ -387,6 +393,9 @@ def _run_openhands_container(
     arch = task.get("arch", "ascend910b1")
     operator_backend = str(task.get("operator_backend", "triton"))
 
+    path = Path("/tmp/shared_npu_lock")
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+
     # TODO(遗留): Ascend NPU 入容器所需的 docker --device / 额外 -v 挂载（如 /dev/davinci*、驱动相关路径）
     # 待按 CANN 与所用基础镜像文档确定，并与 OPENHANDS_ASCEND_VISIBLE_DEVICES 一起在真机验证。
     # 当前仅挂载 workspace、entrypoint 及注入 ASCEND_RT_VISIBLE_DEVICES（若设置）。
@@ -395,24 +404,46 @@ def _run_openhands_container(
         "--rm",
         "-d",
         "--name", container_name,
-        "-e", f"LLM_BASE_URL={proxied_url}",
+        "-e", f"LLM_BASE_URL=\"{proxied_url}\"",
         "-e", "LLM_API_KEY=EMPTY",
-        "-e", f"LLM_MODEL=openai/{_MODEL_NAME}",
+        "-e", f"LLM_MODEL=\"openai/{_MODEL_NAME}\"",
         "-e", f"OPERATOR_BACKEND={operator_backend}",
         "-e", f"OPERATOR_ARCH={arch}",
         "-e", f"OPERATOR_NAME={op_name}",
-        "-e", f"TASK_INSTRUCTION=\"{instruction}\"",
         
         "-e", "http_proxy=", 
         "-e", "https_proxy=",
-        "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1"
+        "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1",
         "-e", "WORKSPACE_BASE=/opt/workspace/agent_workdir",
-        "-e", f"OBSERVER_API_URL=http://127.0.0.1:18858"
+        "-e", f"OBSERVER_API_URL=http://host.docker.internal:18858",
+        "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
+        
+        # 评估专用
+        "-e", "EVAL_LOCK_DIR=/shared/device-locks",
+        "-e", "EVAL_DEVICE_PREFIX=npu",
+        "-e", "EVAL_DEVICE_COUNT=2",
+        "-e", "EVAL_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES",
+        "-e", "EVAL_RETRY_INTERVAL=1.0",
+        "-e", "EVAL_TIMEOUT=None",
+        "-e", "EVAL_VERBOSE=true",
+        
+        "--device", "/dev/davinci0",
+        "--device", "/dev/davinci1",
+        "--device", "/dev/davinci2",
+        "--device", "/dev/davinci3",
+        "--device", "/dev/davinci4",
+        "--device", "/dev/davinci5",
+        "--device", "/dev/davinci6",
+        "--device", "/dev/davinci7",
+        "--device", "/dev/davinci_manager",
+        "--device", "/dev/hisi_hdc",
+        "--device", "/dev/devmm_svm",
+
         # os.environ["OBSERVER_API_URL"] = "http://127.0.0.1:18858"
         "-v", f"{workspace}:/opt/workspace",
+        "-v", f"/tmp/shared_npu_lock:/shared/device-locks",   # 共享文件锁所在路径
         # "-v", f"/home/g00841271/rllm-071/examples/openhands_sdk/workspace_debug:/opt/workspace",
         "--entrypoint", f"/opt/workspace/entrypoint.py",
-        "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
         "--add-host", "host.docker.internal:host-gateway",
     ]
     cmd.extend([_OPENHANDS_IMAGE,])
@@ -421,7 +452,7 @@ def _run_openhands_container(
         "[openhands] Launching container %s (image=%s, proxied_url=%s...)",
         container_name, _OPENHANDS_IMAGE, proxied_url[:70],
     )
-
+    breakpoint()
     try:
         result = subprocess.run(
             cmd,
@@ -558,11 +589,4 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         shutil.rmtree(workspace, ignore_errors=True)
 
     return reward
-    # return [
-    #     Trajectory(
-    #             name="openhands",
-    #             steps=[],
-    #             reward=reward,
-    #             metadata={"session_uid": session_uid},
-    #         )
-    # ]
+

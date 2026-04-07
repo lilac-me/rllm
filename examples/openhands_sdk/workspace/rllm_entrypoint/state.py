@@ -44,6 +44,8 @@ class RunState:
     llm_model: str = ""
     llm_base_url: str = ""        # proxied URL (may contain metadata slug)
     max_iterations: int = 0
+    ops_name: str = ""
+    ops_arch: str = ""
 
     # ── Runtime ─────────────────────────────────────────────────────────────
     is_running: bool = False

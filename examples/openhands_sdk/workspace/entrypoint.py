@@ -10,7 +10,6 @@ Configuration via environment variables (set by openhands_agent.py):
     LLM_BASE_URL            Proxied rllm LiteLLM URL with embedded metadata slug.
     LLM_API_KEY             API key for the proxy (default: EMPTY)
     LLM_MODEL               Model name on the LiteLLM proxy
-    TASK_INSTRUCTION        Task text; falls back to reading INSTRUCTIONS.md
     WORKSPACE_BASE          Workspace directory (default: /opt/workspace)
     MAX_ITERATIONS          Max agent iterations (default: 30)
     NPU_OPERATOR_TASK       1 = operator / kernel task prompt
@@ -36,17 +35,6 @@ from __future__ import annotations
 import logging
 import sys
 import os
-
-# os.environ["LLM_BASE_URL"] = "https://api.silra.cn/v1"
-# os.environ["LLM_API_KEY"] = "sk-ZkzodY0fm4YmAqEuplsBLcLT9mX44wLlLpBXEhgnHOPGJIFn"
-# os.environ["LLM_MODEL"] = "openai/glm-4.7"
-# os.environ["TASK_INSTRUCTION"] = "Write an add operator in Ascend-triton."
-# os.environ["WORKSPACE_BASE"] = "/data/home/3120235672/huawei-intern/code_agent/rllm/examples/openhands_sdk/workspace/agent_workdir"
-# os.environ["MAX_ITERATIONS"] = "10"
-# os.environ["NPU_OPERATOR_TASK"] = "1"
-# os.environ["OPERATOR_BACKEND"] = "triton"
-
-# os.environ["OBSERVER_API_URL"] = "http://127.0.0.1:18858"
 
 
 # ---------------------------------------------------------------------------

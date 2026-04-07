@@ -228,3 +228,4 @@ extra-info
 litellm_proxy_config_autogen.yaml
 
 *.db
+*.db*

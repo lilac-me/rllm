@@ -173,7 +173,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fair GPU/NPU wrapper based on shared filesystem locks."
     )
-    parser.add_argument("--lock-dir", required=True, help="共享锁目录，例如 /shared/device-locks")
+    parser.add_argument("--lock-dir", os.environ.get("EVAL_LOCK_DIR"), help="共享锁目录，例如 /shared/device-locks")
     parser.add_argument("--device-prefix", default="gpu", help="设备前缀，如 gpu / npu")
     parser.add_argument("--device-count", type=int, required=True, help="设备数量")
     parser.add_argument("--env-name", default="CUDA_VISIBLE_DEVICES", help="设置给子进程的环境变量名")

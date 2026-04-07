@@ -40,6 +40,7 @@ from rllm_entrypoint.events import (
 from rllm_entrypoint.pause_ctrl import PauseController
 from rllm_entrypoint.state import AgentPhase, RunState
 
+from openhands.sdk.context import Skill
 from openhands.sdk.context.skills import load_project_skills, load_skills_from_dir
 
 logger = logging.getLogger(__name__)
@@ -62,22 +63,22 @@ def _write_system_prompt() -> None:
 # Workspace skill merging (kept here to avoid monolithic entrypoint)
 # ---------------------------------------------------------------------------
 
-def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
+def merge_workspace_skills(workspace_base: str, task_scope: Skill=None) -> list:
     """Merge AGENTS.md + .agents/skills/* + inline task_scope."""
     ws = Path(workspace_base)
     skills: list = []
 
-    if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
-        loaded = load_project_skills(workspace_dir=str(ws))
-        if loaded:
-            skills.extend(loaded if isinstance(loaded, list) else list(loaded))
+    # if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
+    loaded = load_project_skills(work_dir=str(ws))
+    if loaded:
+        skills.extend(loaded if isinstance(loaded, list) else list(loaded))
 
-    agents_skills_root = ws / ".agents" / "skills"
-    if agents_skills_root.is_dir():
-        _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
-        skills.extend(agent_skills.values())
+    # agents_skills_root = ws / ".agents" / "skills"
+    # if agents_skills_root.is_dir():
+    #     _repo, _knowledge, agent_skills = load_skills_from_dir(str(agents_skills_root))
+    #     skills.extend(agent_skills.values())
 
-    skills.append(task_scope)
+    # skills.append(task_scope)
     return skills
 
 
@@ -176,8 +177,7 @@ def _parse_extra_metadata() -> dict[str, Any]:
 
 def run() -> int:
     """Build SDK objects, run the conversation, return exit code."""
-    from openhands.sdk import LLM, Agent, AgentContext, Conversation, get_logger
-    from openhands.sdk.context import Skill
+    from openhands.sdk import LLM, Agent, AgentContext, Conversation
     from openhands.sdk.tool import Tool
     from openhands.tools.file_editor import FileEditorTool
     from openhands.tools.terminal import TerminalTool
@@ -240,33 +240,32 @@ def run() -> int:
         max_output_tokens=4096,
     )
 
-    _task_scope = (
-    "You are a Triton-Ascend kernel generation agent. "
-    f"Target architecture: {cfg.operator_backend}. "
-    "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
-    f"Implement ModelNew with @triton.jit kernels in src/{cfg.operatpr_name}_triton_ascend_impl.py. "
-    "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
-    f"Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name {cfg.operatpr_name}. "
-    "Iterate until metrics.json reports success. Summarize results when done."
-)
+#     _task_scope = (
+#     "You are a Triton-Ascend kernel generation agent. "
+#     f"Target architecture: {cfg.operator_backend}. "
+#     "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
+#     f"Implement ModelNew with @triton.jit kernels in src/{cfg.operat0r_name}_triton_ascend_impl.py. "
+#     "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
+#     f"Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name {cfg.operator_name}. "
+#     "Iterate until metrics.json reports success. Summarize results when done."
+# )
 
-    _task_skill = Skill(
-        name="task_scope",
-        content=_task_scope,
-        trigger=None,
-    )
+    # _task_skill = Skill(
+    #     name="task_scope",
+    #     content=_task_scope,
+    #     trigger=None,
+    # )
 
     try:
-        _merged_skills = merge_workspace_skills(cfg.workspace_base, _task_skill)
+        _merged_skills = merge_workspace_skills(cfg.workspace_base)
     except Exception:
         logger.exception("merge_workspace_skills failed; falling back to task_scope only")
-        _merged_skills = [_task_skill]
+        _merged_skills = []
 
     agent_context = AgentContext(
         skills=_merged_skills,
         load_public_skills=False,
         system_message_suffix=(
-            _task_scope +
             f"Workspace directory: {cfg.workspace_base}. "
             f"Maximum iterations budget: {cfg.max_iterations}. "
             f"Session ID: {cfg.session_id}."

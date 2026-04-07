@@ -2,7 +2,7 @@
 
 ## 固定配置
 
-- **framework**: torch  |  **dsl**: triton_ascend  |  **backend**: ascend  |  **arch**: 见 `INSTRUCTIONS.md`（默认 ascend910b1）
+- **framework**: torch  |  **dsl**: triton_ascend  |  **backend**: ascend
 
 ## 环境规则
 
@@ -22,7 +22,6 @@
 | 3 | 代码生成与验证（核心循环）| kernel-generator + kernel-verifier | 5 |
 | 4 | 性能优化（⚠️ **必须执行，禁止跳过**）| latency-optimizer + kernel-verifier | 3 |
 
-具体步骤见 `INSTRUCTIONS.md`。
 
 ### 何时运行 pipeline
 
@@ -122,7 +121,7 @@ bash tools/operator_pipeline.sh --op_name <op_name>
 ## 文件布局
 
 ```
-/opt/workspace/
+.
 ├── INSTRUCTIONS.md
 ├── src/
 │   ├── {op_name}.py                       # 任务文件（host 写入）

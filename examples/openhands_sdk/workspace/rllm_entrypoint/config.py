@@ -23,7 +23,7 @@ class EntrypointConfig:
     max_iterations: int
     npu_operator_task: bool
     operator_backend: str
-    operatpr_name: str
+    operator_name: str
     operator_arch: str
     task_instruction: str
 
@@ -67,17 +67,14 @@ def _load() -> EntrypointConfig:
     operator_name: str = os.environ.get("OPERATOR_NAME", "operator")
     operator_arch: str = os.environ.get("OPERATOR_ARCH", "ascend910b1")
 
-    # Resolve task instruction: env var → INSTRUCTIONS.md fallback
-    task_instruction = os.environ.get("TASK_INSTRUCTION", "")
-    if not task_instruction:
-        md_path = os.path.join(workspace_base, "INSTRUCTIONS.md")
-        if os.path.exists(md_path):
-            with open(md_path) as f:
-                lines = [ln for ln in f.read().splitlines()
-                         if ln.strip() and not ln.startswith("#")]
-            task_instruction = "\n".join(lines).strip()
+    md_path = os.path.join(workspace_base, "INSTRUCTIONS.md")
+    if os.path.exists(md_path):
+        with open(md_path) as f:
+            lines = [ln for ln in f.read().splitlines()
+                        if ln.strip() and not ln.startswith("#")]
+        task_instruction = "\n".join(lines).strip()
 
-    observer_api_url = os.environ.get("OBSERVER_API_URL", "").rstrip("/")
+    observer_api_url = os.environ.get("OBSERVER_API_URL", "http://127.0.0.1:18858").rstrip("/")
     upload_interval_s = float(os.environ.get("OBSERVER_UPLOAD_INTERVAL", "5.0"))
     pause_poll_interval_s = float(os.environ.get("OBSERVER_PAUSE_POLL_INTERVAL", "2.0"))
 

@@ -10,7 +10,7 @@
 
 # --- Conda ---
 : "${CONDA_BASE:=/opt/conda}"
-: "${OPERATOR_CONDA_ENV:=operator-build}"
+: "${OPERATOR_CONDA_ENV:=evaluator-py311}"
 
 _CONDA_PYTHON="${CONDA_BASE}/envs/${OPERATOR_CONDA_ENV}/bin/python"
 if [[ -x "${_CONDA_PYTHON}" ]]; then
