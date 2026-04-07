@@ -151,10 +151,10 @@ class RunState:
             return {
                 "session_id": self.session_id,
                 "session_label": self.session_label,
-                "task_instruction": self.task_instruction[:500],
+                "task_instruction": self.task_instruction,
                 "workspace_base": self.workspace_base,
                 "llm_model": self.llm_model,
-                "llm_base_url_prefix": self.llm_base_url[:80],
+                "llm_base_url_prefix": self.llm_base_url,
                 "max_iterations": self.max_iterations,
                 "is_running": self.is_running,
                 "phase": self.phase.value if isinstance(self.phase, AgentPhase) else self.phase,

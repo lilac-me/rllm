@@ -189,7 +189,7 @@ function renderSessionList(sessions) {
       </div>
       <div class="session-item-tags">
         ${s.llm_model ? `<span class="tag" title="${s.llm_model}">${s.llm_model.split('/').pop()}</span>` : ''}
-        ${s.task_preview ? `<span class="tag" title="${s.task_preview}">${s.task_preview.slice(0, 40)}</span>` : ''}
+        ${s.task_preview ? `<span class="tag" title="${s.task_preview}">${s.task_preview}</span>` : ''}
       </div>`;
     item.addEventListener('click', () => selectSession(s.session_id));
     list.appendChild(item);

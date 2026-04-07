@@ -96,7 +96,7 @@ def _safe_env_snapshot() -> dict[str, str]:
         if any(pat in upper for pat in _SECRET_PATTERNS):
             result[k] = "***REDACTED***"
         else:
-            result[k] = v[:200]
+            result[k] = v
     return result
 
 

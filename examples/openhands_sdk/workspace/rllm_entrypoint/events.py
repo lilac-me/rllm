@@ -230,7 +230,7 @@ def push_startup_event(client: "ObserverClient", run_state: RunState) -> None:
             workspace_base=run_state.workspace_base,
             max_iterations=run_state.max_iterations,
             # Task
-            task_preview=run_state.task_instruction[:500],
+            task_preview=run_state.task_instruction,
             task_instruction=run_state.task_instruction,
             # Environment
             env_vars=dict(run_state.env_vars),

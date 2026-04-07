@@ -793,6 +793,6 @@ kbd {
 .conv-result-pre {
   padding: 8px 14px 10px; font-size: 11px; font-family: var(--font-mono);
   color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
-  max-height: 400px; overflow-y: auto; line-height: 1.5; background: var(--bg-base);
+  line-height: 1.5; background: var(--bg-base);
 }
 .conv-tool-error .conv-result-pre { color: var(--red); }
