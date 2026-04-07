@@ -38,22 +38,20 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_str(v: Any, max_len: int = 2000) -> str:
+def _safe_str(v: Any, max_len: int = 0) -> str:
+    """Return str(v) without truncation. max_len is kept for API compatibility but ignored."""
     try:
-        s = str(v)
-        return s[:max_len] if len(s) > max_len else s
+        return str(v)
     except Exception:
         return "<repr failed>"
 
 
-def _truncate_dict(d: Any, max_str_len: int = 500) -> Any:
-    """Recursively truncate strings in a dict/list structure."""
+def _truncate_dict(d: Any, max_str_len: int = 0) -> Any:
+    """Pass through the structure without truncation."""
     if isinstance(d, dict):
         return {k: _truncate_dict(v, max_str_len) for k, v in d.items()}
     if isinstance(d, list):
         return [_truncate_dict(v, max_str_len) for v in d]
-    if isinstance(d, str) and len(d) > max_str_len:
-        return d[:max_str_len] + "…"
     return d
 
 
@@ -94,7 +92,7 @@ def _event_to_dict(event: Any) -> dict[str, Any]:  # noqa: ANN401
         "source": str(source),
         "timestamp": str(timestamp),
         "summary": summary,
-        "raw": _truncate_dict(raw, max_str_len=500),
+        "raw": _truncate_dict(raw),
     }
 
 
@@ -107,7 +105,7 @@ def _build_summary(event: Any, event_type: str) -> str:
             thought = getattr(event, "thought", [])
             thought_text = " ".join(
                 getattr(t, "text", str(t)) for t in thought
-            )[:200]
+            )
             return f"[Action:{tool}] {thought_text}"
 
         # ObservationEvent: show tool + result preview
@@ -119,9 +117,9 @@ def _build_summary(event: Any, event_type: str) -> str:
                     content_list = obs.to_llm_content
                     text = " ".join(
                         getattr(c, "text", str(c)) for c in content_list
-                    )[:300]
+                    )
                 except Exception:
-                    text = _safe_str(obs, 300)
+                    text = _safe_str(obs)
             else:
                 text = ""
             return f"[Observation:{tool}] {text}"
@@ -133,13 +131,13 @@ def _build_summary(event: Any, event_type: str) -> str:
                 content = getattr(msg, "content", [])
                 text = " ".join(
                     getattr(c, "text", str(c)) for c in content
-                )[:200]
+                )
                 role = getattr(msg, "role", "?")
                 return f"[Message:{role}] {text}"
 
         # AgentErrorEvent
         if event_type == "AgentErrorEvent":
-            return f"[Error] {getattr(event, 'error', '')[:300]}"
+            return f"[Error] {getattr(event, 'error', '')}"
 
         # PauseEvent
         if event_type == "PauseEvent":
