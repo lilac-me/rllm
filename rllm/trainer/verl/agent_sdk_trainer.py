@@ -88,6 +88,9 @@ class AgentSdkTrainer(RayPPOTrainer):
         """Initialize workers with instrumented vLLM servers for distributed rollouts."""
         import ray
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
+        import importlib.util
+        import sys
+        from pathlib import Path
 
         # Create an instrumented vLLM HTTP server class
         @ray.remote(num_cpus=1)
@@ -101,10 +104,23 @@ class AgentSdkTrainer(RayPPOTrainer):
                 # Instrument vLLM in this Ray worker process
                 # Import directly from the module to avoid importing the entire rllm package
                 # which has signal handlers that can't be set up in Ray worker threads
-                import importlib.util
-                import sys
-                from pathlib import Path
-
+                # cbx
+                # import os
+                ascend_vars = {k: v for k, v in os.environ.items()
+                             if any(k.startswith(p) for p in ['HCCL', 'ASCEND', 'NPU', 'CANN', 'LD_LIBRARY'])}
+                print(f"[DEBUG] Ascend env vars in Ray worker: {ascend_vars}")
+                print(f"[DEBUG] ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT SET')}")
+                print(f"[DEBUG] RANK={os.environ.get('RANK', 'NOT SET')}")
+                print(f"[DEBUG] WORLD_SIZE={os.environ.get('WORLD_SIZE', 'NOT SET')}")
+                print(f"[DEBUG] LOCAL_RANK={os.environ.get('LOCAL_RANK', 'NOT SET')}")
+                import torch_npu
+                print(f"[DEBUG] NPU initialized before vLLM: {torch_npu.npu.is_available()}")
+                print(f"[DEBUG] NPU device count: {torch_npu.npu.device_count()}")
+                print(f"[DEBUG] Current device: {torch_npu.npu.current_device() if torch_npu.npu.is_available() else 'N/A'}")
+                # 检查 distributed 是否已经被 init 了
+                import torch.distributed as dist
+                print(f"[DEBUG] torch.distributed already initialized: {dist.is_initialized()}")
+                # cbx
                 # Get the path to vllm_instrumentation.py relative to this file
                 instrumentation_path = Path(__file__).parent.parent.parent / "patches" / "vllm_instrumentation.py"
 
@@ -123,7 +139,7 @@ class AgentSdkTrainer(RayPPOTrainer):
         # Monkey-patch vLLMReplica.__init__ to use our instrumented server class
         # The problem is that vLLMReplica.__init__ sets self.server_class = vLLMHttpServer
         # which overrides any class attribute we set
-        _original_vllm_replica_init = vLLMReplica.__init__
+        _original_vllm_replica_init = vLLMReplica.__init__ # vLLMReplica.__init__ is origin vLLM init
 
         def patched_vllm_replica_init(self, *args, **kwargs):
             """Patched __init__ that uses InstrumentedvLLMHttpServer instead of vLLMHttpServer."""

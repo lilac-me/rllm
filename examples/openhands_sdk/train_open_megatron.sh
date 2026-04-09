@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # ==============================================================================
 # Train OpenHands agent with rllm (container-based, no openhands Python lib)
@@ -26,8 +27,13 @@ set -x
 export RLLM_UI_URL=http://127.0.0.1:3000
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
-# export MODEL_PATH=/home/g00841271/Qwen3-8B
 export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
+
+export HCCL_ENTRY_LOG_ENABLE=1
+export ASCEND_GLOBAL_LOG_LEVEL=0
+export HCCL_DIAGNOSE_ENABLE=1
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
 # export ASCEND_LAUNCH_BLOCKING=1
 
@@ -51,8 +57,7 @@ export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -70,7 +75,7 @@ export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 # Training parameters
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
-N_GPUS="${N_GPUS:-8}"
+N_GPUS="${N_GPUS:-4}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
@@ -116,7 +121,7 @@ ray start --head \
 # Each rollout spawns its own OpenHands Docker container via docker run.
 # No rllm sandbox (worker_server.py) wrapper is used.
 # ------------------------------------------------------------------------------
-python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
+python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     algorithm.adv_estimator=grpo \
     \
     data.train_batch_size=${BATCH_SIZE} \
@@ -124,33 +129,55 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     data.max_prompt_length=8192 \
     data.max_response_length=8192 \
     \
-    actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.hybrid_engine=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.ppo_mini_batch_size=${BATCH_SIZE} \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
-    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
     \
-    actor_rollout_ref.rollout.load_format=dummy \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.load_format=dummy \
+    actor_rollout_ref.actor.strategy=megatron \
+    actor_rollout_ref.actor.megatron.use_mbridge=True \
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=False \
+    actor_rollout_ref.actor.megatron.param_offload=True \
+    actor_rollout_ref.actor.megatron.grad_offload=True \
+    actor_rollout_ref.actor.megatron.optimizer_offload=True \
+    \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.context_parallel_size=1 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.param_offload=True \
+    actor_rollout_ref.actor.megatron.optimizer_offload=True \
+    actor_rollout_ref.actor.megatron.grad_offload=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2 \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
+    actor_rollout_ref.ref.megatron.context_parallel_size=4 \
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size=8 \
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1 \
+    actor_rollout_ref.ref.megatron.param_offload=True \
+    actor_rollout_ref.ref.megatron.use_mbridge=True \
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=False \
+    \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
@@ -162,9 +189,8 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     \
     rllm.stepwise_advantage.enable=False \
     rllm.compact_filtering.enable=True \
@@ -184,10 +210,9 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     trainer.save_freq=100 \
     trainer.test_freq=10 \
     trainer.total_epochs=50 \
-    trainer.val_before_train=False \
+    trainer.device=npu \
     \
     rllm.sdk.proxy.host=0.0.0.0 \
-    trainer.device=npu \
     rllm.sdk.proxy.port=${PROXY_PORT} \
     rllm.sdk.proxy.mode=subprocess \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
