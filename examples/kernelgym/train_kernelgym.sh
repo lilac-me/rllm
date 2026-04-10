@@ -104,7 +104,7 @@ python3 -m examples.kernelgym.train_kernelgym \
     rllm.stepwise_advantage.enable=False \
     trainer.total_epochs=100 \
     ++kernel.server_url=http://localhost:28000 \
-    ++kernel.backend=cuda \
+    ++kernel.backend=npu \
     ++kernel.toolkit=kernelbench \
     ++kernel.use_ray=false \
     ++kernel.timeout=300 \

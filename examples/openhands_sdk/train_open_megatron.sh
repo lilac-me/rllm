@@ -26,14 +26,13 @@ set -euo pipefail
 set -x
 
 # First time
-export RLLM_UI_URL=http://127.0.0.1:3000
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
 export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
 
-export HCCL_ENTRY_LOG_ENABLE=1
-export ASCEND_GLOBAL_LOG_LEVEL=0
-export HCCL_DIAGNOSE_ENABLE=1
+# export HCCL_ENTRY_LOG_ENABLE=1
+# export ASCEND_GLOBAL_LOG_LEVEL=0
+# export HCCL_DIAGNOSE_ENABLE=1
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
@@ -59,7 +58,7 @@ export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -111,9 +110,9 @@ ray stop --force || true
 rm -rf /tmp/ray/*
 sleep 2
 ray start --head \
-    --port 6379 \
+    --port 6380 \
     --dashboard-host 0.0.0.0 \
-    --dashboard-port 8265 \
+    --dashboard-port 8266 \
     --disable-usage-stats \
     --node-ip-address ${MASTER_ADDR}
 
@@ -154,11 +153,11 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     actor_rollout_ref.actor.megatron.grad_offload=True \
     actor_rollout_ref.actor.megatron.optimizer_offload=True \
     \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.context_parallel_size=1 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.context_parallel_size=4 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=8 \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.optimizer_offload=True \
@@ -203,7 +202,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     rllm.rejection_sample.enable=False \
     \
     trainer.critic_warmup=0 \
-    "trainer.logger=['console','wandb']" \
+    "trainer.logger=['console']" \
     trainer.project_name=${PROJECT_NAME} \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.val_before_train=False \
