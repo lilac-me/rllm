@@ -20,6 +20,8 @@
 #   OPENHANDS_IMAGE     — OpenHands Docker image to run per rollout
 #   OPENHANDS_DATASET   — swe (default) | mock_npu  (算子 bring-up：mock parquet + profiling mock)
 # ==============================================================================
+pkill -9 python
+pkill -9 torchrun
 set -euo pipefail
 set -x
 
@@ -57,7 +59,7 @@ export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -75,7 +77,7 @@ export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 # Training parameters
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
-N_GPUS="${N_GPUS:-4}"
+N_GPUS="${N_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
@@ -178,7 +180,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     actor_rollout_ref.ref.megatron.use_mbridge=True \
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=False \
     \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.enforce_eager=False \
