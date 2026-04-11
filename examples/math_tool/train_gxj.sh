@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # ==============================================================================
 # Train OpenHands agent with rllm (container-based, no openhands Python lib)
@@ -38,8 +37,8 @@ export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
 # export ASCEND_LAUNCH_BLOCKING=1
 
-# export RAY_DEBUG_POST_MORTEM=0
-export RAY_DEBUG_POST_MORTEM=1
+export RAY_DEBUG_POST_MORTEM=0
+# export RAY_DEBUG_POST_MORTEM=1
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
@@ -54,10 +53,12 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # vLLM / CUDA
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
+export HCCL_INTRA_ROCE_ENABLE=1
 # export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
 # ------------------------------------------------------------------------------
@@ -76,8 +77,8 @@ export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 # Training parameters
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
-N_GPUS="${N_GPUS:-8}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+N_GPUS="${N_GPUS:-16}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
@@ -112,7 +113,7 @@ sleep 2
 ray start --head \
     --port 6380 \
     --dashboard-host 0.0.0.0 \
-    --dashboard-port 8265 \
+    --dashboard-port 8266 \
     --disable-usage-stats \
     --node-ip-address ${MASTER_ADDR}
 
@@ -122,7 +123,7 @@ ray start --head \
 # Each rollout spawns its own OpenHands Docker container via docker run.
 # No rllm sandbox (worker_server.py) wrapper is used.
 # ------------------------------------------------------------------------------
-python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
+python3 -m examples.math_tool.train_math_with_tool_megatron \
     algorithm.adv_estimator=grpo \
     \
     data.train_batch_size=${BATCH_SIZE} \
@@ -151,9 +152,8 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=False \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
-    actor_rollout_ref.actor.megatron.optimizer_offload=True \
     \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.context_parallel_size=4 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=4 \
@@ -163,11 +163,15 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
     \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
-    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2 \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=1 \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.ref.megatron.context_parallel_size=4 \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=8 \
@@ -182,40 +186,27 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_open_megatron.py \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=2048 \
+    actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     \
-    rllm.stepwise_advantage.enable=False \
-    rllm.compact_filtering.enable=True \
-    rllm.compact_filtering.mask_max_prompt_length_exceeded=True \
-    rllm.compact_filtering.mask_max_response_length_exceeded=True \
-    rllm.compact_filtering.mask_max_turns_exceeded=False \
-    rllm.compact_filtering.mask_timeout=True \
-    rllm.rejection_sample.enable=False \
-    \
+    rllm.mask_truncated_samples=False \
     trainer.critic_warmup=0 \
-    "trainer.logger=['console']" \
-    trainer.project_name=${PROJECT_NAME} \
-    trainer.experiment_name=${EXPERIMENT_NAME} \
+    trainer.logger="['console']" \
+    trainer.project_name='rllm-agent' \
+    trainer.experiment_name='4b-math-tool' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=${N_GPUS} \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=10 \
-    trainer.total_epochs=50 \
     trainer.device=npu \
-    \
-    rllm.sdk.proxy.host=0.0.0.0 \
-    rllm.sdk.proxy.port=${PROXY_PORT} \
-    rllm.sdk.proxy.mode=subprocess \
-    rllm.sdk.store.path="${TRACE_DB_PATH}" \
-    rllm.workflow.n_parallel_tasks=1
-
-
-# pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true
-    # rllm.stepwise_advantage.mode=per_step \
+    trainer.save_freq=100 \
+    trainer.test_freq=20 \
+    trainer.default_hdfs_dir=null \
+    rllm.agent.max_steps=2 \
+    rllm.stepwise_advantage.enable=False \
+    trainer.total_epochs=100

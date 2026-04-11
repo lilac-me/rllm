@@ -3,6 +3,7 @@ import json
 import math
 import os
 import uuid
+import torch_npu
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 from pprint import pprint
@@ -28,6 +29,9 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
+
+import torch
+import torch_npu
 
 
 class AgentPPOTrainer(RayPPOTrainer):
@@ -147,9 +151,11 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         self.global_steps = 0
 
+        # torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
         # load checkpoint before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
+        # torch_npu.npu.memory._dump_snapshot("/home/g00841271/rllm-071/ckpt_mng.pickle")
 
         # perform validation before training
         import time
@@ -195,8 +201,37 @@ class AgentPPOTrainer(RayPPOTrainer):
                         batch = batch.union(final_gen_batch_output)
                         metrics.update(generate_metrics)
                     
+                    # ========== 显存快照：sleep 前 ==========
+                    # rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    # # 只在特定 step + 特定 rank 打，避免刷爆磁盘
+                    # do_snapshot = rank in (0, 8)  # rank 0 和 rank 8 代表两个节点/两组卡
+                    
+                    # if do_snapshot:
+                    #     torch_npu.npu.empty_cache()  # 先清一下 cache,让数据更干净
+                    #     before_alloc = torch_npu.npu.memory_allocated() / 1024**3
+                    #     before_reserved = torch_npu.npu.memory_reserved() / 1024**3
+                    #     print(f"[MEM] rank={0} BEFORE sleep: allocated={before_alloc:.2f}GB, reserved={before_reserved:.2f}GB", flush=True)
+                        
+                    #     torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
+
                     # fix issue
                     self.checkpoint_manager.sleep_replicas()
+
+                    # ========== 显存快照：sleep 后 ==========
+                    # if do_snapshot:
+                    #     torch_npu.npu.empty_cache()
+                    #     after_alloc = torch_npu.npu.memory_allocated() / 1024**3
+                    #     after_reserved = torch_npu.npu.memory_reserved() / 1024**3
+                    #     print(f"[MEM] rank={0} AFTER sleep: allocated={after_alloc:.2f}GB, reserved={after_reserved:.2f}GB", flush=True)
+                    #     print(f"[MEM] rank={0} DIFF: alloc={before_alloc-after_alloc:+.2f}GB, reserved={before_reserved-after_reserved:+.2f}GB", flush=True)
+                        
+                    #     snapshot_path = f"/tmp/mem_snapshot_step{self.global_steps}_rank{0}.pickle"
+                    #     torch_npu.npu.memory._dump_snapshot(snapshot_path)
+                    #     torch_npu.npu.memory._record_memory_history(enabled=None)
+                    #     print(f"[MEM] rank={0} snapshot dumped to {snapshot_path}", flush=True)
+                    
+                    # fix issue
+                    # self.checkpoint_manager.sleep_replicas()
 
                     # compute values
                     if self.use_critic:
@@ -445,6 +480,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    
 
                 # validate
                 if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:

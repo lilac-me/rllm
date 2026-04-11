@@ -63,12 +63,13 @@ ray start --head \
 echo "正在提交 rllm 训练任务..."
 
 # --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    # actor_rollout_ref.actor.megatron.optimizer_offload=True \
 
 ray job submit --address="http://127.0.0.1:8265" \
     -- \
     python3 -m examples.math_tool.train_math_with_tool_megatron \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=4 \
+    data.train_batch_size=2 \
     data.val_batch_size=4 \
     data.max_prompt_length=2048 \
     data.max_response_length=4096 \
@@ -84,10 +85,6 @@ ray job submit --address="http://127.0.0.1:8265" \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.megatron.param_offload=True \
-    actor_rollout_ref.actor.megatron.grad_offload=True \
-    actor_rollout_ref.actor.megatron.optimizer_offload=True \
-    actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
     actor_rollout_ref.rollout.name=vllm \
@@ -120,8 +117,11 @@ ray job submit --address="http://127.0.0.1:8265" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
-    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=3 \
-    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4 \
     actor_rollout_ref.ref.megatron.context_parallel_size=2 \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=8 \
     actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1 \
