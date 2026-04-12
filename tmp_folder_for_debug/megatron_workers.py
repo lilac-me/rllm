@@ -376,6 +376,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
         self._update_actor_count = 0
         self._rollout_count = 0
+        self._rollout_in_step = 0
+
+    def _debug_mem(self, tag: str):
+        """Print both device-level and process-level GPU memory for debugging."""
+        free, tot = torch.npu.mem_get_info()
+        dev_used = (tot - free) / 1e9
+        proc_alloc = torch_npu.npu.memory_allocated() / 1e9
+        proc_reserved = torch_npu.npu.memory_reserved() / 1e9
+        print(
+            f"[DEBUG MEM] {tag} | gstep={self._update_actor_count} "
+            f"rollout={self._rollout_in_step} rank={self.rank} "
+            f"dev_used={dev_used:.2f}GB dev_free={free/1e9:.2f}GB | "
+            f"proc_alloc={proc_alloc:.2f}GB proc_reserved={proc_reserved:.2f}GB"
+        )
 
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
@@ -683,39 +697,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         log_gpu_memory_usage("After init_model finish", logger=logger)
 
     async def rollout_mode(self):
-        self._rollout_count += 1
-        free, tot = torch.npu.mem_get_info()
-        print(f"[DEBUG MEM-A] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
-        
         """Context switch hybridengine to rollout mode."""
+        self._rollout_count += 1
+        self._rollout_in_step += 1
+        self._debug_mem("rollout-A  enter")
+
         if torch.distributed.get_rank() == 0:
             torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
         aggressive_empty_cache(force_sync=True)
+        self._debug_mem("rollout-B  after_empty_cache")
 
-        free, tot = torch.npu.mem_get_info()
-        print(f"[DEBUG MEM-B] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
-        # cbx debug
-        # free, tot = torch.npu.mem_get_info()
-        # print(f"[DEBUG rollout_mode] rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
-        # cbx debug
         set_expandable_segments(False)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-C] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("rollout-C  after_load_param(no_grad)")
             log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
 
-        # Build peft_config for vLLM LoRA support
         peft_config = None
         do_lora_base_sync = False
         if not self.peft_merge and self.peft_cls is not None:
             peft_config = build_peft_config_for_vllm(self.config.model.get("lora", {}))
-            # set sleep level for LoRA adapter weights only sync
-            # TODO: make this configurable so that users with small
-            # main memory can trade sync time to avoid OOM
             self.rollout.sleep_level = 1
-
             do_lora_base_sync = (not self.base_sync_done) or (
                 self.rollout.sleep_level != 1 and self.config.rollout.free_cache_engine
             )
@@ -724,7 +727,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.vanilla_bridge:
                 per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
             elif not self.peft_merge and self.peft_cls is not None:
-                # Only export adapter weights
                 per_tensor_param = self.bridge.export_adapter_weights(self.actor.actor_module)
             else:
                 per_tensor_param = self.bridge.export_hf_weights(self.actor.actor_module)
@@ -739,10 +741,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-D] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("rollout-D  after_resume(weights)")
         if do_lora_base_sync:
-            # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
                 self.actor.actor_module, merge_adapter_weights=False
             )
@@ -751,22 +751,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 peft_config=peft_config,
                 base_sync_done=False,
             )
-
-            # Mark base sync as done after first successful sync
             self.base_sync_done = True
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        self._debug_mem("rollout-E0 after_update_weights")
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-E] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("rollout-E  after_offload_param")
         aggressive_empty_cache(force_sync=True)
-        free, tot = torch.npu.mem_get_info()
-        print(f"[DEBUG MEM-F] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+        self._debug_mem("rollout-F  after_empty_cache2")
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-G] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("rollout-G  after_resume(kv_cache)")
 
         set_expandable_segments(True)
         if torch.distributed.get_rank() == 0:
@@ -777,18 +775,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         self._update_actor_count += 1
+        self._rollout_in_step = 0
         if torch.distributed.get_rank() == 0:
             torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
         assert self._is_actor
+
+        self._debug_mem("actor-A0 enter")
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-update_actor-A] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("actor-A  after_load_param(+grad)")
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-update_actor-B] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("actor-B  after_load_optimizer")
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
@@ -796,6 +796,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
+
+        self._debug_mem("actor-B2 after_update_policy")
+
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         images_seqlens = data.meta_info.get("images_seqlens", None)
@@ -811,23 +814,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
 
-        # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-update_actor-C] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("actor-C  after_offload_param")
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
-            free, tot = torch.npu.mem_get_info()
-            print(f"[DEBUG MEM-update_actor-D] steps={self._update_actor_count} rank={self.rank} free={free/1e9:.2f}GB total={tot/1e9:.2f}GB used={(tot-free)/1e9:.2f}GB")
+            self._debug_mem("actor-D  after_offload_optimizer")
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-        
 
         aggressive_empty_cache(force_sync=True)
+        self._debug_mem("actor-E  after_empty_cache")
+
         if torch.distributed.get_rank() == 0:
             torch_npu.npu.memory._dump_snapshot(f"/home/g00841271/rllm-071/actor_{self._update_actor_count}.pickle")
         return output
