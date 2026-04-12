@@ -766,7 +766,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             await self.rollout.resume(tags=["kv_cache"])
             self._debug_mem("rollout-G  after_resume(kv_cache)")
 
-        set_expandable_segments(True)
+        # set_expandable_segments(True)  # 暂时关闭，排查是否导致大 segment 碎片化
         if torch.distributed.get_rank() == 0:
             torch_npu.npu.memory._dump_snapshot(f"/home/g00841271/rllm-071/rollout_{self._update_actor_count}_{self._rollout_count}.pickle")
 
@@ -817,9 +817,42 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
+        # --- 清理 TE / Megatron 残留 buffer，防止碎片 pin 住整个 reserved segment ---
+        try:
+            from transformer_engine.pytorch.module.base import _dummy_wgrads
+            n_cleared = len(_dummy_wgrads)
+            _dummy_wgrads.clear()
+            if torch.distributed.get_rank() == 0:
+                print(f"[DEBUG CLEAN] cleared {n_cleared} TE _dummy_wgrads")
+        except ImportError:
+            pass
+        try:
+            from megatron.core.tensor_parallel.random import get_global_memory_buffer
+            buf = get_global_memory_buffer()
+            n_buf = len(buf.buffer)
+            buf.buffer.clear()
+            if torch.distributed.get_rank() == 0:
+                print(f"[DEBUG CLEAN] cleared {n_buf} Megatron global_memory_buffer entries")
+        except Exception:
+            pass
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             self._debug_mem("actor-C  after_offload_param")
+            # --- 残留 NPU 张量探测：找出 offload 后仍然留在设备上的张量 ---
+            if torch.distributed.get_rank() == 0:
+                import gc as _gc
+                _gc.collect()
+                leak_items = []
+                for obj in _gc.get_objects():
+                    if isinstance(obj, torch.Tensor) and obj.is_npu and obj.storage().size() > 0:
+                        sz_mb = obj.storage().size() * obj.element_size() / 1e6
+                        if sz_mb > 0.1:
+                            leak_items.append((sz_mb, obj.shape, obj.dtype))
+                leak_items.sort(key=lambda x: -x[0])
+                print(f"[LEAK SCAN] found {len(leak_items)} NPU tensors > 0.1MB after offload:")
+                for sz_mb, shape, dtype in leak_items[:30]:
+                    print(f"  [LEAK?] shape={shape} dtype={dtype} size={sz_mb:.1f}MB")
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
