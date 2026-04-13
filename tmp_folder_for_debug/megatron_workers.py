@@ -378,6 +378,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._rollout_count = 0
         self._rollout_in_step = 0
 
+    def _offload_model_buffers(self, models):
+        """Offload all non-parameter GPU tensors (registered buffers, RoPE cache, etc.)
+        that offload_megatron_model_to_cpu does NOT handle."""
+        import gc as _gc
+        for model_chunk in models:
+            # unwrap DDP / Float16Module to get the raw nn.Module
+            inner = model_chunk
+            while hasattr(inner, 'module'):
+                inner = inner.module
+            for buf_name, buf in list(inner.named_buffers()):
+                if buf.device.type != 'cpu' and buf.storage().size() > 0:
+                    buf.data = buf.data.to('cpu', non_blocking=True)
+            # clear lazy-created caches on RotaryEmbedding, attention mask, etc.
+            for mod in inner.modules():
+                for attr in ('cos_cached', 'sin_cached', '_cos_cached', '_sin_cached',
+                             'cos_', 'sin_', 'rotary_emb_cos', 'rotary_emb_sin',
+                             'causal_mask', '_causal_mask'):
+                    t = getattr(mod, attr, None)
+                    if isinstance(t, torch.Tensor) and t.device.type != 'cpu':
+                        setattr(mod, attr, t.to('cpu', non_blocking=True))
+        _gc.collect()
+
     def _debug_mem(self, tag: str):
         """Print both device-level and process-level GPU memory for debugging."""
         free, tot = torch.npu.mem_get_info()
@@ -757,6 +779,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._debug_mem("rollout-E0 after_update_weights")
 
         if self._is_offload_param:
+            self._offload_model_buffers(self.actor.actor_module)
             offload_megatron_model_to_cpu(self.actor.actor_module)
             self._debug_mem("rollout-E  after_offload_param")
         aggressive_empty_cache(force_sync=True)
@@ -766,7 +789,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             await self.rollout.resume(tags=["kv_cache"])
             self._debug_mem("rollout-G  after_resume(kv_cache)")
 
-        # set_expandable_segments(True)  # 暂时关闭，排查是否导致大 segment 碎片化
+        set_expandable_segments(True)  # 暂时关闭，排查是否导致大 segment 碎片化
         if torch.distributed.get_rank() == 0:
             torch_npu.npu.memory._dump_snapshot(f"/home/g00841271/rllm-071/rollout_{self._update_actor_count}_{self._rollout_count}.pickle")
 
@@ -837,6 +860,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             pass
 
         if self._is_offload_param:
+            self._offload_model_buffers(self.actor_module)
             offload_megatron_model_to_cpu(self.actor_module)
             self._debug_mem("actor-C  after_offload_param")
             # --- 残留 NPU 张量探测：找出 offload 后仍然留在设备上的张量 ---
@@ -937,6 +961,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
+            self._offload_model_buffers(self.ref_module)
             offload_megatron_model_to_cpu(self.ref_module)
             log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
@@ -984,6 +1009,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:
+            self._offload_model_buffers(self.actor_module)
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
