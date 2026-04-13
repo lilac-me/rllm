@@ -378,6 +378,34 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._rollout_count = 0
         self._rollout_in_step = 0
 
+    def _gc_clear_gpu_tensors(self, tag: str = ""):
+        """Brute-force: move ALL remaining NPU tensors to CPU after model offload.
+        This ensures no small tensor pins any GPU segment."""
+        import gc as _gc
+        _gc.collect()
+        torch.npu.synchronize()
+        moved = 0
+        moved_bytes = 0
+        for obj in _gc.get_objects():
+            if not isinstance(obj, torch.Tensor):
+                continue
+            if not obj.is_npu:
+                continue
+            try:
+                sz = obj.storage().size() * obj.element_size()
+            except Exception:
+                continue
+            if sz == 0:
+                continue
+            obj.data = obj.data.to('cpu', non_blocking=True)
+            moved += 1
+            moved_bytes += sz
+        torch.npu.synchronize()
+        _gc.collect()
+        if torch.distributed.get_rank() == 0:
+            print(f"[GC CLEAR] {tag} | moved {moved} NPU tensors "
+                  f"({moved_bytes/1e6:.1f}MB) to CPU")
+
     def _diag_snapshot(self, tag: str):
         """Root-cause diagnostic: allocator stats + full tensor census +
         cross-step diff + referrer chain trace.
@@ -919,6 +947,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            self._gc_clear_gpu_tensors("rollout-offload")
             self._debug_mem("rollout-E  after_offload_param")
         aggressive_empty_cache(force_sync=True)
         self._debug_mem("rollout-F  after_empty_cache2")
@@ -1000,6 +1029,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
+            self._gc_clear_gpu_tensors("actor-offload")
             self._debug_mem("actor-C  after_offload_param")
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
@@ -1087,6 +1117,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
         if self._ref_is_offload_param:
             offload_megatron_model_to_cpu(self.ref_module)
+            self._gc_clear_gpu_tensors("ref-offload")
             log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
         return output
@@ -1134,6 +1165,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
+            self._gc_clear_gpu_tensors("logprob-offload")
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
         return output
