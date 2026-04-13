@@ -229,3 +229,7 @@ litellm_proxy_config_autogen.yaml
 
 *.db
 *.db*
+
+*.pickle
+*.csv
+!res[0-9].log
