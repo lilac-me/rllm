@@ -29,6 +29,8 @@ export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
 export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
 
+export RAY_DEDUP_LOGS_ALLOW_REGEX="DEBUG MEM"
+
 # export HCCL_ENTRY_LOG_ENABLE=1
 # export ASCEND_GLOBAL_LOG_LEVEL=0
 # export HCCL_DIAGNOSE_ENABLE=1
@@ -53,8 +55,8 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # vLLM / CUDA
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+# expandable_segments:True,
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
@@ -133,6 +135,7 @@ python3 -m examples.math_tool.train_math_with_tool_megatron \
     \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.model.path=${MODEL_PATH} \
+    actor_rollout_ref.model.use_shm=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -153,7 +156,7 @@ python3 -m examples.math_tool.train_math_with_tool_megatron \
     actor_rollout_ref.actor.megatron.param_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=True \
     \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=1 \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.context_parallel_size=4 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=4 \
@@ -164,14 +167,13 @@ python3 -m examples.math_tool.train_math_with_tool_megatron \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
-    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True \
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
     \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
-    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=1 \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4 \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.ref.megatron.context_parallel_size=4 \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=8 \
