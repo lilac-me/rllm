@@ -383,11 +383,15 @@ class KernelGymEnv(MultiTurnEnvironment):
 
         assert self.task is not None, "Task must be set before calling reset()"
 
+        import uuid
+
         self.done = False
         self.current_turn = 0
         self.history = []
         self._last_error = None
         self._last_result = None
+
+        self.session_uuid = uuid.uuid4().hex[:16]
 
         return self.task, {}
 
@@ -458,7 +462,7 @@ class KernelGymEnv(MultiTurnEnvironment):
         entry_point = task.get("entry_point", "Model")
 
         payload = {
-            "task_id": task_id,
+            "task_id": f"{task_id}_{self.session_uuid}",
             "reference_code": task.get("reference_code", ""),
             "kernel_code": kernel_code,
             "toolkit": task.get("toolkit", self.toolkit),

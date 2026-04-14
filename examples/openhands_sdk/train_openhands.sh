@@ -27,7 +27,7 @@ export RLLM_UI_URL=http://127.0.0.1:3000
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
 # export MODEL_PATH=/home/g00841271/Qwen3-8B
-export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
+export MODEL_PATH=/home/g00841271/Qwen3-8B
 
 # export ASCEND_LAUNCH_BLOCKING=1
 
@@ -42,6 +42,9 @@ export OPENHANDS_IMAGE=openhands-triton-env:v1
 export HYDRA_FULL_ERROR=1
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
 # ------------------------------------------------------------------------------
 # vLLM / CUDA
@@ -125,6 +128,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     data.max_response_length=8192 \
     \
     actor_rollout_ref.model.path=${MODEL_PATH} \
+    actor_rollout_ref.model.use_shm=True \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.strategy=fsdp2 \
