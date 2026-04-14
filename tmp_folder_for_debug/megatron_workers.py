@@ -379,32 +379,38 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._rollout_in_step = 0
 
     def _gc_clear_gpu_tensors(self, tag: str = ""):
-        """Brute-force: move ALL remaining NPU tensors to CPU after model offload.
-        This ensures no small tensor pins any GPU segment."""
+        """Release GPU storage of ALL remaining NPU tensors after model offload.
+        Instead of moving to CPU (which causes device mismatch on next forward),
+        we resize storage to 0 — keeping the tensor 'on NPU' but freeing GPU memory.
+        Lazy caches (RoPE, attn mask, etc.) will be regenerated on next forward."""
         import gc as _gc
         _gc.collect()
         torch.npu.synchronize()
-        moved = 0
-        moved_bytes = 0
+        cleared = 0
+        cleared_bytes = 0
         for obj in _gc.get_objects():
             if not isinstance(obj, torch.Tensor):
                 continue
             if not obj.is_npu:
                 continue
             try:
-                sz = obj.storage().size() * obj.element_size()
+                st = obj.storage()
+                sz = st.size() * obj.element_size()
             except Exception:
                 continue
             if sz == 0:
                 continue
-            obj.data = obj.data.to('cpu', non_blocking=True)
-            moved += 1
-            moved_bytes += sz
+            try:
+                st.resize_(0)
+            except Exception:
+                continue
+            cleared += 1
+            cleared_bytes += sz
         torch.npu.synchronize()
         _gc.collect()
         if torch.distributed.get_rank() == 0:
-            print(f"[GC CLEAR] {tag} | moved {moved} NPU tensors "
-                  f"({moved_bytes/1e6:.1f}MB) to CPU")
+            print(f"[GC CLEAR] {tag} | freed storage of {cleared} NPU tensors "
+                  f"({cleared_bytes/1e6:.1f}MB)")
 
     def _diag_snapshot(self, tag: str):
         """Root-cause diagnostic: allocator stats + full tensor census +
