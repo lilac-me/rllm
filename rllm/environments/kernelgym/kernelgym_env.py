@@ -457,12 +457,12 @@ class KernelGymEnv(MultiTurnEnvironment):
         First tries the Ray-based KernelRewardClient from drkernel.
         Falls back to the simple httpx client.
         """
-        task_id = f"{task.get('problem_id', 'task')}_{uuid.uuid4().hex[:8]}"
+        task_id = f"{task.get('problem_id', 'task')}_{self.session_uuid}_{uuid.uuid4().hex[:8]}"
         server_url = task.get("kernel_server_url", self.kernel_server_url).rstrip("/")
         entry_point = task.get("entry_point", "Model")
 
         payload = {
-            "task_id": f"{task_id}_{self.session_uuid}",
+            "task_id": f"{task_id}",
             "reference_code": task.get("reference_code", ""),
             "kernel_code": kernel_code,
             "toolkit": task.get("toolkit", self.toolkit),
