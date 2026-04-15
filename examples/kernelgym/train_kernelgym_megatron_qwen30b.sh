@@ -12,17 +12,13 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
-
 
 export RAY_DEBUG_POST_MORTEM=0
-# ValueError: FRACTAL_NZ mode is enabled. This may cause model parameter precision issues in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0.
 export VLLM_ASCEND_ENABLE_NZ=0
 
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
-# 修复 ModuleNotFoundError: 自动获取当前目录并加入 PYTHONPATH
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
@@ -30,10 +26,11 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
-# ── NCCL / Tokenizers ─────────────────────────────────────────────────────────
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
 export HYDRA_FULL_ERROR=1
+
+MODEL_PATH=/home/g00841271/cszhou_sft_weight/global_step_100
 
 echo "正在重启 Ray 集群..."
 ray stop --force
@@ -58,8 +55,8 @@ ARGS=(
   # =========================
   data.train_batch_size=8
   data.val_batch_size=16
-  data.max_prompt_length=24576
-  data.max_response_length=8192
+  data.max_prompt_length=24576      # 48K
+  data.max_response_length=8192    # 16K
 
   # =========================
   # actor_rollout_ref - common
@@ -106,6 +103,7 @@ ARGS=(
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
+  +actor_rollout_ref.actor.checkpoint.save_contents="['model']"
 
   # =========================
   # actor optimizer override
@@ -151,8 +149,8 @@ ARGS=(
   # rllm
   # =========================
   rllm.mask_truncated_samples=False
-  +rllm.agent.engine_args.n_parallel_agents=8
-  rllm.agent.max_steps=5
+  +rllm.agent.engine_args.n_parallel_agents=64
+  rllm.agent.max_steps=3
   rllm.stepwise_advantage.enable=False
 
   # =========================
@@ -161,12 +159,12 @@ ARGS=(
   trainer.critic_warmup=0
   trainer.logger=[console,wandb]
   trainer.project_name=rllm-agent
-  trainer.experiment_name=30b-kernelgym
+  trainer.experiment_name=kernelgym-qwen30b
   trainer.val_before_train=False
   trainer.n_gpus_per_node=8
   trainer.nnodes=1
   trainer.device=npu
-  trainer.save_freq=100
+  trainer.save_freq=1
   trainer.test_freq=20
   trainer.default_hdfs_dir=null
   trainer.total_epochs=100
@@ -179,7 +177,7 @@ ARGS=(
   ++kernel.toolkit=kernelbench
   ++kernel.use_ray=false
   ++kernel.timeout=300
-  ++kernel.num_correct_trials=5
+  ++kernel.num_correct_trials=3
   ++kernel.num_perf_trials=100
 
   # optional

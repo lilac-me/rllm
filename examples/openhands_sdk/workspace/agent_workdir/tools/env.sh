@@ -28,3 +28,12 @@ export AST_CHECK_PYTHON="${AST_CHECK_PYTHON:-python3}"
 
 # --- Workspace ---
 : "${WORKSPACE_BASE:=/opt/workspace}"
+
+
+rm -rf /root/.triton/cache/
+ 
+source /opt/conda/envs/evaluator-py311/Ascend/ascend-toolkit/set_env.sh
+
+export TRITON_DEBUG=1
+export TRITON_ALLWAYS_COMPILE=1
+export PATH=/opt/conda/envs/evaluator-py311/Ascend/cann-8.5.0/tools/bishengir/bin:$PATH

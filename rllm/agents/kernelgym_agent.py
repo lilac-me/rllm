@@ -17,41 +17,28 @@ from rllm.agents.agent import Action, BaseAgent, Step, Trajectory
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
+##########
 _SYSTEM_PROMPT = """\
-You are an expert GPU kernel engineer. Your task is to write a high-performance \
-CUDA or Triton kernel that is functionally equivalent to the given PyTorch \
-reference implementation, but runs faster.
+You are looking at this PyTorch code and thinking it could be optimized with Triton. You need to create a Triton version with the `ModelNew`. This triton version must be execution on Ascend NPU platforms.
 
-**Instructions:**
-1. Study the reference PyTorch implementation carefully.
-2. Implement a custom CUDA or Triton kernel as a Python class named `ModelNew` \
-   that has the same interface as the reference `Model` class.
-3. Your implementation must pass correctness checks against the reference output.
-4. Optimise for speed: minimise memory bandwidth, maximise compute utilisation.
-5. Wrap your final kernel code inside `<kernel>` ... `</kernel>` tags so it can \
-   be extracted automatically. Only include the full, runnable Python file inside \
-   the tags — no explanatory text inside the tags.
+Please firstly analyze this code and think hard how you can optimize it. YOU MUST wrap your final code in a ```triton ... ``` code block. No other code block markers are acceptable.
 
-**Allowed libraries:** torch, triton, CUDA C extensions (via torch.utils.cpp_extension).
+**Please output and show your thinking, plan,
+analysis etc., before your coding, which should be as
+more as possible.**
+
+Here's the PyTorch code:
+
 """
 
-_INITIAL_USER_TEMPLATE = """\
-Here is the reference PyTorch implementation you need to optimise:
-
+##########
+_INITIAL_USER_TEMPLATE = """
 ```python
 {reference_code}
 ```
-
-{description}
-
-Please write a high-performance `ModelNew` implementation. Remember to wrap your \
-final code in `<kernel>` ... `</kernel>` tags.
 """
 
+##########
 _REVISION_USER_TEMPLATE = """\
 Your previous kernel submission was evaluated. Here is the feedback:
 
@@ -60,6 +47,11 @@ Your previous kernel submission was evaluated. Here is the feedback:
 Please revise your `ModelNew` implementation to fix the issues above. \
 Remember to wrap your final code in `<kernel>` ... `</kernel>` tags.
 """
+
+# TODO. fix err: "RuntimeError: grid should be less than 65536!"
+# TODO. ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
+# TODO. RuntimeError: ModelNew requires x.device.type == 'ascend'
+# TODO. ValueError('program_id axis must be 0, 1, or 2 but got 3')
 
 
 class KernelAgent(BaseAgent):
@@ -99,19 +91,12 @@ class KernelAgent(BaseAgent):
         info: dict,
         **kwargs: Any,
     ) -> None:
-        """Update internal state after an environment observation.
-
-        Turn 0 (initial): builds system message + first user message from the
-        task dict (reference code + description).
-        Subsequent turns: appends the feedback string as a new user message.
-        """
+        # 第一轮，需要初始化
         if not self._trajectory.steps:
-            # ── First turn: observation IS the task dict ──────────────────
-            assert isinstance(observation, dict), (
-                "Initial observation must be the task dict."
-            )
+            assert isinstance(observation, dict), ("Initial observation must be the task dict.")
+
             reference_code = observation.get("reference_code", "")
-            description = observation.get("description", "")
+            # description = observation.get("description", "")
 
             # Seed message history with the system prompt
             if not self.messages:
@@ -121,7 +106,7 @@ class KernelAgent(BaseAgent):
 
             user_content = _INITIAL_USER_TEMPLATE.format(
                 reference_code=reference_code,
-                description=f"Additional context:\n{description}" if description else "",
+                # description=f"Additional context:\n{description}" if description else "",
             )
             self.messages.append({"role": "user", "content": user_content})
 
@@ -129,8 +114,6 @@ class KernelAgent(BaseAgent):
             self._trajectory.steps.append(new_step)
 
         else:
-            # ── Subsequent turns: observation is the feedback dict ────────
-            # Update the previous step's reward / done flag
             cur_step = self.get_current_state()
             if cur_step is not None:
                 cur_step.reward = reward
@@ -140,22 +123,23 @@ class KernelAgent(BaseAgent):
             if done:
                 return
 
-            # Extract human-readable feedback
-            if isinstance(observation, dict) and "feedback" in observation:
-                user_content = _REVISION_USER_TEMPLATE.format(
-                    feedback=observation["feedback"]
-                )
-            elif isinstance(observation, str):
-                user_content = _REVISION_USER_TEMPLATE.format(feedback=observation)
-            else:
-                user_content = _REVISION_USER_TEMPLATE.format(
-                    feedback=str(observation)
-                )
+            user_content = _REVISION_USER_TEMPLATE.format(feedback=observation)
+            # if isinstance(observation, dict) and "feedback" in observation:
+            #     user_content = _REVISION_USER_TEMPLATE.format(
+            #         feedback=observation["feedback"]
+            #     )
+            # elif isinstance(observation, str):
+            #     user_content = _REVISION_USER_TEMPLATE.format(feedback=observation)
+            # else:
+            #     user_content = _REVISION_USER_TEMPLATE.format(
+            #         feedback=str(observation)
+            #     )
 
             self.messages.append({"role": "user", "content": user_content})
 
             new_step = Step(observation=observation)
             self._trajectory.steps.append(new_step)
+
 
     def update_from_model(self, response: str, **kwargs: Any) -> Action:
         """Update internal state with the model's response and return an Action.
@@ -189,11 +173,6 @@ class KernelAgent(BaseAgent):
 
     @property
     def chat_completions(self) -> list[dict[str, str]]:
-        """Return the conversation history for model inference.
-
-        When ``accumulate_thinking=False`` (default), ``<think>`` blocks in
-        previous assistant turns are stripped to keep context concise.
-        """
         messages = copy.deepcopy(self.messages)
         if not self.accumulate_thinking:
             for msg in messages[:-1]:
