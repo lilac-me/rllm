@@ -40,18 +40,82 @@ _INITIAL_USER_TEMPLATE = """
 
 ##########
 _REVISION_USER_TEMPLATE = """\
-Your previous kernel submission was evaluated. Here is the feedback:
+Now you have received the server feedback for your last implementation. Based on that and all your previous responses, improve the implementation.
 
+Here is the server feedback. Please refer to this feedback to improve the implementation:
+Server feedback (status/metrics/errors):
 {feedback}
 
-Please revise your `ModelNew` implementation to fix the issues above. \
-Remember to wrap your final code in `<kernel>` ... `</kernel>` tags.
+Return an improved Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.
 """
 
 # TODO. fix err: "RuntimeError: grid should be less than 65536!"
 # TODO. ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
 # TODO. RuntimeError: ModelNew requires x.device.type == 'ascend'
 # TODO. ValueError('program_id axis must be 0, 1, or 2 but got 3')
+
+
+def extract_reference_code(solution_str: str) -> str:
+    """
+    从解决方案字符串中提取参考代码
+    
+    Args:
+        solution_str: 包含提示和响应的完整字符串
+        
+    Returns:
+        提取的参考代码
+    """
+    # 查找参考实现标记
+    patterns = [
+        r"# Reference Implementation\s*\n(.*?)(?=# Your Task|# Generate|$)",
+        r"```python\s*# Reference\s*\n(.*?)```",
+        r"# PyTorch Reference:\s*\n(.*?)(?=# Task|# Generate|$)",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, solution_str, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    # 如果没有找到特定标记，尝试提取第一个 Python 代码块
+    code_block_match = re.search(r"```python\s*\n(.*?)```", solution_str, re.DOTALL)
+    if code_block_match:
+        return code_block_match.group(1).strip()
+    
+    # 回退到整个字符串
+    return solution_str
+
+
+def extract_kernel_code(solution_str: str) -> str:
+    """
+    从解决方案字符串中提取内核代码
+    
+    Args:
+        solution_str: 包含提示和响应的完整字符串
+        
+    Returns:
+        提取的内核代码
+    """
+    # 查找内核实现标记
+    patterns = [
+        r"# Kernel Implementation\s*\n(.*?)(?=# End|$)",
+        r"```python\s*# Kernel\s*\n(.*?)```",
+        r"# Your implementation:\s*\n(.*?)(?=# End|$)",
+        r"# Generated kernel:\s*\n(.*?)(?=# End|$)",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, solution_str, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    # 如果没有找到特定标记，尝试提取最后一个代码块
+    code_blocks = re.findall(r"```(?:\w+)?\s*\n?(.*?)```", solution_str, re.DOTALL)
+    if code_blocks:
+        return code_blocks[-1].strip()
+    
+    # 回退：假设整个响应就是内核代码
+    return solution_str
 
 
 class KernelAgent(BaseAgent):
@@ -94,20 +158,12 @@ class KernelAgent(BaseAgent):
         # 第一轮，需要初始化
         if not self._trajectory.steps:
             assert isinstance(observation, dict), ("Initial observation must be the task dict.")
-
-            reference_code = observation.get("reference_code", "")
-            # description = observation.get("description", "")
-
-            # Seed message history with the system prompt
+            
+            #! 构造并初始化
             if not self.messages:
-                self.messages.append(
-                    {"role": "system", "content": self._system_prompt}
-                )
-
-            user_content = _INITIAL_USER_TEMPLATE.format(
-                reference_code=reference_code,
-                # description=f"Additional context:\n{description}" if description else "",
-            )
+                self.messages.append({"role": "system", "content": self._system_prompt})
+            reference_code = observation.get("reference_code", "")
+            user_content = _INITIAL_USER_TEMPLATE.format( reference_code=reference_code )
             self.messages.append({"role": "user", "content": user_content})
 
             new_step = Step(observation=observation)
@@ -124,17 +180,6 @@ class KernelAgent(BaseAgent):
                 return
 
             user_content = _REVISION_USER_TEMPLATE.format(feedback=observation)
-            # if isinstance(observation, dict) and "feedback" in observation:
-            #     user_content = _REVISION_USER_TEMPLATE.format(
-            #         feedback=observation["feedback"]
-            #     )
-            # elif isinstance(observation, str):
-            #     user_content = _REVISION_USER_TEMPLATE.format(feedback=observation)
-            # else:
-            #     user_content = _REVISION_USER_TEMPLATE.format(
-            #         feedback=str(observation)
-            #     )
-
             self.messages.append({"role": "user", "content": user_content})
 
             new_step = Step(observation=observation)
@@ -142,28 +187,17 @@ class KernelAgent(BaseAgent):
 
 
     def update_from_model(self, response: str, **kwargs: Any) -> Action:
-        """Update internal state with the model's response and return an Action.
-
-        The action payload is the raw LLM response string (the environment will
-        extract the kernel code from it via ``_extract_kernel_code``).
-        """
         self.messages.append({"role": "assistant", "content": response})
 
         cur_step = self.get_current_state()
-        if cur_step is not None:
-            cur_step.chat_completions = list(self.chat_completions)
-            cur_step.model_response = response
+        assert cur_step is not None
 
-            # Separate thinking from answer if present
-            if response.count("</think>") == 1:
-                thought, sep, answer = response.partition("</think>")
-                cur_step.thought = thought + sep
-                action = Action(action=answer.strip())
-            else:
-                cur_step.thought = ""
-                action = Action(action=response.strip())
+        cur_step.chat_completions = list(self.chat_completions)
+        cur_step.model_response = response
 
-            cur_step.action = action
+        kernel_code = extract_kernel_code(response)
+        action = Action(action=kernel_code.strip())
+        cur_step.action = action
 
         return action
 

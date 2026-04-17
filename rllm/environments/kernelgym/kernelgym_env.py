@@ -1,380 +1,696 @@
-"""KernelGYM environment for rllm.
-
-Directly reuses the KernelGYM package (from /home/robomaster/Research/KernelGYM)
-for kernel evaluation. Delegates to ``kernel.rewards.kernel_reward`` for
-batch reward computation and to ``kernel.rewards.reward_client.KernelRewardClient``
-for HTTP communication with the KernelGYM API server.
-
-This avoids re-implementing the HTTP client logic and reward formulation,
-keeping the rllm integration aligned with upstream KernelGYM / DrKernel.
-"""
-
 from __future__ import annotations
 
 import logging
 import re
+import os
 import sys
 import uuid
-from typing import Any, Dict, Optional, Tuple
-
+import time
+import random
+import json
+import ray
+import httpx
+import omegaconf
+from verl.tools.sandbox_fusion_tools import TokenBucketWorker
+from typing import Any, Dict, Optional, Tuple, List, Sequence, Callable
 from rllm.environments.base.multi_turn_env import MultiTurnEnvironment
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Ensure KernelGYM packages are importable
-# ---------------------------------------------------------------------------
-_KERNELGYM_ROOT = "/data/home/3120235672/code_agent/KernelGYM"
-
-for _p in [_KERNELGYM_ROOT, f"{_KERNELGYM_ROOT}/drkernel"]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-
-# ---------------------------------------------------------------------------
-# Lazy import helpers – only imported when actually needed
-# ---------------------------------------------------------------------------
-
-def _get_reward_client_class():
-    """Lazily import KernelRewardClient from drkernel."""
-    from kernel.rewards.reward_client import KernelRewardClient
-    return KernelRewardClient
-
-
-def _get_compute_kernel_reward_batch():
-    """Lazily import the batch reward function from drkernel."""
-    from kernel.rewards.kernel_reward import (
-        compute_kernel_reward_batch,
-        extract_kernel_code as _kg_extract,
-    )
-    return compute_kernel_reward_batch, _kg_extract
-
-
-# ---------------------------------------------------------------------------
-# Fallback kernel-code extraction (same logic as current, used as default)
-# ---------------------------------------------------------------------------
-
-def _extract_kernel_code(text: str) -> str:
-    """Extract kernel code from an LLM response.
-
-    Priority:
-    1. ``<kernel>...</kernel>`` tags.
-    2. Last ```python ... ``` (or bare ``` ... ```) fenced block.
-    3. Entire text as fallback.
-    """
-    # 1. Explicit tags
-    tag_match = re.search(r"<kernel>(.*?)</kernel>", text, re.DOTALL)
-    if tag_match:
-        return tag_match.group(1).strip()
-
-    # 2. Fenced code blocks (last one wins – usually the final answer)
-    fence_matches = re.findall(r"```(?:python|cuda|triton)?\n?(.*?)```", text, re.DOTALL)
-    if fence_matches:
-        return fence_matches[-1].strip()
-
-    # 3. Fallback
-    return text.strip()
-
-
-# ---------------------------------------------------------------------------
-# Minimal reward-config shim for KernelRewardClient
-# ---------------------------------------------------------------------------
-
-class _RewardPolicy:
-    """Thin shim that mimics the OmegaConf object expected by KernelRewardClient."""
-
-    def __init__(self, penalties: Optional[Dict[str, float]] = None):
-        self.penalties = _DictAccessor(penalties or {
-            "penalty_score": -1.0,
-            "compilation_fail": -0.5,
-            "correctness_fail": -0.3,
-            "perf_degrade": -0.1,
-        })
-
-
-class _CoverageReward:
-    """Shim for ``reward_config.coverage_reward``."""
-
-    def __init__(self, enable: bool = False, weight: float = 0.0,
-                 reward_type: str = "time_coverage"):
-        self.enable = enable
-        self.weight = weight
-        self.reward_type = reward_type
-
-
-class _DictAccessor(dict):
-    """dict subclass that also supports attribute-style access."""
-
-    def __getattr__(self, key: str):
-        try:
-            return self[key]
-        except KeyError:
-            raise AttributeError(key)
-
-
-class _RewardConfig:
-    """Minimal reward config that satisfies ``KernelRewardClient.__init__``."""
-
-    def __init__(
-        self,
-        server_url: str = "http://localhost:8000",
-        timeout: int = 300,
-        max_retries: int = 3,
-        rate_limit: int = 8,
-        max_concurrent: int = 8,
-        acquire_timeout: int = 120,
-        reward_func_name: str = "calculate_reward_like_kernel",
-        init_correct_weight: float = 0.3,
-        init_performance_weight: float = 0.6,
-        speedup_eps: float = 0.05,
-        speedup_reward_upper_bound: float = 10.0,
-        speedup_reward_lower_bound: float = 0.0,
-        task_timeout_in_client: Optional[int] = None,
-        num_correct_trials: int = 5,
-        num_perf_trials: int = 100,
-        enable_profiling: bool = False,
-        verbose_errors: bool = True,
-        detect_decoy_kernel: bool = True,
-        reference_backend: Optional[str] = None,
-        penalty_score: float = -1.0,
-        coverage_enable: bool = False,
-        coverage_weight: float = 0.0,
-        coverage_reward_type: str = "time_coverage",
-    ):
+class _HybridHttpWorker:
+    def __init__(self, server_url: str, rate_limit: int, default_timeout: int, acquire_timeout: int) -> None:
         self.server_url = server_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.rate_limit = rate_limit
-        self.max_concurrent = max_concurrent
-        self.acquire_timeout = acquire_timeout
-        self.reward_func_name = reward_func_name
-        self.init_correct_weight = init_correct_weight
-        self.init_performance_weight = init_performance_weight
-        self.speedup_eps = speedup_eps
-        self.speedup_reward_upper_bound = speedup_reward_upper_bound
-        self.speedup_reward_lower_bound = speedup_reward_lower_bound
-        self.task_timeout_in_client = task_timeout_in_client or timeout
-        self.num_correct_trials = num_correct_trials
-        self.num_perf_trials = num_perf_trials
-        self.enable_profiling = enable_profiling
-        self.verbose_errors = verbose_errors
-        self.detect_decoy_kernel = detect_decoy_kernel
-        self.reference_backend = reference_backend
-        self.reward_policy = _RewardPolicy({"penalty_score": penalty_score})
-        self.coverage_reward = _CoverageReward(
-            enable=coverage_enable,
-            weight=coverage_weight,
-            reward_type=coverage_reward_type,
+        # print(f"[DEBUG] Default timeout: {default_timeout}")
+        self.default_timeout = int(default_timeout)
+        self.acquire_timeout = int(acquire_timeout)
+        self._limits = httpx.Limits(max_keepalive_connections=64, max_connections=128, keepalive_expiry=30.0)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=self.default_timeout, write=10.0, pool=5.0),
+            limits=self._limits,
+            headers={"Content-Type": "application/json"},
         )
+        # TokenBucketWorker 是一个全局视角的 token 计数器
+        self._rate_limit_worker = TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
 
+    def _backoff(self, attempt: int, base: int = 2, cap: int = 30) -> float:
+        return min(base ** attempt, cap)
 
-# ---------------------------------------------------------------------------
-# Simple httpx-based fallback client (no Ray dependency)
-# ---------------------------------------------------------------------------
-
-class _SimpleEvalClient:
-    """Lightweight evaluation client using httpx when Ray is not available.
-
-    Follows the same submit → poll → fetch pattern as KernelGYM server but
-    without requiring Ray or the full ``KernelRewardClient`` stack.
-    """
-
-    def __init__(self, server_url: str, timeout: int = 300, request_timeout: int = 360):
-        self.server_url = server_url.rstrip("/")
-        self.timeout = timeout
-        self.request_timeout = request_timeout
-
-    def evaluate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST to /evaluate synchronously and return the response dict."""
+    def get_token_in_use(self) -> int:
         try:
-            import httpx
-        except ImportError as exc:
-            raise ImportError(
-                "httpx is required for KernelGymEnv. "
-                "Install it via 'pip install httpx'."
-            ) from exc
+            return ray.get(self._rate_limit_worker.get_current_count.remote())
+        except Exception:
+            return -1
 
+    def submit_and_poll(self, task_data: Dict[str, Any], client_timeout: int, max_retries: Optional[int]) -> Dict[str, Any]:
+        """Submit task and poll for results.
+
+        Args:
+            task_data: Task payload including server-side timeout in task_data["timeout"]
+            client_timeout: Client-side total timeout including queue wait + execution time
+            max_retries: Max retry attempts for submission failures
+        """
+        start_ts = time.time()
+        # Rate-limit only during submission; polling does not consume tokens.
         try:
-            with httpx.Client(timeout=self.request_timeout) as client:
-                resp = client.post(f"{self.server_url}/evaluate", json=payload)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as exc:
-            logger.warning("KernelGYM evaluation failed for task %s: %s",
-                           payload.get("task_id", "?"), exc)
-            return {
-                "compiled": False,
-                "correctness": False,
-                "speedup": None,
-                "status": "failed",
-                "error_message": str(exc),
-            }
+            # Submit with limited retries: 429/503/timeout/connect errors.
+            attempt = 0
+            unlimited = max_retries is None or max_retries == -1
+            while unlimited or attempt < (max_retries or 0):
+                try:
+                    # Acquire token with timeout.
+                    acquire_ref = self._rate_limit_worker.acquire.remote()
+                    ready, _ = ray.wait([acquire_ref], timeout=self.acquire_timeout)
+                    if not ready:
+                        try:
+                            curr = ray.get(self._rate_limit_worker.get_current_count.remote())
+                        except Exception:
+                            curr = -1
+                        print(f"[HybridWorker] acquire timeout tokens_in_use={curr}")
+                        return {"status": "failed", "error_message": "rate limiter acquire timeout"}
+                    # Log once on first attempt to help debug "server did not receive request".
+                    if attempt == 0:
+                        print(f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}")
+                    resp = self._client.post(f"{self.server_url}/evaluate", json=task_data)
+                    # Log status code to help diagnose non-200 responses.
+                    try:
+                        print(f"[HybridWorker] POST /evaluate resp={resp.status_code} task_id={task_data.get('task_id','')}")
+                    except Exception:
+                        pass
+                    # Release token immediately after submission.
+                    try:
+                        self._rate_limit_worker.release.remote()
+                    except Exception:
+                        pass
+                    if resp.status_code == 200:
+                        break
+                    if resp.status_code in (429, 503):
+                        time.sleep(self._backoff(attempt, base=2 if resp.status_code == 429 else 5))
+                        attempt += 1
+                        continue
+                    resp.raise_for_status()
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
+                    try:
+                        self._rate_limit_worker.release.remote()
+                    except Exception:
+                        pass
+                    if unlimited or attempt < (max_retries or 0) - 1:
+                        time.sleep(self._backoff(attempt))
+                        attempt += 1
+                        continue
+                    return {"status": "failed", "error_message": str(e)}
+                except Exception as e:
+                    try:
+                        self._rate_limit_worker.release.remote()
+                    except Exception:
+                        pass
+                    return {"status": "failed", "error_message": str(e)}
 
+            # Poll status at a fixed 1s interval.
+            task_id = task_data.get("task_id", "")
+            last_status = None
+            while time.time() - start_ts < client_timeout:
+                try:
+                    s = self._client.get(f"{self.server_url}/status/{task_id}")
+                    if s.status_code == 200:
+                        data = s.json()
+                        status = data.get("status", "unknown")
+                        if status != last_status:
+                            last_status = status
+                            try:
+                                print(f"[HybridWorker] STATUS task_id={task_id} -> {status}")
+                            except Exception:
+                                pass
+                        if status in ("completed", "failed", "timeout", "cancelled"):
+                            if status == "completed":
+                                r = self._client.get(f"{self.server_url}/results/{task_id}")
+                                if r.status_code == 200:
+                                    result = r.json()
+                                    result["status"] = status
+                                    return result
+                                return {"status": status, "error_message": f"Failed to fetch results: HTTP {r.status_code}"}
+                            return {"status": status, "error_message": data.get("error_message", f"Task {status}")}
+                except Exception:
+                    pass
+                time.sleep(1.0)
 
-# ---------------------------------------------------------------------------
-# Reward computation – try drkernel first, fallback to simple formula
-# ---------------------------------------------------------------------------
+            return {"status": "timeout", "error_message": f"Task timeout after {client_timeout}s (client-side)"}
+        finally:
+            # No need to release here (already released during submission).
+            pass
 
-# Default weights (mirrors DrKernel's calculate_reward_like_kernel)
-_W_COMPILED = 0.1
-_W_CORRECT = 0.3
-_W_SPEEDUP = 0.6
-_SPEEDUP_CLIP_MAX = 10.0
-
-
-def _compute_reward_simple(
-    compiled: bool,
-    correctness: Optional[bool],
-    speedup: Optional[float],
-) -> float:
-    """Simple fallback reward when drkernel is not available."""
-    r = _W_COMPILED * float(compiled)
-    if correctness:
-        r += _W_CORRECT
-    if speedup is not None and speedup > 0:
-        clipped = min(speedup, _SPEEDUP_CLIP_MAX)
-        r += _W_SPEEDUP * (clipped / _SPEEDUP_CLIP_MAX)
-    return round(r, 4)
-
-
-# ---------------------------------------------------------------------------
-# KernelGymEnv
-# ---------------------------------------------------------------------------
 
 class KernelGymEnv(MultiTurnEnvironment):
-    """Multi-turn RL environment backed by the KernelGYM evaluation server.
+    '''rllm 中使用的 KernelGym 包装(KernelGymEnv) 与 Kernelgym 不同，
+    kernelgym中评估kernel是以batch输入的, batch交给一个RewardClient后, 
+    由RewardClient分发到多个 Ray Http 客户端上, 而后获得返回。
+    在 KernelGymEnv(rllm) 中, 数据是以单条输入的, 因此我们不再使用这种结构, 
+    转而直接发送Http请求。
+    '''
+    def __init__(self, task: dict | None = None, config:omegaconf.DictConfig = omegaconf.DictConfig({})):
+        super().__init__(task=task, max_turns=config.max_turns)
 
-    This environment directly reuses the KernelGYM package from
-    ``/home/robomaster/Research/KernelGYM`` for evaluation and reward
-    computation, rather than re-implementing the HTTP client logic.
+        assert task is not None
+        #! 任务相关的输入
+        self.problem_id = task.get("problem_id", "undefined_"+uuid.uuid4().hex[:16])
+        self.reference_code = task.get("reference_code", "")
+        self.entry_point = task.get("entry_point", "")
+        self.is_valid = task.get("is_valid", True)
+        # TODO. 检查下这他妈是啥参数
+        self.uuid = task.get("uuid", None)
+        self.task = task
+        
+        # 用于存储每次 get_reward_and_next_obs 返回的 meta_data
+        self.meta_info_history = list()
+        
+        #! 配置信息
+        self.config = config
+        self.server_url = str(config["server_url"])
+        self.timeout = float(config.timeout)
+        self.rate_limit = int(config.rate_limit)
+        if self.rate_limit <= 0:
+            self.rate_limit = 1
+        self.acquire_timeout = int(config.acquire_timeout)
 
-    **Evaluation modes** (selected automatically):
+        self.task_timeout =  int(getattr(config, 'task_timeout', self.timeout))
+        self.task_timeout_in_client = int(getattr(config, 'task_timeout_in_client', self.timeout))
+        self.max_retries = config.max_retries
 
-    1. **Ray + KernelRewardClient** (preferred): When Ray is available and
-       ``use_ray=True``, uses ``KernelRewardClient`` from drkernel for the
-       full submit → poll → fetch pattern with rate limiting.
-    2. **Simple httpx client** (fallback): Direct synchronous POST to
-       ``/evaluate`` when Ray is not available.
+        self.reward_func_name = config.reward_func_name
+        self.init_correct_weight = float(config.init_correct_weight)
+        self.init_performance_weight = float(config.init_performance_weight)
+        self.speedup_eps = float(config.speedup_eps)
+        self.penalty_score = float(config.reward_policy.penalties.penalty_score)
+        self.speedup_reward_upper_bound = float(config.speedup_reward_upper_bound)
+        self.speedup_reward_lower_bound = float(config.speedup_reward_lower_bound)
 
-    Each episode:
-    - ``reset()``  → returns the task description (reference PyTorch code).
-    - ``step(action)`` → submits the kernel code to KernelGYM, receives
-      compiled / correctness / speedup metrics, compute reward.
+        self.num_perf_trials = config.num_perf_trials
+        self.num_correct_trials = config.num_correct_trials
+        self.enable_profiling = config.enable_profiling
+        self.verbose_errors = config.verbose_errors
+        self.detect_decoy_kernel = config.detect_decoy_kernel
+        self.reference_backend = config.reference_backend
 
-    Args:
-        task: Task dict with fields:
-            - ``problem_id`` (str): Unique problem identifier.
-            - ``reference_code`` (str): PyTorch reference implementation.
-            - ``description`` (str, optional): Human-readable problem description.
-            - ``entry_point`` (str, optional): Class name to evaluate (default "Model").
-        kernel_server_url: Base URL of the running KernelGYM API server.
-        max_turns: Maximum LLM refinement rounds per episode (default 3).
-        num_correct_trials: Correctness trials passed to KernelGYM (default 5).
-        num_perf_trials: Performance timing trials (default 100).
-        timeout: Per-evaluation timeout in seconds (default 300).
-        toolkit: Default toolkit name (default "kernelbench").
-        backend_adapter: Default backend adapter (default "kernelbench").
-        backend: Default backend type (default "cuda").
-        request_timeout: HTTP request timeout in seconds (default 360).
-        use_ray: Whether to attempt using KernelRewardClient with Ray.
-        reward_func_name: Name of reward function in KernelRewardClient
-            (default "calculate_reward_like_kernel").
-        reward_config: Optional dict of extra reward-config overrides.
-    """
+        self._worker = _HybridHttpWorker(
+            self.server_url, self.rate_limit, int(self.timeout), self.acquire_timeout
+        )
 
-    def __init__(
-        self,
-        task: dict | None = None,
-        kernel_server_url: str = "http://localhost:8000",
-        max_turns: int = 3,
-        num_correct_trials: int = 5,
-        num_perf_trials: int = 100,
-        timeout: int = 300,
-        toolkit: str = "kernelbench",
-        backend_adapter: str = "kernelbench",
-        backend: str = "cuda",
-        request_timeout: int = 360,
-        use_ray: bool = False,
-        reward_func_name: str = "calculate_reward_like_kernel",
-        reward_config: dict | None = None,
-    ):
-        super().__init__(task=task, max_turns=max_turns)
-        self.kernel_server_url = kernel_server_url.rstrip("/")
-        self.num_correct_trials = num_correct_trials
-        self.num_perf_trials = num_perf_trials
-        self.timeout = timeout
-        self.toolkit = toolkit
-        self.backend_adapter = backend_adapter
-        self.backend = backend
-        self.request_timeout = request_timeout
-        self.use_ray = use_ray
-        self.reward_func_name = reward_func_name
-        self._reward_config_overrides = reward_config or {}
+        self.logger = logging.getLogger(__name__)
 
-        # State reset by reset()
-        self._last_error: Optional[str] = None
-        self._last_result: Optional[Dict[str, Any]] = None
 
-        # Lazy-initialised clients
-        self._reward_client = None  # KernelRewardClient instance (Ray mode)
-        self._simple_client = None  # _SimpleEvalClient instance (no-Ray mode)
-        self._reward_cfg = None     # _RewardConfig object
-
-    # ------------------------------------------------------------------
-    # Client initialisation
-    # ------------------------------------------------------------------
-
-    def _get_reward_config(self) -> _RewardConfig:
-        """Build (or return cached) _RewardConfig object."""
-        if self._reward_cfg is None:
-            defaults = {
-                "server_url": self.kernel_server_url,
-                "timeout": self.timeout,
-                "num_correct_trials": self.num_correct_trials,
-                "num_perf_trials": self.num_perf_trials,
-                "reward_func_name": self.reward_func_name,
+    def calculate_reward_like_kernel(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        if result.get("status") != "completed":
+            error_message = result.get("error_message", "Task failed")
+            if error_message == "Task failed":
+                error_message = result.get("error", "Task failed")
+            print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
+            print(f"[HybridClient] Task failed result: {result}")
+            return {
+                "reward": -1.0,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "error": error_message,
             }
-            defaults.update(self._reward_config_overrides)
-            self._reward_cfg = _RewardConfig(**defaults)
-        return self._reward_cfg
+        # Server returned a decoy kernel; force -1 and carry the marker.
+        if result.get("decoy_kernel", False):
+            try:
+                print("[HybridClient] decoy_kernel detected; forcing reward -1")
+            except Exception:
+                pass
+            return {
+                "reward": -1.0,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "decoy_kernel": True,
+                "error": "Reward hacking: Decoy kernel detected",
+                "score": -1.0,
+            }
+        correctness = result.get("correctness", False)
+        speedup = result.get("speedup", 0.0)
+        compiled = result.get("compiled", False)
 
-    def _get_simple_client(self) -> _SimpleEvalClient:
-        """Build (or return cached) simple HTTP client."""
-        if self._simple_client is None:
-            self._simple_client = _SimpleEvalClient(
-                server_url=self.kernel_server_url,
-                timeout=self.timeout,
-                request_timeout=self.request_timeout,
-            )
-        return self._simple_client
+        penalties = self.config.reward_policy.penalties
+        compilation_fail_penalty = float(penalties.get("compilation_fail", -0.5))
+        correctness_fail_penalty = float(penalties.get("correctness_fail", -0.3))
+        perf_degrade_penalty = float(penalties.get("perf_degrade", -0.1))
 
-    def _try_get_reward_client(self):
-        """Try to initialise KernelRewardClient (requires Ray)."""
-        if self._reward_client is not None:
-            return self._reward_client
+        if not compiled:
+            reward = compilation_fail_penalty
+        elif not correctness:
+            reward = correctness_fail_penalty
+        else:
+            if speedup >= 3.0:
+                reward = 1.0
+            elif speedup >= 2.0:
+                reward = 0.8
+            elif speedup >= 1.5:
+                reward = 0.6
+            elif speedup >= 1.2:
+                reward = 0.4
+            elif speedup >= 1.0:
+                reward = 0.2
+            else:
+                reward = perf_degrade_penalty
+        return {
+            "reward": reward,
+            "speedup": speedup,
+            "success": compiled and correctness,
+            "correctness": correctness,
+            "compiled": compiled,
+            "score": reward,
+        }
 
-        if not self.use_ray:
-            return None
 
+    def compute_coverage_reward(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        # Some server versions put coverage fields in metadata, possibly with plural names; normalize here.
+        metadata = result.get("metadata") or {}
+
+        def _get_field(*keys: str, default: int = 0) -> int:
+            for k in keys:
+                if k in metadata:
+                    return metadata.get(k) or default
+                if k in result:
+                    return result.get(k) or default
+            return default
+
+        num_custom_kernel = _get_field("num_custom_kernels", "num_custom_kernel")
+        num_total_kernels = _get_field("num_total_kernels", "num_total_kernel", "num_total_kernels")
+        custom_kernel_cuda_time_in_profiling_us = _get_field("custom_kernel_cuda_time_in_profiling_us")
+        total_kernel_run_time_in_profiling_us = _get_field("total_kernel_run_time_in_profiling_us")
+
+        # Only log keys once when all fields are missing to aid debugging.
+        if (
+            not num_custom_kernel
+            and not num_total_kernels
+            and "num_custom_kernel" not in result
+            and "num_total_kernels" not in result
+            and "num_custom_kernels" not in metadata
+            and "num_total_kernels" not in metadata
+        ):
+            try:
+                print(f"[HybridClient] coverage fields missing, fallback to 0: keys={list(result.keys())}")
+            except Exception:
+                pass
+
+        num_coverage = 0
+        if num_total_kernels > 0:
+            num_coverage = num_custom_kernel / num_total_kernels
+
+
+        time_coverage = 0
+        if total_kernel_run_time_in_profiling_us > 0:
+            time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us
+
+        if self.config.coverage_reward.reward_type == "time_coverage":
+            coverage = time_coverage
+        elif self.config.coverage_reward.reward_type == "number_coverage":
+            coverage = num_coverage
+        else:
+            raise ValueError(f"Invalid reward type: {self.config.coverage_reward.reward_type}")
+
+        return {
+            "coverage": coverage,
+            "num_custom_kernel": num_custom_kernel,
+            "num_total_kernels": num_total_kernels,
+            "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
+            "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
+        }
+
+
+    def calculate_reward_weighted(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        penalty_score = self.penalty_score
+
+        if result.get("status") != "completed":
+            error_message = result.get("error_message", "Task failed")
+            if error_message == "Task failed":
+                error_message = result.get("error", "Task failed")
+            print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
+            print(f"[HybridClient] Task failed result: {result}")
+
+            return_result = {
+                "reward": penalty_score,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "error": error_message,
+            }
+
+            for key in result.keys():
+                if key not in return_result:
+                    return_result[key] = result[key]
+
+            return return_result
+        # Server returned a decoy kernel; force penalty and carry the marker.
+        # TODO Temporary disable decoy kernel detection
+        if result.get("decoy_kernel", False):
+            try:
+                print("[HybridClient] decoy_kernel detected; forcing reward -1")
+            except Exception:
+                pass
+            return {
+                "reward": penalty_score,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "decoy_kernel": True,
+                "error": "Reward hacking: Decoy kernel detected",
+                "score": penalty_score,
+            }
+        correctness = result.get("correctness", False)
+        speedup = result.get("speedup", 0.0)
+        compiled = result.get("compiled", False)
+        # In fact, profiling is always None here since it is actually inside metadata
+        profiling = result.get("profiling", None) 
+
+        if speedup is None:
+            speedup = 0.0
+
+        is_speedup_positive = speedup >= (1 + self.speedup_eps) # ignore too small speedup
+
+        reward = self.init_correct_weight * correctness + self.init_performance_weight * is_speedup_positive
+
+        num_custom_kernel = 0
+        num_total_kernels = 0
+        custom_kernel_cuda_time_in_profiling_us = 0
+        total_kernel_run_time_in_profiling_us = 0
+        # if self.reward_config.coverage_reward.enable and correctness:
+        final_reward = reward
+        if correctness:
+            coverage_dict = self.compute_coverage_reward(result)
+            coverage = coverage_dict["coverage"]
+            num_custom_kernel = coverage_dict["num_custom_kernel"]
+            num_total_kernels = coverage_dict["num_total_kernels"]
+            custom_kernel_cuda_time_in_profiling_us = coverage_dict["custom_kernel_cuda_time_in_profiling_us"]
+            total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
+            print(f"[DEBUG] coverage: {coverage}")
+            print(f"[DEBUG] num_custom_kernel: {num_custom_kernel}")
+            print(f"[DEBUG] num_total_kernels: {num_total_kernels}")
+            print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us: {custom_kernel_cuda_time_in_profiling_us}")
+            print(f"[DEBUG] total_kernel_run_time_in_profiling_us: {total_kernel_run_time_in_profiling_us}")
+            if self.config.coverage_reward.enable:
+                final_reward += self.config.coverage_reward.weight * coverage
+
+        return {
+            "reward": final_reward,
+            "speedup": speedup,
+            "success": compiled and correctness,
+            "correctness": correctness,
+            "compiled": compiled,
+            "score": final_reward,
+            "profiling": profiling,
+            "num_custom_kernel": num_custom_kernel,
+            "num_total_kernels": num_total_kernels,
+            "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
+            "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
+        }
+
+
+    def calculate_reward_speedup(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        penalty_score = self.penalty_score
+
+        if result.get("status") != "completed":
+            
+            error_message = result.get("error_message", "Task failed")
+            if error_message == "Task failed":
+                error_message = result.get("error", "Task failed")
+            print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
+            print(f"[HybridClient] Task failed result: {result}")
+
+            return_result = {
+                "reward": penalty_score,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "error": error_message,
+            }
+
+            for key in result.keys():
+                if key not in return_result:
+                    return_result[key] = result[key]
+
+            return return_result
+        # Server returned a decoy kernel; force penalty and carry the marker.
+        # TODO Temporary disable decoy kernel detection
+        if result.get("decoy_kernel", False):
+            try:
+                print("[HybridClient] decoy_kernel detected; forcing reward -1")
+            except Exception:
+                pass
+            return {
+                "reward": penalty_score,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "decoy_kernel": True,
+                "error": "Reward hacking: Decoy kernel detected",
+                "score": penalty_score,
+            }
+        correctness = result.get("correctness", False)
+        speedup = result.get("speedup", 0.0)
+        compiled = result.get("compiled", False)
+        # In fact, profiling is always None here since it is actually inside metadata
+        profiling = result.get("profiling", None)
+
+        if speedup is None:
+            speedup = 0.0
+
+        # is_speedup_positive = speedup >= (1 + self.speedup_eps) # ignore too small speedup
+
+        reward_speedup = speedup
+        if speedup > self.speedup_reward_upper_bound:
+            reward_speedup = self.speedup_reward_upper_bound
+        
+        if reward_speedup < self.speedup_reward_lower_bound:
+            reward_speedup = 0.0
+
+        reward = self.init_correct_weight * correctness + self.init_performance_weight * reward_speedup
+
+        num_custom_kernel = 0
+        num_total_kernels = 0
+        custom_kernel_cuda_time_in_profiling_us = 0
+        total_kernel_run_time_in_profiling_us = 0
+
+        # if self.reward_config.coverage_reward.enable and correctness:
+        final_reward = reward
+        if correctness:
+            coverage_dict = self.compute_coverage_reward(result)
+            coverage = coverage_dict["coverage"]
+            num_custom_kernel = coverage_dict["num_custom_kernel"]
+            num_total_kernels = coverage_dict["num_total_kernels"]
+            custom_kernel_cuda_time_in_profiling_us = coverage_dict["custom_kernel_cuda_time_in_profiling_us"]
+            total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
+
+            print(f"[DEBUG] coverage: {coverage}")
+            print(f"[DEBUG] num_custom_kernel: {num_custom_kernel}")
+            print(f"[DEBUG] num_total_kernels: {num_total_kernels}")
+            print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us: {custom_kernel_cuda_time_in_profiling_us}")
+            print(f"[DEBUG] total_kernel_run_time_in_profiling_us: {total_kernel_run_time_in_profiling_us}")
+
+            if self.config.coverage_reward.enable:
+                final_reward += self.config.coverage_reward.weight * coverage
+
+        return {
+            "reward": final_reward,
+            "speedup": speedup,
+            "success": compiled and correctness,
+            "correctness": correctness,
+            "compiled": compiled,
+            "score": final_reward,
+            "profiling": profiling,
+            "num_custom_kernel": num_custom_kernel,
+            "num_total_kernels": num_total_kernels,
+            "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
+            "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
+        }
+
+
+    def _preflight_validate(self, reference_code: str, kernel_code: str, entry_point: str) -> Tuple[bool, str]:
+        """预备检查, 排除没有ModelNew入口的算子"""
         try:
-            import ray
-            if not ray.is_initialized():
-                logger.info("Ray not initialised; falling back to simple client")
-                return None
+            ref_required = f"class {entry_point}"
+            ker_required = f"class {entry_point}New"
+            ref_ok = ref_required in (reference_code or "")
+            ker_ok = ker_required in (kernel_code or "")
+            if ref_ok and ker_ok:
+                return True, ""
+            missing = []
+            if not ref_ok:
+                missing.append(ref_required)
+            if not ker_ok:
+                missing.append(ker_required)
+            return False, ", ".join(missing)
+        except Exception as e:
+            logger.debug(f"preflight skipped due to error: {e}")
+            return True, ""
 
-            KernelRewardClient = _get_reward_client_class()
-            cfg = self._get_reward_config()
-            self._reward_client = KernelRewardClient(reward_config=cfg)
-            logger.info("Initialised KernelRewardClient (Ray mode)")
-            return self._reward_client
-        except Exception as exc:
-            logger.warning("Failed to init KernelRewardClient, using simple client: %s", exc)
-            return None
 
-    # ------------------------------------------------------------------
-    # Gym interface
-    # ------------------------------------------------------------------
+    def _get_reward_func(self) -> Callable[..., Dict[str, Any]]:
+        """Select reward function based on config; default to calculate_reward_like_kernel."""
+        try:
+            func = getattr(self, str(self.reward_func_name), None)
+            if callable(func):
+                return func # type: ignore
+        except Exception:
+            pass
+        try:
+            print(f"[HybridClient] invalid reward_func_name={self.reward_func_name}, fallback to calculate_reward_like_kernel")
+        except Exception:
+            pass
+        return self.calculate_reward_like_kernel
+
+
+    def compute_reward(self, task: Dict[str, Any], *, use_reference_cache: Optional[bool] = None, **_: Any ) -> Dict[str, Any]:
+        penalty_score = self.penalty_score
+        
+        # !评估超时设定，kernelgym侧，env侧
+        effective_timeout = int(self.timeout)
+        effective_timeout_in_client = int(self.task_timeout_in_client)
+        if effective_timeout_in_client < effective_timeout:     # !需要满足 client timeout >= server timeout
+            print(f"[WARNING] task_timeout_in_client ({effective_timeout_in_client}s) < task_timeout ({effective_timeout}s)")
+            print(f"[WARNING] Adjusting task_timeout_in_client to match task_timeout to respect timeout invariant")
+            effective_timeout_in_client = effective_timeout
+        
+        kcode = task.get("kernel_code", "")
+        ep = task.get("entry_point", "Model")
+        ok, missing = self._preflight_validate(task.get("reference_code", ""), kcode, ep)
+        if not ok:
+            print(f"[HybridClient] preflight failed: missing {missing} entry_point={ep}")
+            ret_data = {
+                "reward": penalty_score,
+                "speedup": 0.0,
+                "success": False,
+                "correctness": False,
+                "compiled": False,
+                "error": f"Client validation failed: missing {missing}",
+            }
+        else:
+            #! 如果一个任务耗时特别长，可能会需要单独的设定保证不会破坏超时限定
+            per_task_timeout_raw = task.get("task_timeout", None)
+            per_task_timeout = effective_timeout if per_task_timeout_raw is None else int(per_task_timeout_raw)
+            per_task_timeout_in_client_raw = task.get("task_timeout_in_client", None)
+            per_task_timeout_in_client = effective_timeout_in_client if per_task_timeout_in_client_raw is None else int(per_task_timeout_in_client_raw)
+            if per_task_timeout_in_client < per_task_timeout:
+                per_task_timeout_in_client = per_task_timeout
+
+            #! 构造请求
+            payload = {
+                "task_id": task.get("task_id"),
+                "reference_code": task.get("reference_code", ""),
+                "kernel_code": kcode,
+                "backend": self.reference_backend,
+                "num_correct_trials": task.get("num_correct_trials", 5),
+                "num_perf_trials": task.get("num_perf_trials", 100),
+                "timeout": per_task_timeout,
+                "priority": "normal",
+                "entry_point": ep,
+                "is_valid": task.get("is_valid", self.is_valid),                     # 是否需要开启 detect_decoy_kernel 验证
+                "verbose_errors": task.get("verbose_errors", True),
+                "enable_profiling": task.get("enable_profiling", True),
+                "detect_decoy_kernel": task.get("detect_decoy_kernel", True),
+                "reference_backend": task.get("reference_backend", None),
+            }
+
+            #! 当算子需要验证时，强制开启 detect_decoy_kernel
+            if payload["is_valid"]:
+                print(f"Enforce detect decoy kernel if validate: {payload['detect_decoy_kernel']}")
+                payload["detect_decoy_kernel"] = True
+
+            # TODO. 还没搞懂啥东西
+            ucache = task.get("use_reference_cache", use_reference_cache)
+            if ucache:
+                payload["use_reference_cache"] = True
+                if task.get("uuid"):
+                    payload["uuid"] = task["uuid"]
+            
+            #! 发送请求并获得回复
+            ret_data = self._worker.submit_and_poll(payload, per_task_timeout_in_client, self.max_retries)
+
+
+        #! 调用**奖励函数**对结果进行评估
+        reward_func = self._get_reward_func()
+        reward_summary = reward_func(ret_data)
+        reward_result = {**(ret_data or {}), **(reward_summary or {})}      # 合并结果
+        default_reward_result = {
+            "reward": penalty_score,
+            "speedup": 0.0,
+            "success": False,
+            "correctness": False,
+            "compiled": False,
+            "error": "Unknown error",
+            "num_custom_kernel": 0,
+            "num_total_kernels": 0,
+            "custom_kernel_cuda_time_in_profiling_us": 0,
+            "total_kernel_run_time_in_profiling_us": 0,
+        }  
+
+        return reward_result or default_reward_result # type: ignore[return-value]
+
+
+    def get_reward_and_next_obs(self, task: dict, action: Any) -> tuple[float, dict]:
+        #! 评估
+        result = self.compute_reward(task=task, use_reference_cache=False)
+
+        #! 有异常高值时会重新跑一遍 compute_reward
+        if result.get("speedup", 0.0) > self.config.speedup_reward_upper_bound:
+            print(f"[DEBUG] speedup is anomaly large, re-execute the environment")
+            result = self.compute_reward(task=task, use_reference_cache=False)
+
+        #! 剩下的是统计信息
+        score = result.get("score", result.get("reward", 0.0))
+        num_custom_kernel = result.get("num_custom_kernel", 0)
+        num_total_kernels = result.get("num_total_kernels", 0)
+        custom_kernel_cuda_time_in_profiling_us = result.get("custom_kernel_cuda_time_in_profiling_us", 0)
+        total_kernel_run_time_in_profiling_us = result.get("total_kernel_run_time_in_profiling_us", 0)
+        correctness = result.get("correctness", False)
+        success = result.get("success", False)
+        compiled = result.get("compiled", False)
+        speedup = result.get("speedup", 0.0)
+        status = result.get("status", "unknown")
+        err_msg = result.get("error")
+
+        #! num_coverage/time_coverage 参数处理
+        num_coverage = 0
+        if num_total_kernels > 0:
+            num_coverage = num_custom_kernel / num_total_kernels
+        time_coverage = 0
+        if total_kernel_run_time_in_profiling_us > 0:
+            time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us
+
+        meta_info = {
+            "server_result": result,            #! 保存 kernelgym 反馈的数据，直接用于 Agent 的输入构造
+            "correctness": correctness,
+            "performance": speedup,
+            "is_speedup_positive": (speedup >= 1.0 + self.config.speedup_eps),
+            "is_decoy_kernel": result.get("decoy_kernel", False),
+            "compilation": compiled,
+            "success": success,
+            "error": err_msg,
+            "num_custom_kernel": num_custom_kernel,
+            "num_total_kernels": num_total_kernels,
+            "num_coverage": float(f"{num_coverage:.2f}"),
+            "custom_kernel_cuda_time_in_profiling_us": custom_kernel_cuda_time_in_profiling_us,
+            "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
+            "time_coverage": float(f"{time_coverage:.2f}")
+        }
+        
+        print(f"[DEBUG] num_custom_kernel in reward manager: {num_custom_kernel}")
+        print(f"[DEBUG] num_total_kernels in reward manager: {num_total_kernels}")
+        print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us in reward manager: {custom_kernel_cuda_time_in_profiling_us}")
+        print(f"[DEBUG] total_kernel_run_time_in_profiling_us in reward manager: {total_kernel_run_time_in_profiling_us}")
+        
+        #! 日志记录
+        self.logger.info(f"[KernelEvalStatus] idx={0} status={status} compiled={compiled} correct={correctness} speedup={speedup} uuid={uuid} error={err_msg}")
+
+        return score, meta_info
+
 
     def reset(self, task: dict | None = None, seed: int | None = None) -> Tuple[dict, dict]:
         """Reset the environment and return the initial observation."""
@@ -382,8 +698,6 @@ class KernelGymEnv(MultiTurnEnvironment):
             self.task = task
 
         assert self.task is not None, "Task must be set before calling reset()"
-
-        import uuid
 
         self.done = False
         self.current_turn = 0
@@ -395,12 +709,36 @@ class KernelGymEnv(MultiTurnEnvironment):
 
         return self.task, {}
 
+
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, dict]:
-        """Submit the kernel code to KernelGYM and compute the reward."""
         self.history.append(action)
 
-        kernel_code = _extract_kernel_code(action)
-        reward, next_obs = self.get_reward_and_next_obs(self.task, kernel_code)
+        #! 构造 LLM 观测文本，重新构造一遍 task 对象，作为输入
+        task = {
+            "task_id": self.task["task_id"], # TODO. 
+            "reference_code": self.reference_code,
+            "kernel_code": action,
+            "backend": self.reference_backend,
+            "entry_point": self.entry_point,
+            "use_reference_cache": False,
+            "uuid": self.uuid or "",
+            "is_valid": self.is_valid,
+            "task_timeout": self.task_timeout,
+            "task_timeout_in_client": self.task_timeout_in_client,
+            "num_correct_trials": self.num_correct_trials,
+            "num_perf_trials": self.num_perf_trials,
+            "enable_profiling": self.enable_profiling,
+            "verbose_errors": self.verbose_errors,
+            "detect_decoy_kernel": self.detect_decoy_kernel,
+            "reference_backend": self.reference_backend,
+        }
+
+        reward, meta_info = self.get_reward_and_next_obs(task, action=action)
+
+        #! 观测值来自于 kernelgym 这个 server_result
+        next_obs = meta_info["server_result"]
+
+        self.meta_info_history.append(meta_info)
 
         self.current_turn += 1
         if self.current_turn >= self.max_turns:
@@ -409,242 +747,15 @@ class KernelGymEnv(MultiTurnEnvironment):
 
         return next_obs, reward, self.done, self.task
 
-    def get_reward_and_next_obs(
-        self, task: dict, action: str
-    ) -> Tuple[float, Dict[str, Any]]:
-        """Evaluate the kernel and return (reward, next_obs).
-
-        Tries to use drkernel's ``compute_kernel_reward_batch`` for reward
-        computation; falls back to a simple formula if unavailable.
-        """
-        result = self._evaluate_kernel(task, action)
-        self._last_result = result
-
-        compiled: bool = result.get("compiled", False)
-        correctness: Optional[bool] = result.get("correctness")
-        speedup: Optional[float] = result.get("speedup")
-        error_msg: Optional[str] = result.get("error_message")
-
-        # --- Reward computation ---
-        # Prefer drkernel reward if available in the result (Ray path injects it)
-        if "reward" in result and isinstance(result["reward"], (int, float)):
-            reward = float(result["reward"])
-        else:
-            reward = _compute_reward_simple(compiled, correctness, speedup)
-
-        # Build next observation for the agent
-        if self.done or (compiled and correctness):
-            next_obs: Dict[str, Any] = {}
-        else:
-            feedback = self._build_feedback(compiled, correctness, speedup, error_msg)
-            next_obs = {
-                "feedback": feedback,
-                "compiled": compiled,
-                "correctness": correctness,
-                "speedup": speedup,
-                "error_message": error_msg,
-            }
-
-        return reward, next_obs
-
-    # ------------------------------------------------------------------
-    # Internal evaluation
-    # ------------------------------------------------------------------
-
-    def _evaluate_kernel(self, task: dict, kernel_code: str) -> Dict[str, Any]:
-        """Evaluate a kernel using KernelGYM.
-
-        First tries the Ray-based KernelRewardClient from drkernel.
-        Falls back to the simple httpx client.
-        """
-        task_id = f"{task.get('problem_id', 'task')}_{self.session_uuid}_{uuid.uuid4().hex[:8]}"
-        server_url = task.get("kernel_server_url", self.kernel_server_url).rstrip("/")
-        entry_point = task.get("entry_point", "Model")
-
-        payload = {
-            "task_id": f"{task_id}",
-            "reference_code": task.get("reference_code", ""),
-            "kernel_code": kernel_code,
-            "toolkit": task.get("toolkit", self.toolkit),
-            "backend_adapter": task.get("backend_adapter", self.backend_adapter),
-            "backend": task.get("backend", self.backend),
-            "entry_point": entry_point,
-            "num_correct_trials": self.num_correct_trials,
-            "num_perf_trials": self.num_perf_trials,
-            "timeout": self.timeout,
-            "priority": "normal",
-            "workflow": task.get("workflow", "kernelbench"),
-        }
-
-        # --- Try Ray-based KernelRewardClient ---
-        reward_client = self._try_get_reward_client()
-        if reward_client is not None:
-            return self._evaluate_via_reward_client(reward_client, task, payload)
-
-        # --- Fallback: simple httpx POST ---
-        return self._get_simple_client().evaluate(payload)
-
-    def _evaluate_via_reward_client(
-        self,
-        client,
-        task: dict,
-        payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Use KernelRewardClient.compute_batch_rewards for a single task.
-
-        This follows the exact patterns used in drkernel's
-        ``compute_kernel_reward_batch`` — submit via Ray workers,
-        poll for completion, compute reward.
-        """
-        import asyncio
-
-        cfg = self._get_reward_config()
-        reward_task = {
-            "reference_code": payload["reference_code"],
-            "kernel_code": payload["kernel_code"],
-            "entry_point": payload["entry_point"],
-            "use_reference_cache": False,
-            "uuid": task.get("uuid", ""),
-            "is_valid": False,
-            "task_timeout": None,
-            "task_timeout_in_client": None,
-            "num_correct_trials": self.num_correct_trials,
-            "num_perf_trials": self.num_perf_trials,
-            "enable_profiling": cfg.enable_profiling,
-            "verbose_errors": cfg.verbose_errors,
-            "detect_decoy_kernel": cfg.detect_decoy_kernel,
-            "reference_backend": cfg.reference_backend,
-        }
-
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Running inside an async context (e.g. Ray); create new loop
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    results = pool.submit(
-                        lambda: asyncio.new_event_loop().run_until_complete(
-                            client.compute_batch_rewards([reward_task])
-                        )
-                    ).result(timeout=self.request_timeout)
-            else:
-                results = loop.run_until_complete(
-                    client.compute_batch_rewards([reward_task])
-                )
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            results = loop.run_until_complete(
-                client.compute_batch_rewards([reward_task])
-            )
-
-        if results and len(results) > 0:
-            return results[0]
-
-        return {
-            "compiled": False,
-            "correctness": False,
-            "speedup": None,
-            "status": "failed",
-            "error_message": "KernelRewardClient returned empty results",
-        }
-
-    # ------------------------------------------------------------------
-    # Feedback
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_feedback(
-        compiled: bool,
-        correctness: Optional[bool],
-        speedup: Optional[float],
-        error_message: Optional[str],
-    ) -> str:
-        """Human-readable feedback string to feed back to the agent."""
-        lines = []
-        if not compiled:
-            lines.append("❌ Compilation FAILED.")
-            if error_message:
-                lines.append(f"Error:\n{error_message}")
-            lines.append("Please fix the compilation error and resubmit your kernel.")
-        elif not correctness:
-            lines.append("✅ Compilation succeeded.")
-            lines.append("❌ Correctness check FAILED — outputs do not match the reference.")
-            if error_message:
-                lines.append(f"Error:\n{error_message}")
-            lines.append("Please fix the numerical correctness issue and resubmit.")
-        else:
-            speedup_str = f"{speedup:.2f}x" if speedup is not None else "N/A"
-            lines.append("✅ Compilation succeeded.")
-            lines.append("✅ Correctness check PASSED.")
-            lines.append(f"Speedup over reference: {speedup_str}")
-            lines.append("Can you further optimize the kernel?")
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Factory method
-    # ------------------------------------------------------------------
-
-    # Keys that are recognised as environment *configuration* (constructor params).
-    # Everything else in the dict coming from `extra_info` is treated as task data.
-    _ENV_CONFIG_KEYS = frozenset({
-        "kernel_server_url", "max_turns", "num_correct_trials",
-        "num_perf_trials", "timeout", "toolkit", "backend_adapter",
-        "request_timeout", "use_ray", "reward_func_name", "reward_config",
-    })
 
     @staticmethod
     def from_dict(env_args: dict) -> "KernelGymEnv":
-        """Create a KernelGymEnv from a configuration dictionary.
-
-        When called from ``AgentPPOTrainer.init_envs_and_agents``, *env_args*
-        is the union of the dataset row (``extra_info``) and the base env
-        config.  Dataset rows contain task-level fields such as
-        ``problem_id``, ``reference_code``, ``description``, etc. — these
-        must be collected into the ``task`` dict rather than forwarded as
-        ``**kwargs`` to ``__init__`` (which would cause a TypeError).
-
-        The split logic: any key in ``_ENV_CONFIG_KEYS`` is an env config
-        parameter; everything else is task data.
-        """
         env_args = dict(env_args)  # avoid mutating caller's dict
 
-        # If the caller already wrapped the task, honour that.
-        if "task" in env_args:
-            task = env_args.pop("task")
-        else:
-            # Separate env config from task data
-            config = {k: env_args.pop(k) for k in list(env_args) if k in KernelGymEnv._ENV_CONFIG_KEYS}
-            task = env_args if env_args else None  # remaining keys = task data
-            env_args = config
-        # self,
-        # task: dict | None = None,
-        # kernel_server_url: str = "http://localhost:8000",
-        # max_turns: int = 3,
-        # num_correct_trials: int = 5,
-        # num_perf_trials: int = 100,
-        # timeout: int = 300,
-        # toolkit: str = "kernelbench",
-        # backend_adapter: str = "kernelbench",
-        # backend: str = "cuda",
-        # request_timeout: int = 360,
-        # use_ray: bool = False,
-        # reward_func_name: str = "calculate_reward_like_kernel",
-        # reward_config: dict | None = None,
-        return KernelGymEnv(
-            task=task, 
-            kernel_server_url=env_args['kernel_server_url'],
-            max_turns=env_args['max_turns'],
-            num_correct_trials=env_args['num_correct_trials'],
-            num_perf_trials=env_args['num_perf_trials'],
-            timeout=env_args['timeout'],
-            toolkit=env_args['toolkit'],
-            backend_adapter=env_args['backend_adapter'],
-            backend=env_args['backend'],
-            use_ray=env_args['use_ray'],
-            reward_func_name=env_args['reward_func_name'],
-            reward_config=env_args['reward_config'],
-        )
+        assert "task" in env_args
+        task = env_args.pop("task")
+
+        return KernelGymEnv(task=task, config=env_args['reward_config'])
 
     @staticmethod
     def is_multithread_safe() -> bool:
