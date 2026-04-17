@@ -8,7 +8,7 @@ set -x
 # ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
 export FORCE_BUILD=0
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
@@ -19,20 +19,17 @@ export VLLM_ASCEND_ENABLE_NZ=0
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 export HCCL_INTRA_ROCE_ENABLE=1
-# export HCCL_BUFFSIZE=512
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+# export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
 export HYDRA_FULL_ERROR=1
-
-# export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
 MODEL_PATH=/home/g00841271/cszhou_sft_weight/global_step_100
 
@@ -59,14 +56,14 @@ ARGS=(
   # =========================
   data.train_batch_size=8
   data.val_batch_size=16
-  data.max_prompt_length=16384      # 24K
-  data.max_response_length=16384    # 18K
+  data.max_prompt_length=24576      # 48K
+  data.max_response_length=8192    # 16K
 
   # =========================
   # actor_rollout_ref - common
   # =========================
   actor_rollout_ref.hybrid_engine=True
-  # actor_rollout_ref.model.use_shm=True
+  actor_rollout_ref.model.use_shm=True
   actor_rollout_ref.model.path=$MODEL_PATH
   actor_rollout_ref.model.use_remove_padding=True
   actor_rollout_ref.model.enable_gradient_checkpointing=True
@@ -107,15 +104,15 @@ ARGS=(
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
-  +actor_rollout_ref.actor.checkpoint.save_contents="['model']"
+  # +actor_rollout_ref.actor.checkpoint.save_contents="['model']"
 
   # =========================
   # actor optimizer override
   # =========================
-  +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
+#   +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
 #   +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
-  +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
-  +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
+#   +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
+#   +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
 
   # =========================
   # ref
@@ -142,7 +139,6 @@ ARGS=(
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.8
-  actor_rollout_ref.rollout.max_model_len=98304
   actor_rollout_ref.rollout.n=8
   actor_rollout_ref.rollout.val_kwargs.n=4
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
@@ -166,10 +162,10 @@ ARGS=(
   trainer.project_name=rllm-agent
   trainer.experiment_name=kernelgym-qwen30b
   trainer.val_before_train=False
-  trainer.n_gpus_per_node=8
+  trainer.n_gpus_per_node=16
   trainer.nnodes=1
   trainer.device=npu
-  trainer.save_freq=5
+  trainer.save_freq=1
   trainer.test_freq=20
   trainer.default_hdfs_dir=null
   trainer.total_epochs=100
@@ -191,7 +187,6 @@ ARGS=(
 )
 
 # python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
-
 
 ray job submit --address="http://${MASTER_ADDR}:8265" \
     -- \

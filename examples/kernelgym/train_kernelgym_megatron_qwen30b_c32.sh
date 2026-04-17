@@ -1,51 +1,63 @@
 #!/bin/bash
 
-pkill -9 python
-pkill -9 torchrun
 set -euo pipefail
 set -x
 
-# ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
-export FORCE_BUILD=0
-export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
-export VLLM_USE_V1=1
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-
-export RAY_DEBUG_POST_MORTEM=0
-export VLLM_ASCEND_ENABLE_NZ=0
-
-export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
-export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
-export HCCL_INTRA_ROCE_ENABLE=1
-# export HCCL_BUFFSIZE=512
-
+# source setup_env.sh
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+# ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
+export FORCE_BUILD=0
+export VLLM_USE_V1=1
+export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
+export VLLM_ASCEND_ENABLE_NZ=0
+# export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
-export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export RAY_DEBUG_POST_MORTEM=0
+
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
+export TASK_QUEUE_ENABLE=2 # 下发优化，图模式设置为1，非图模式设置为2
+
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+# export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
+export RAY_DEDUP_LOGS=1
 export HYDRA_FULL_ERROR=1
 
-# export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+
+# HCCL 相关配置
+export HCCL_EXEC_TIMEOUT=7200
+export HCCL_EVENT_TIMEOUT=7200
+export HCCL_CONNECT_TIMEOUT=7200
+export ACL_DEVICE_SYNC_TIMEOUT=7200
+export HCCL_ASYNC_ERROR_HANDLING=0
+export P2P_HCCL_BUFFSIZE=30
+export HCCL_BUFFSIZE=300
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+export HCCL_INTRA_ROCE_ENABLE=1
+
+export GLOO_SOCKET_TIMEOUT=7200
+
+export NPUS_PER_NODE=16
+
+# 获取IP / 指定hostname
+export SOCKET_IFNAME=ens1f3
+export RAY_MASTER_HOSTNAME="rllm-node-61"
+export RAY_MASTER_PORT=6766
+# export CURRENT_HOSTNAME=$(hostname)
+export CURRENT_IP=$(ifconfig "$SOCKET_IFNAME" | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')
+
 
 MODEL_PATH=/home/g00841271/cszhou_sft_weight/global_step_100
 
-echo "正在重启 Ray 集群..."
-ray stop --force
-rm -rf /tmp/ray/*
-sleep 2
-ray start --head \
-    --port 6379 \
-    --dashboard-host 0.0.0.0 \
-    --dashboard-port 8265 \
-    --disable-usage-stats \
-    --node-ip-address ${MASTER_ADDR}
+NNODES=2
+NPUS_PER_NODE=16
 
 ARGS=(
   # =========================
@@ -99,10 +111,10 @@ ARGS=(
 
   actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.actor.megatron.context_parallel_size=2
-  actor_rollout_ref.actor.megatron.expert_model_parallel_size=8
+  actor_rollout_ref.actor.megatron.context_parallel_size=8
+  actor_rollout_ref.actor.megatron.expert_model_parallel_size=16
   actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
-  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=2
+  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=8
   +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
@@ -125,8 +137,8 @@ ARGS=(
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=32768
   actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.ref.megatron.context_parallel_size=2
-  actor_rollout_ref.ref.megatron.expert_model_parallel_size=8
+  actor_rollout_ref.ref.megatron.context_parallel_size=8
+  actor_rollout_ref.ref.megatron.expert_model_parallel_size=16
   actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1
   actor_rollout_ref.ref.megatron.param_offload=True
   actor_rollout_ref.ref.megatron.use_mbridge=True
@@ -166,8 +178,8 @@ ARGS=(
   trainer.project_name=rllm-agent
   trainer.experiment_name=kernelgym-qwen30b
   trainer.val_before_train=False
-  trainer.n_gpus_per_node=8
-  trainer.nnodes=1
+  trainer.n_gpus_per_node=$NPUS_PER_NODE
+  trainer.nnodes=$NNODES
   trainer.device=npu
   trainer.save_freq=5
   trainer.test_freq=20
@@ -177,7 +189,7 @@ ARGS=(
   # =========================
   # kernel
   # =========================
-  ++kernel.server_url=http://80.48.5.52:8002
+  ++kernel.server_url=http://127.0.0.1:8002
   ++kernel.backend=triton
   ++kernel.toolkit=kernelbench
   ++kernel.use_ray=false
@@ -190,9 +202,8 @@ ARGS=(
   # data.val_files=data/kernelbench_val.jsonl
 )
 
-# python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
+RAY_MASTER_HOSTNAME=80.48.5.61
+RAY_MASTER_PORT=6766
 
-
-ray job submit --address="http://${MASTER_ADDR}:8265" \
-    -- \
-    python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
+ray job submit --address="http://${RAY_MASTER_HOSTNAME}:$RAY_MASTER_PORT" -- \
+    python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}" --working-dir /workspace/rllm-071/

@@ -187,4 +187,7 @@ ARGS=(
   # data.val_files=data/kernelbench_val.jsonl
 )
 
-python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
+# python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
+ray job submit --address="http://${MASTER_ADDR}:8265" \
+    -- \
+    python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"

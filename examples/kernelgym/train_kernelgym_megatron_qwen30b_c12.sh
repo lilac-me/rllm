@@ -8,7 +8,7 @@ set -x
 # ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
 export FORCE_BUILD=0
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
@@ -19,14 +19,13 @@ export VLLM_ASCEND_ENABLE_NZ=0
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 export HCCL_INTRA_ROCE_ENABLE=1
-# export HCCL_BUFFSIZE=512
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7,8,9,10,11"
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
@@ -59,8 +58,8 @@ ARGS=(
   # =========================
   data.train_batch_size=8
   data.val_batch_size=16
-  data.max_prompt_length=16384      # 24K
-  data.max_response_length=16384    # 18K
+  data.max_prompt_length=24576      # 48K
+  data.max_response_length=8192    # 16K
 
   # =========================
   # actor_rollout_ref - common
@@ -99,10 +98,10 @@ ARGS=(
 
   actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.actor.megatron.context_parallel_size=2
-  actor_rollout_ref.actor.megatron.expert_model_parallel_size=8
+  actor_rollout_ref.actor.megatron.context_parallel_size=3
+  actor_rollout_ref.actor.megatron.expert_model_parallel_size=4
   actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
-  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=2
+  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=3
   +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
@@ -125,8 +124,8 @@ ARGS=(
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=32768
   actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.ref.megatron.context_parallel_size=2
-  actor_rollout_ref.ref.megatron.expert_model_parallel_size=8
+  actor_rollout_ref.ref.megatron.context_parallel_size=3
+  actor_rollout_ref.ref.megatron.expert_model_parallel_size=4
   actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1
   actor_rollout_ref.ref.megatron.param_offload=True
   actor_rollout_ref.ref.megatron.use_mbridge=True
@@ -143,7 +142,7 @@ ARGS=(
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.8
   actor_rollout_ref.rollout.max_model_len=98304
-  actor_rollout_ref.rollout.n=8
+  actor_rollout_ref.rollout.n=12
   actor_rollout_ref.rollout.val_kwargs.n=4
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0
@@ -166,7 +165,7 @@ ARGS=(
   trainer.project_name=rllm-agent
   trainer.experiment_name=kernelgym-qwen30b
   trainer.val_before_train=False
-  trainer.n_gpus_per_node=8
+  trainer.n_gpus_per_node=12
   trainer.nnodes=1
   trainer.device=npu
   trainer.save_freq=5
