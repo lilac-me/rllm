@@ -19,6 +19,7 @@ ENVIRONMENT_IMPORTS = [
     ("rllm.environments.swe.swe", "SWEEnv"),
     ("rllm.environments.code.competition_coding", "CompetitionCodingEnv"),
     ("rllm.environments.appworld.appworld_env", "AppWorldEnv"),
+    ("rllm.environments.kernelgym.kernelgym_env", "KernelGymEnv"),
 ]
 
 for module_path, class_name in ENVIRONMENT_IMPORTS:
