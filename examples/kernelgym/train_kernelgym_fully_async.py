@@ -105,7 +105,7 @@ def make_rollout_fn(kernel_cfg: dict):
 
 @hydra.main(
     config_path="pkg://rllm.experimental.fully_async.config",
-    config_name="fully_async_ppo_trainer",
+    config_name="fully_async_ppo_megatron_trainer",
     version_base=None,
 )
 def main(config):
