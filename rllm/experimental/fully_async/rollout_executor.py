@@ -8,9 +8,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from rllm.experimental.fully_async.client import RolloutClient
 from rllm.experimental.fully_async.protocol import TrajectoryGroup
 from rllm.experimental.fully_async.utils import (
-    abort_async,
     calculate_rollout_global_steps,
-    continue_generation_async,
     load_dataloader_checkpoint,
     save_dataloader_checkpoint,
 )
@@ -18,9 +16,8 @@ from rllm.experimental.fully_async.utils import (
 
 @ray.remote(num_cpus=10, max_concurrency=10)
 class RolloutExecutor:
-    def __init__(self, router_url, rollout_fn, n, config, tokenizer, processor, max_concurrency: int = 4096, total_rollout_steps: int = None, val_rollout_fn=None):
+    def __init__(self, router_url, rollout_fn, n, config, tokenizer, processor, max_concurrency: int = 4096, total_rollout_steps: int = None, val_rollout_fn=None, rollout_name: str = "sglang"):
         self.rollout_fn = rollout_fn
-        # Use val_rollout_fn if provided, otherwise fall back to rollout_fn for validation
         self.val_rollout_fn = val_rollout_fn if val_rollout_fn is not None else rollout_fn
         self.n = n
         self.message_queue_client = None  # Set later via set_message_queue_client
@@ -28,23 +25,22 @@ class RolloutExecutor:
         self.tokenizer = tokenizer
         self.processor = processor
         self.router_url = router_url
+        self.rollout_name = rollout_name
+        self.inference_manager = None  # Set later via set_inference_manager
         self.global_steps = 1
 
-        # Calculate max_concurrent_rollout from config: limits total concurrent individual rollouts
         num_servers = config.rollout.n_gpus_per_node * config.rollout.nnodes
         self.max_concurrent_rollout = 128 * num_servers
         print(f"[RolloutExecutor] num_servers={num_servers}, max_concurrent_rollout={self.max_concurrent_rollout}")
 
         self.result_dict = defaultdict(list)
 
-        # Use the passed max_concurrency value directly
         self.max_concurrency = max_concurrency
 
         max_prompt_length = int(getattr(config.data, "max_prompt_length", 0) or 0)
         max_response_length = int(getattr(config.data, "max_response_length", 0) or 0)
         max_tokens = max_prompt_length + max_response_length
-        # RolloutClient defaults to 32768; only override when config provides a positive budget.
-        client_kwargs = dict(router_url=router_url, tokenizer=tokenizer, max_concurrency=self.max_concurrency)
+        client_kwargs = dict(router_url=router_url, tokenizer=tokenizer, max_concurrency=self.max_concurrency, backend=rollout_name)
         if max_tokens > 0:
             client_kwargs["max_tokens"] = max_tokens
 
@@ -209,6 +205,10 @@ class RolloutExecutor:
             print(f"[RolloutExecutor] Set global_steps to {self.global_steps}")
         return trainer_global_steps
 
+    def set_inference_manager(self, inference_manager):
+        """Set InferenceManager handle for abort/resume via Ray."""
+        self.inference_manager = inference_manager
+
     def set_message_queue_client(self, message_queue_client):
         """Set message queue client after initialization."""
         self.message_queue_client = message_queue_client
@@ -227,17 +227,24 @@ class RolloutExecutor:
         if self.idle_start_time is None:
             self.idle_start_time = time.time()
         self.client.pause()
-        # Abort all in-flight requests on the router - waits for completion
-        await abort_async(self.router_url)
+        # Abort all in-flight requests via InferenceManager (backend-agnostic Ray calls)
+        if self.inference_manager is not None:
+            await self.inference_manager.abort_all_rollout_requests.remote()
+        else:
+            from rllm.experimental.fully_async.utils import abort_async
+            await abort_async(self.router_url)
         print(f"[RolloutExecutor] Paused at {self.idle_start_time:.2f}")
 
     async def resume(self):
-        """Resume rollout and SGLang generation."""
-        # Resume SGLang generation first (unblocks workers)
-        await continue_generation_async(self.router_url)
+        """Resume rollout and inference generation."""
+        if self.inference_manager is not None:
+            await self.inference_manager.resume_all_rollout_generation.remote()
+        else:
+            from rllm.experimental.fully_async.utils import continue_generation_async
+            await continue_generation_async(self.router_url)
         self.is_paused = False
         self.idle_start_time = None
-        self.continue_event.set()  # Unblock the main loop
+        self.continue_event.set()
         self.client.resume()
         print("[RolloutExecutor] Resumed")
 

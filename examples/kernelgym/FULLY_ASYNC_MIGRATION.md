@@ -199,9 +199,46 @@ Kernel 相关参数通过 `++kernel.*` 注入：
 
 ---
 
+## vLLM 后端支持
+
+自 2026-04 起，fully_async 层同时支持 **vLLM** 和 **SGLang** 后端。
+
+### 切换后端
+
+在启动脚本中通过 `actor_rollout_ref.rollout.name` 切换：
+
+```bash
+# vLLM (默认)
+rollout_name="vllm"
+
+# SGLang
+rollout_name="sglang"
+```
+
+`train_kernelgym_fully_async.sh` 已默认使用 `vllm`。
+
+### 后端差异
+
+| 特性 | vLLM | SGLang |
+|------|------|--------|
+| HTTP API | OpenAI 兼容 `/v1/completions` | 原生 `/generate` |
+| 路由 | 直连 server URL（单 replica）| `sglang_router` 负载均衡 |
+| abort/resume | Ray 级 `abort_all_requests()` | Ray 级（统一） |
+| checkpoint engine | 支持 | 不支持（走 collective sync） |
+| 多 replica | 需外部 L7 代理 | `sglang_router` 内置 |
+
+### 注意事项
+
+- vLLM 多 replica 场景暂不支持内置负载均衡，需配置外部反向代理
+- `sampling_params` 中的 `top_k` / `repetition_penalty` 在 vLLM 端由 `RolloutClient` 自动映射到 `extra_body`
+- `kernelgym_rollout.py` 无需因后端差异做任何改动
+
+---
+
 ## 后续 TODO
 
 1. **Reward 对齐**：reward 模块并行修改完成后，更新 `kernelgym_rollout.py` 中的 `_compute_reward_simple` 或 `_evaluate_kernel_async` 的返回值处理
 2. **`KernelGymEnv` 硬编码路径**：`kernelgym_env.py` L28 的 `_KERNELGYM_ROOT` 路径需要适配实际部署环境
 3. **端到端集成测试**：在实际 NPU 集群上验证全流程
 4. **上游合入**：待 `KernelAgent`/`KernelGymEnv` 的上游改动上线后，删除本地合入的副本并切换到上游版本
+5. **vLLM 多 replica 负载均衡**：实现轻量级客户端选路或集成外部 LB 方案

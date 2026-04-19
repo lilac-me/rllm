@@ -170,14 +170,18 @@ def calculate_rollout_global_steps(trainer_global_steps: int, config) -> int:
 
 def calculate_max_concurrency(config) -> int:
     """
-    Calculate max HTTP concurrency: sglang_server_concurrency * num_engines
-    Matches slime's approach.
+    Calculate max HTTP concurrency: inference_server_concurrency * num_engines.
+    Supports both the new key (inference_server_concurrency) and the legacy key
+    (sglang_server_concurrency) for backward compatibility.
     """
-    sglang_server_concurrency = config.async_training.get("sglang_server_concurrency", 512)
+    concurrency = config.async_training.get(
+        "inference_server_concurrency",
+        config.async_training.get("sglang_server_concurrency", 512),
+    )
     rollout_n_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
     tensor_parallel_size = config.actor_rollout_ref.rollout.get("tensor_model_parallel_size", 1)
     num_engines = rollout_n_gpus // tensor_parallel_size
-    return sglang_server_concurrency * num_engines
+    return concurrency * num_engines
 
 
 def get_client(max_connections: int = 100) -> httpx.AsyncClient:

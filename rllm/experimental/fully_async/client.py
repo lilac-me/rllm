@@ -6,6 +6,9 @@ import httpx
 from rllm.experimental.fully_async.protocol import OutputChunk, OutputWithVersion
 from rllm.parser.tool_parser import ToolParser
 
+# ── Sampling params that vLLM OpenAI API only accepts in extra_body ──
+_VLLM_EXTRA_BODY_KEYS = {"top_k", "repetition_penalty", "min_p", "min_tokens"}
+
 
 class RolloutClient:
     def __init__(
@@ -14,11 +17,13 @@ class RolloutClient:
         tokenizer=None,
         max_concurrency: int = 4096,
         max_tokens=32768,
+        backend: str = "sglang",
     ):
         self.router_url = router_url
         self.tokenizer = tokenizer
         self.parser = ToolParser.get_parser(tokenizer)
         self._max_concurrency = max_concurrency
+        self.backend = backend
 
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(
@@ -40,11 +45,9 @@ class RolloutClient:
     def set_version(self, version: int):
         self.cur_version = version
 
-    async def _post(self, payload):
-        # Block if paused - ensures no new requests after pause()
+    async def _post(self, url: str, payload: dict):
         await self.resume_event.wait()
-
-        response = await self.client.post(self.router_url + "/generate", json=payload)
+        response = await self.client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
 
@@ -57,20 +60,10 @@ class RolloutClient:
     # ========== Low-Level API ==========
 
     async def generate(self, prompt_ids: list[int], sampling_params: dict) -> OutputWithVersion:
-        """
-        Generate with token IDs directly (low-level API).
-
-        Args:
-            prompt_ids: List of input token IDs
-            sampling_params: SGLang sampling parameters dict
-
-        Returns:
-            OutputWithVersion with prompt_ids and output_chunks
-        """
+        """Generate with token IDs directly (low-level API)."""
         output = OutputWithVersion(prompt_ids=prompt_ids, output_chunks=[])
 
         while True:
-            # Block at start of each iteration
             await self.resume_event.wait()
             output, sampling_params = await self._generate(output, sampling_params)
             if output.finish_reason == "abort":
@@ -79,7 +72,15 @@ class RolloutClient:
                 return output
 
     async def _generate(self, output: OutputWithVersion, sampling_params: dict):
-        """Internal generate that handles a single request/response cycle."""
+        """Internal generate that dispatches to backend-specific implementation."""
+        if self.backend == "sglang":
+            return await self._generate_sglang(output, sampling_params)
+        else:
+            return await self._generate_vllm(output, sampling_params)
+
+    # ── SGLang backend ──
+
+    async def _generate_sglang(self, output: OutputWithVersion, sampling_params: dict):
         old_version = self.cur_version
         payload = {
             "input_ids": output.all_tokens(),
@@ -87,20 +88,16 @@ class RolloutClient:
             "return_logprob": True,
         }
 
-        response = await self._post(payload)
+        response = await self._post(self.router_url + "/generate", payload)
 
-        # finish_reason is a dict with "type" key, or None
         finish_reason_obj = response["meta_info"].get("finish_reason")
         output.finish_reason = finish_reason_obj["type"] if finish_reason_obj else "unknown"
 
-        # output_token_logprobs is a list of tuples: [(log_prob, token_id, _), ...]
         output_token_logprobs = response["meta_info"].get("output_token_logprobs", [])
-        # Ensure logprobs are Python floats (not tensors or nested structures)
         logprob_values = [float(log_prob) for log_prob, token_id, _ in output_token_logprobs]
 
-        # TODO: delete this after testing
         output_ids = [token_id for _, token_id, _ in output_token_logprobs]
-        assert output_ids == response["output_ids"], "output_ids mismatch, {} != {}".format(output_ids, response["output_ids"])
+        assert output_ids == response["output_ids"], f"output_ids mismatch, {output_ids} != {response['output_ids']}"
 
         chunk = OutputChunk(
             response_ids=response["output_ids"],
@@ -109,13 +106,97 @@ class RolloutClient:
         )
         output.append(chunk)
 
-        # Adjust max_tokens for continuation
-        max_tokens = sampling_params.get("max_new_tokens") or sampling_params.get("max_tokens")
-        if max_tokens is None:
+        max_tokens_val = sampling_params.get("max_new_tokens") or sampling_params.get("max_tokens")
+        if max_tokens_val is None:
             return output, sampling_params
 
         sampling_params = sampling_params.copy()
-        remaining = max_tokens - len(chunk.response_ids)
+        remaining = max_tokens_val - len(chunk.response_ids)
+        if "max_new_tokens" in sampling_params:
+            sampling_params["max_new_tokens"] = remaining
+        else:
+            sampling_params["max_tokens"] = remaining
+
+        return output, sampling_params
+
+    # ── vLLM (OpenAI-compatible) backend ──
+
+    async def _generate_vllm(self, output: OutputWithVersion, sampling_params: dict):
+        old_version = self.cur_version
+
+        sp = sampling_params.copy()
+
+        # Translate max_new_tokens -> max_tokens (OpenAI naming)
+        if "max_new_tokens" in sp:
+            sp["max_tokens"] = sp.pop("max_new_tokens")
+
+        # Build extra_body for vLLM-specific params not in OpenAI spec
+        extra_body: dict[str, Any] = {}
+        for key in list(sp.keys()):
+            if key in _VLLM_EXTRA_BODY_KEYS:
+                extra_body[key] = sp.pop(key)
+
+        # Construct OpenAI /v1/completions request
+        payload: dict[str, Any] = {
+            "model": "default",
+            "prompt": output.all_tokens(),
+            "logprobs": 1,
+            "echo": False,
+        }
+        # Map standard sampling params
+        for key in ("temperature", "top_p", "max_tokens", "stop", "n", "frequency_penalty", "presence_penalty"):
+            if key in sp:
+                payload[key] = sp[key]
+
+        if extra_body:
+            payload["extra_body"] = extra_body
+
+        response = await self._post(self.router_url + "/v1/completions", payload)
+
+        choice = response["choices"][0]
+        finish_reason_raw = choice.get("finish_reason", "unknown") or "unknown"
+        output.finish_reason = finish_reason_raw
+
+        # Parse token IDs and logprobs from vLLM response
+        response_text = choice.get("text", "")
+        logprobs_obj = choice.get("logprobs")
+
+        if logprobs_obj and logprobs_obj.get("tokens") is not None:
+            token_logprobs = logprobs_obj.get("token_logprobs", [])
+            tokens = logprobs_obj.get("tokens", [])
+            logprob_values = [float(lp) if lp is not None else 0.0 for lp in token_logprobs]
+            # vLLM /v1/completions returns text tokens; decode prompt+response to get IDs
+            if self.tokenizer is not None:
+                response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+            else:
+                response_ids = []
+        else:
+            logprob_values = []
+            if self.tokenizer is not None:
+                response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+            else:
+                response_ids = []
+
+        # Align logprobs length with response_ids (encode might tokenize differently)
+        if len(logprob_values) != len(response_ids):
+            min_len = min(len(logprob_values), len(response_ids))
+            logprob_values = logprob_values[:min_len]
+            response_ids = response_ids[:min_len]
+
+        chunk = OutputChunk(
+            response_ids=response_ids,
+            response_logprobs=logprob_values,
+            version=old_version if output.finish_reason == "abort" else self.cur_version,
+        )
+        output.append(chunk)
+
+        # Adjust max_tokens for continuation
+        orig_max = sampling_params.get("max_new_tokens") or sampling_params.get("max_tokens")
+        if orig_max is None:
+            return output, sampling_params
+
+        sampling_params = sampling_params.copy()
+        remaining = orig_max - len(chunk.response_ids)
         if "max_new_tokens" in sampling_params:
             sampling_params["max_new_tokens"] = remaining
         else:
@@ -130,17 +211,7 @@ class RolloutClient:
         sampling_params: dict | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], OutputWithVersion]:
-        """
-        Generate chat completion and parse response into OpenAI message format.
-
-        Args:
-            messages: List of message dicts (OpenAI format)
-            sampling_params: SGLang sampling params dict
-            tools: List of tool definitions (OpenAI function calling format)
-
-        Returns:
-            (message_dict, output): Parsed message and raw OutputWithVersion
-        """
+        """Generate chat completion and parse response into OpenAI message format."""
         from rllm.experimental.fully_async.message_utils import parse_response
 
         if self.tokenizer is None:

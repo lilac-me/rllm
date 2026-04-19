@@ -155,9 +155,8 @@ class ParameterSynchronizer:
 
         pause_time = time.time()
 
-        # sync weights
-        # For sglang, always use sync_rollout_weights instead of sync_rollout_weights_by_checkpoint
-        rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", None)
+        # SGLang does not support checkpoint engine; vLLM and others do.
+        rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", "sglang")
         use_checkpoint_engine = self.config.async_training.checkpoint_engine.enable and rollout_name != "sglang"
 
         if use_checkpoint_engine:
@@ -170,7 +169,7 @@ class ParameterSynchronizer:
         end_time = time.time()
         print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds, pause:{pause_time - start_time:.2f}s, sync:{end_time - pause_time:.2f}s")
 
-        # Resume executor (includes resume_router for SGLang generation)
+        # Resume executor (abort/resume is backend-agnostic via InferenceManager)
         ray.get(self.rollout_executor.resume.remote())
 
         # Trigger validation AFTER resume so it runs with new weights
