@@ -179,6 +179,7 @@ class FullyAsyncTaskRunner:
         if self._custom_val_rollout_fn is not None and not inspect.iscoroutinefunction(self._custom_val_rollout_fn):
             raise TypeError(f"val_rollout_fn must be an async function (defined with 'async def'), but got {type(self._custom_val_rollout_fn).__name__}. Only async functions are supported.")
 
+        rollout_name = getattr(config.actor_rollout_ref.rollout, "name", "sglang")
         self.rollout_executor = RolloutExecutor.remote(
             router_url=self.router_url,
             rollout_fn=self._custom_rollout_fn,
@@ -189,10 +190,13 @@ class FullyAsyncTaskRunner:
             processor=self.processor,
             max_concurrency=max_concurrent_tasks,
             total_rollout_steps=config.rollout.total_rollout_steps,
+            rollout_name=rollout_name,
         )
+        # Inject InferenceManager so RolloutExecutor can abort/resume via Ray
+        ray.get(self.rollout_executor.set_inference_manager.remote(self.inference_manager))
 
     def _create_inference_manager(self, config) -> None:
-        """Create InferenceManager which manages SGLang servers."""
+        """Create InferenceManager which manages inference servers (vLLM or SGLang)."""
         self.inference_manager = InferenceManager.remote(
             config=config,
             tokenizer=self.tokenizer,

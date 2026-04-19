@@ -17,13 +17,20 @@ Fully asynchronous PPO training with decoupled rollout and training.
 ```
 
 **Key Components:**
-- `rollout_executor.py` - Async rollout generation with SGLang backend
+- `rollout_executor.py` - Async rollout generation (backend-agnostic)
+- `inference_manager.py` - Manages inference servers (vLLM or SGLang) and abort/resume via Ray
 - `fully_async_trainer.py` - PPO trainer consuming from message queue
 - `message_queue.py` - Trajectory buffer between rollout and training
 - `param_sync.py` - Parameter synchronization from trainer to rollout
-- `client.py` - HTTP client for rollout requests
+- `client.py` - HTTP client with vLLM (OpenAI API) and SGLang (`/generate`) backends
 - `metric_utils.py` - Metrics aggregation across training steps
 - `utils.py` - Batch assembly and metric reduction utilities
+
+**Supported Backends:**
+- `vllm` - Uses OpenAI-compatible `/v1/completions` API; direct server URL (no router needed)
+- `sglang` - Uses SGLang-native `/generate` API; `sglang_router` for multi-replica load balancing
+
+Set via `actor_rollout_ref.rollout.name` in Hydra config (default: `"sglang"`).
 
 ## Installation
 

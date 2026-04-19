@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import subprocess
 
 import ray
@@ -25,11 +26,12 @@ from verl.utils.net_utils import get_free_port
 @ray.remote(num_cpus=10, max_concurrency=100)
 class InferenceManager(SeparateRayPPOTrainer):
     """
-    Manages SGLang inference servers for async training.
+    Manages inference servers (vLLM or SGLang) for async training.
     Responsible for:
-    - Launching and managing SGLang worker processes
-    - Launching the router for load balancing
+    - Launching and managing inference worker processes
+    - Launching the router for load balancing (SGLang) or direct URL (vLLM)
     - Clearing KV cache during weight synchronization
+    - Aborting/resuming generation on all replicas via Ray
 
     Does NOT handle:
     - Dataset loading (owned by RolloutExecutor)
@@ -128,37 +130,62 @@ class InferenceManager(SeparateRayPPOTrainer):
             worker_group=self.rollout_wg,
         )
 
+    def get_rollout_name(self) -> str:
+        return getattr(self.config.actor_rollout_ref.rollout, "name", "sglang")
+
     def launch_router(self, port: int = 30000):
-        """Launch SGLang router with the server URLs from async_rollout_manager."""
+        """Launch inference entry point: SGLang router or vLLM direct URL."""
         if self.async_rollout_manager is None:
             raise RuntimeError("async_rollout_manager not initialized. Call init_workers() first.")
 
-        # Get server URLs from async_rollout_manager
         server_addresses = self.async_rollout_manager.server_addresses
         urls = [f"http://{addr}" for addr in server_addresses]
+        rollout_name = self.get_rollout_name()
 
-        # Auto-find available port
-        ip = ray.util.get_node_ip_address()
-        actual_port, sock = get_free_port(ip)
-        sock.close()  # Release the socket, router will bind to this port
-        print(f"[InferenceManager] Launching router on port {actual_port} with server URLs: {urls}")
+        if rollout_name == "sglang":
+            ip = ray.util.get_node_ip_address()
+            actual_port, sock = get_free_port(ip)
+            sock.close()
+            print(f"[InferenceManager] Launching sglang_router on port {actual_port} with server URLs: {urls}")
 
-        cmd = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--worker-urls",
-            *urls,
-            "--port",
-            str(actual_port),
-            "--policy",
-            "cache_aware",
-            "--log-level",
-            "warn",
-        ]
-        self.router_process = subprocess.Popen(cmd)
-        self.router_url = f"http://{ip}:{actual_port}"
+            cmd = [
+                "python3",
+                "-m",
+                "sglang_router.launch_router",
+                "--worker-urls",
+                *urls,
+                "--port",
+                str(actual_port),
+                "--policy",
+                "cache_aware",
+                "--log-level",
+                "warn",
+            ]
+            self.router_process = subprocess.Popen(cmd)
+            self.router_url = f"http://{ip}:{actual_port}"
+        else:
+            # vLLM / trtllm: connect directly to the first server (OpenAI-compatible HTTP)
+            self.router_process = None
+            self.router_url = urls[0]
+            if len(urls) > 1:
+                print(
+                    f"[InferenceManager] WARNING: {rollout_name} has {len(urls)} replicas but only "
+                    f"the first ({self.router_url}) is used. Multi-replica load balancing requires "
+                    f"an external L7 proxy."
+                )
+            print(f"[InferenceManager] Using {rollout_name} server directly at {self.router_url}")
+
         return self.router_url
+
+    async def abort_all_rollout_requests(self):
+        """Abort all in-flight requests on every rollout replica via Ray (backend-agnostic)."""
+        replicas = self.async_rollout_manager.rollout_replicas
+        await asyncio.gather(*[replica.abort_all_requests() for replica in replicas])
+
+    async def resume_all_rollout_generation(self):
+        """Resume generation on every rollout replica via Ray (backend-agnostic)."""
+        replicas = self.async_rollout_manager.rollout_replicas
+        await asyncio.gather(*[replica.resume_generation() for replica in replicas])
 
     async def clear_kv_cache(self):
         await self.async_rollout_manager.clear_kv_cache()
