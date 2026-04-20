@@ -21,6 +21,25 @@ from rllm.experimental.fully_async.runner import AsyncAgentTrainer
 from .kernelgym_rollout import kernelgym_rollout
 
 
+def _ensure_mock_eval_patched_on_worker() -> None:
+    """Apply mock eval in the **current** interpreter.
+
+    ``make_mock_rollout_fn`` runs on the driver, but ``RolloutExecutor`` executes
+    ``rollout_fn`` inside Ray workers — those processes never saw the driver-side
+    monkeypatch, so they still called real ``_evaluate_kernel_async`` and hit
+    ``http://mock:0`` (DNS ``Name or service not known``).
+    """
+    import importlib
+    import sys
+
+    mod_name = kernelgym_rollout.__module__
+    mod = sys.modules.get(mod_name)
+    if mod is None:
+        mod = importlib.import_module(mod_name)
+    mod._evaluate_kernel_async = _mock_evaluate_kernel
+    kernelgym_rollout.__globals__["_evaluate_kernel_async"] = _mock_evaluate_kernel
+
+
 # ---------------------------------------------------------------------------
 # Mock eval function — replaces _evaluate_kernel_async
 # ---------------------------------------------------------------------------
@@ -143,13 +162,13 @@ def _register_mock_dataset():
 
 def make_mock_rollout_fn(kernel_cfg: dict):
     """Same as make_rollout_fn but monkey-patches eval to use mock."""
-    import examples.kernelgym.kernelgym_rollout as _mod
-    _mod._evaluate_kernel_async = _mock_evaluate_kernel
+    _ensure_mock_eval_patched_on_worker()
 
     max_turns = int(kernel_cfg.get("max_turns", 3))
     system_prompt = kernel_cfg.get("system_prompt", None)
 
     async def rollout_fn(client, tokenizer, **kwargs):
+        _ensure_mock_eval_patched_on_worker()
         start_time = time.time()
         param_version_start = client.cur_version
 
