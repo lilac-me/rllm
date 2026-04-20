@@ -214,11 +214,24 @@ class FullyAsyncTaskRunner:
 
     def _create_inference_manager(self, config) -> None:
         """Create InferenceManager which manages inference servers (vLLM or SGLang)."""
+        # verl 0.7.1+ (PR #5184) 的 create_resource_pool_manager 不再为 Role.Rollout
+        # 创建资源池（standalone 模式由 AgentLoopManager 自建）。rllm 仍走 hybrid
+        # 模式，需要手动构建 rollout 资源池。
+        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+
+        rollout_pool_spec = {
+            "rollout_pool": [config.rollout.n_gpus_per_node] * config.rollout.nnodes,
+        }
+        rollout_pool_manager = ResourcePoolManager(
+            resource_pool_spec=rollout_pool_spec,
+            mapping={Role.Rollout: "rollout_pool"},
+        )
+
         self.inference_manager = InferenceManager.remote(
             config=config,
             tokenizer=self.tokenizer,
             role_worker_mapping={Role.Rollout: self.role_worker_mapping[Role.Rollout]},
-            resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
+            resource_pool_manager=rollout_pool_manager,
             ray_worker_group_cls=self.ray_worker_group_cls,
             processor=self.processor,
             device_name=config.trainer.device,
