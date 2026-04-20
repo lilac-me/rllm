@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import httpx
@@ -735,11 +735,40 @@ def assemble_batch_from_trajectory_group_ls(trajectory_group_ls: list[Trajectory
     # Add user-defined custom metrics to meta_info
     # Users can define metrics with "custom/" prefix in trajectory.metadata
     for metric_key, values in custom_metrics.items():
-        if values:
-            values_arr = np.array(values)
+        if not values:
+            continue
+
+        numeric_values: list[float] = []
+        non_numeric_values: list[str] = []
+        for value in values:
+            if isinstance(value, (int, float, np.integer, np.floating, bool)):
+                numeric_values.append(float(value))
+                continue
+            # Accept numeric strings, e.g. "1.23"
+            if isinstance(value, str):
+                try:
+                    numeric_values.append(float(value))
+                    continue
+                except ValueError:
+                    non_numeric_values.append(value)
+                    continue
+            non_numeric_values.append(str(value))
+
+        # Keep custom/* meta strictly numeric so downstream metric logger/aggregator
+        # can consume them safely in both mock and non-mock runs.
+        if numeric_values:
+            values_arr = np.array(numeric_values, dtype=np.float64)
             batch.meta_info[f"{metric_key}/avg"] = float(np.mean(values_arr))
             batch.meta_info[f"{metric_key}/max"] = float(np.max(values_arr))
             batch.meta_info[f"{metric_key}/min"] = float(np.min(values_arr))
+            batch.meta_info[f"{metric_key}/numeric_count"] = len(numeric_values)
+
+        if non_numeric_values:
+            value_counter = Counter(non_numeric_values)
+            top_count = value_counter.most_common(1)[0][1]
+            batch.meta_info[f"{metric_key}/non_numeric_count"] = len(non_numeric_values)
+            batch.meta_info[f"{metric_key}/non_numeric_unique_count"] = len(value_counter)
+            batch.meta_info[f"{metric_key}/non_numeric_top_ratio"] = float(top_count / len(non_numeric_values))
 
     if balance_batch:
         balance_batch(batch, metrics={})
