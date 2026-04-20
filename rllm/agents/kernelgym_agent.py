@@ -196,6 +196,10 @@ class KernelAgent(BaseAgent):
         cur_step.model_response = response
 
         kernel_code = extract_kernel_code(response)
+        kernel_code = "import triton \nimport triton.language as tl\nimport torch\nimport torch.nn as nn\n" + kernel_code
+        #! Patch 1. 直接将没有继承 nn.Module 的 ModelNew 进行替换。
+        if "class ModelNew:" in kernel_code:
+            kernel_code = kernel_code.replace("class ModelNew:", "class ModelNew(nn.Module):")
         action = Action(action=kernel_code.strip())
         cur_step.action = action
 

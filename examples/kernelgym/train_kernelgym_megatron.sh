@@ -171,20 +171,38 @@ ARGS=(
   trainer.default_hdfs_dir=null
   trainer.total_epochs=100
 
-  # =========================
-  # kernel
-  # =========================
-  ++kernel.server_url=http://80.48.5.52:8002
-  ++kernel.backend=triton
-  ++kernel.toolkit=kernelbench
-  ++kernel.use_ray=false
-  ++kernel.timeout=300
-  ++kernel.num_correct_trials=5
-  ++kernel.num_perf_trials=100
+  # # =========================
+  # # kernel
+  # # =========================
 
-  # optional
-  # data.train_files=data/kernelbench_train.jsonl
-  # data.val_files=data/kernelbench_val.jsonl
+  reward_model.max_turns=3
+  reward_model.reference_backend=triton
+  reward_model.server_url=reward_model
+  reward_model.reward_func_name=calculate_reward_weighted
+  reward_model.init_correct_weight=0.5
+  reward_model.init_performance_weight=0.5
+
+  reward_model.timeout=1800
+  reward_model.max_retries=3
+  reward_model.task_timeout=600
+  reward_model.task_timeout_in_client=1800
+  reward_model.num_perf_trials=100
+  reward_model.num_correct_trials=5
+  reward_model.enable_profiling=true
+  reward_model.verbose_errors=true
+
+  reward_model.reward_policy.penalties.penalty_score=0.0
+  reward_model.reward_policy.penalties.compilation_fail=-0.5
+  reward_model.reward_policy.penalties.correctness_fail=-0.3
+  reward_model.reward_policy.penalties.perf_degrade=-0.1
+
+  reward_model.reward_weights.compilation=0.3
+  reward_model.reward_weights.correctness=0.4
+  reward_model.reward_weights.performance=0.3
+
+  reward_model.coverage_reward.reward_type=time_coverage
+  reward_model.coverage_reward.enable=false
+  reward_model.coverage_reward.weight=0.25
 )
 
 # python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"

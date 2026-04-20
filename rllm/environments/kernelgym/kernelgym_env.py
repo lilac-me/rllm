@@ -719,8 +719,6 @@ class KernelGymEnv(MultiTurnEnvironment):
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, dict]:
         self.history.append(action)
 
-        breakpoint()
-
         #! 构造 LLM 观测文本，重新构造一遍 task 对象，作为输入
         task = {
             "task_id": self.task["task_id"], # TODO. 

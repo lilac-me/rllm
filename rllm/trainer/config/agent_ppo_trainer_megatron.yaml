@@ -94,9 +94,44 @@ trainer:
   log_episodes: false
   episode_log_dir: logs/${trainer.project_name}/${trainer.experiment_name}
 
-kernel:
-  server_url: None
-  backend: cuda
-  toolkit: kernelbench
-  backend_adapter: kernelbench
-  
+
+# Kernel specific reward model configuration
+reward_model:
+  max_turns: 3
+  reference_backend: triton
+  reward_manager: kernel
+  server_url: "http://127.0.0.1:8002"
+  reward_func_name: "calculate_reward_weighted"
+  init_correct_weight: 0.5
+  init_performance_weight: 0.5
+  speedup_eps: 0.01
+  enhanced: true
+  rate_limit: 64                  # 令牌桶并发上限（全局）
+  acquire_timeout: 2400             # 获取令牌等待超时（秒），超过则放弃提交 240 default
+  max_concurrent: 64              # Ray 执行池 worker 并发（建议 >= rate_limit）
+  print_status: true             # 是否打印每个评测样本的状态
+  speedup_reward_upper_bound: 3.0      # 加速奖励上限
+  speedup_reward_lower_bound: 0.0      # 加速奖励下限
+  reward_policy:
+    penalties:
+      penalty_score: 0.0
+      compilation_fail: -0.5     # 编译失败惩罚
+      correctness_fail: -0.3     # 正确性失败惩罚
+      perf_degrade: -0.1         # speedup < 1.0 的惩罚
+  reward_weights:
+    compilation: 0.3
+    correctness: 0.4
+    performance: 0.3
+  timeout: 1800  # 180 default
+  max_retries: 3
+  task_timeout: 600  # 180 default
+  task_timeout_in_client: 1800  # 180 default
+  num_perf_trials: 100
+  num_correct_trials: 5
+  enable_profiling: true
+  verbose_errors: true
+  coverage_reward:
+    reward_type: "time_coverage"  # time_coverage: cutom_kernel_time_us / total_kernel_time_us, number_coverage: num_custom_kernel / num_total_kernels
+    enable: false
+    weight: 0.25
+  detect_decoy_kernel: true

@@ -31,8 +31,8 @@ def _load_or_register(name: str, split: str, fallback_path: str) -> Dataset:
     )
     return ds
 
-@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
-# @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer_megatron", version_base=None)
+# @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
+@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer_megatron", version_base=None)
 def main(config):
     train_fallback = config.get("data", {}).get("train_files", "data/kernelbench_train.jsonl")
     val_fallback = config.get("data", {}).get("val_files", "data/kernelbench_val.jsonl")

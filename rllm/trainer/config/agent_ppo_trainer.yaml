@@ -93,8 +93,6 @@ trainer:
   episode_log_dir: logs/${trainer.project_name}/${trainer.experiment_name}
 
 
-
-# Kernel specific reward model configuration
 reward_model:
   max_turns: 3
   reference_backend: triton
@@ -104,9 +102,7 @@ reward_model:
   init_correct_weight: 0.5
   init_performance_weight: 0.5
   speedup_eps: 0.01
-  launch_reward_fn_async: true
   enhanced: true
-  use_sandbox_rate_limit: false   # 启用组合版 Hybrid
   rate_limit: 64                  # 令牌桶并发上限（全局）
   acquire_timeout: 2400             # 获取令牌等待超时（秒），超过则放弃提交 240 default
   max_concurrent: 64              # Ray 执行池 worker 并发（建议 >= rate_limit）
@@ -135,9 +131,4 @@ reward_model:
     reward_type: "time_coverage"  # time_coverage: cutom_kernel_time_us / total_kernel_time_us, number_coverage: num_custom_kernel / num_total_kernels
     enable: false
     weight: 0.25
-  coverage_rs: null
-  coverage_rs_threshold: 0.3
-  coverage_rs_factor: 0.1
-  coverage_rs_key: "time_coverage"
-  speedup_threshold: null
   detect_decoy_kernel: true
