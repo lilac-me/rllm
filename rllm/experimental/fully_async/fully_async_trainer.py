@@ -687,7 +687,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
-                critic_output = self.critic_wg.update_critic(batch)
+                critic_output = self._update_critic(batch)
             critic_output_metrics = reduce_metrics_with_flatten(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
 
@@ -696,7 +696,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                actor_output = self.actor_rollout_wg.update_actor(batch)
+                actor_output = self._update_actor(batch)
 
             actor_output_metrics = reduce_metrics_with_flatten(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
