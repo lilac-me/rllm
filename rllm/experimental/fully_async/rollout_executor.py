@@ -311,6 +311,39 @@ class RolloutExecutor:
                 print(f"[RolloutExecutor][WATCH] Error getting stats: {e}")
                 print(traceback.format_exc())
 
+    async def _await_internal_rollout_pipeline_idle(
+        self,
+        stable_polls: int = 10,
+        poll_interval_s: float = 0.05,
+        timeout_s: float = 7200.0,
+    ) -> None:
+        """Wait until in-flight trajectories are in the internal queue and drained.
+
+        ``fit()``'s ``finally`` must not cancel ``_drain_results_to_mq`` while work remains:
+        otherwise ``generate_trajectory`` keeps ``put``ting into ``trajectory_group_queue``
+        but nothing moves samples to the Ray ``MessageQueue``, and ``FullyAsyncTrainer``
+        blocks forever on ``get_sample_sync`` (often right after ``fit() ENDED``).
+        """
+        deadline = time.time() + timeout_s
+        stable = 0
+        while time.time() < deadline:
+            if self.active_sample == 0 and self.trajectory_group_queue.empty():
+                stable += 1
+                if stable >= stable_polls:
+                    break
+            else:
+                stable = 0
+            await asyncio.sleep(poll_interval_s)
+        else:
+            print(
+                f"[RolloutExecutor] WARNING: pipeline idle wait timed out after {timeout_s}s "
+                f"(active_sample={self.active_sample} traj_q={self.trajectory_group_queue.qsize()})",
+                flush=True,
+            )
+        # Last serialized group may have just been ``get`` by the drain loop; allow
+        # ``put_sample`` to finish before cancelling the drain task.
+        await asyncio.sleep(0.2)
+
     async def _drain_results_to_mq(self):
         """Single loop that drains internal result queue to MessageQueue.
 
@@ -422,6 +455,11 @@ class RolloutExecutor:
                 await watch_task
             except asyncio.CancelledError:
                 pass
+            print(
+                "[RolloutExecutor] Waiting for in-flight rollouts + internal queue drain before stopping MQ bridge...",
+                flush=True,
+            )
+            await self._await_internal_rollout_pipeline_idle()
             drain_task.cancel()
             try:
                 await drain_task
