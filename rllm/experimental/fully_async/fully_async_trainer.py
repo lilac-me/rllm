@@ -17,6 +17,7 @@ from datetime import datetime
 from pprint import pprint
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -24,7 +25,13 @@ from verl import DataProto
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    compute_variance_proxy_metrics,
+)
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, apply_kl_penalty, compute_response_mask
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy
 from verl.checkpoint_engine import CheckpointEngineManager
@@ -68,6 +75,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
+        # Keep behavior aligned with verl ray_trainer._update_actor/_update_critic
+        # which branches by this flag.
+        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_rm = False
         self.use_critic = need_critic(self.config)
@@ -453,6 +463,36 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pprint(f"[FullyAsyncTrainer] Logged val results (validated version {val_metrics.param_version}) at step {log_step}: {val_metrics.metrics}")
         if val_metrics.timing_raw:
             self.logger.log(data=val_metrics.timing_raw, step=log_step)
+
+    def _log_rollout(self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict) -> None:
+        """Mirror ``RayPPOTrainer.fit``: dump generations only when ``rollout_data_dir`` is set."""
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+    def _collect_metrics(self, batch: DataProto, epoch: int, metrics: dict, timing_raw: dict) -> None:
+        """Training metrics aligned with ``RayPPOTrainer`` post-step aggregation (no dataloader side-effects)."""
+        metrics.update(
+            {
+                "training/global_step": self.global_steps,
+                "training/epoch": epoch,
+            }
+        )
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+        if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+            for key in gdpo_reward_keys:
+                if key in batch.non_tensor_batch:
+                    vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                    metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                    metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                    metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                    metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        n_gpus = self.resource_pool_manager.get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        gradient_norm = metrics.get("actor/grad_norm", None)
+        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """
