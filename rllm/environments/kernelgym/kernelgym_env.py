@@ -151,13 +151,14 @@ class KernelGymEnv(MultiTurnEnvironment):
         super().__init__(task=task, max_turns=config.max_turns)
 
         assert task is not None
+        task["task_id"] = task.get("problem_id", "undefined_"+uuid.uuid4().hex[:16])
         #! 任务相关的输入
-        self.problem_id = task.get("problem_id", "undefined_"+uuid.uuid4().hex[:16])
+        self.problem_id = task.get("task_id")
         self.reference_code = task.get("reference_code", "")
         self.entry_point = task.get("entry_point", "")
         self.is_valid = task.get("is_valid", True)
         # TODO. 检查下这他妈是啥参数
-        self.uuid = task.get("uuid", None)
+        self.uuid = task.get("problem_id", None)
         self.task = task
         
         # 用于存储每次 get_reward_and_next_obs 返回的 meta_data
@@ -321,6 +322,7 @@ class KernelGymEnv(MultiTurnEnvironment):
         }
 
 
+    #!!! 可选
     def calculate_reward_weighted(self, result: Dict[str, Any]) -> Dict[str, Any]:
         penalty_score = self.penalty_score
 
@@ -410,7 +412,7 @@ class KernelGymEnv(MultiTurnEnvironment):
             "total_kernel_run_time_in_profiling_us": total_kernel_run_time_in_profiling_us,
         }
 
-
+    #!!! 可选
     def calculate_reward_speedup(self, result: Dict[str, Any]) -> Dict[str, Any]:
         penalty_score = self.penalty_score
 
@@ -515,10 +517,14 @@ class KernelGymEnv(MultiTurnEnvironment):
     def _preflight_validate(self, reference_code: str, kernel_code: str, entry_point: str) -> Tuple[bool, str]:
         """预备检查, 排除没有ModelNew入口的算子"""
         try:
-            ref_required = f"class {entry_point}"
-            ker_required = f"class {entry_point}New"
-            ref_ok = ref_required in (reference_code or "")
-            ker_ok = ker_required in (kernel_code or "")
+            import regex
+            #! 使用正则表达式检查是否有继承自 nn.Module 的 Model 或者 ModelNew 
+            ref_required = f"class {entry_point}(nn.Module)"
+            ker_required = f"class {entry_point}New(nn.Module)"
+            ref_ok = bool(regex.search(fr"class {entry_point}\s*\(.*Module\s*\)", reference_code))
+            ker_ok = bool(regex.search(fr"class {entry_point}New\s*\(.*Module\s*\)", kernel_code))
+            # ref_ok = ref_required in (reference_code or "")
+            # ker_ok = ker_required in (kernel_code or "")
             if ref_ok and ker_ok:
                 return True, ""
             missing = []
@@ -600,7 +606,7 @@ class KernelGymEnv(MultiTurnEnvironment):
 
             #! 当算子需要验证时，强制开启 detect_decoy_kernel
             if payload["is_valid"]:
-                print(f"Enforce detect decoy kernel if validate: {payload['detect_decoy_kernel']}")
+                logger.debug(f"Enforce detect decoy kernel if validate: {payload['detect_decoy_kernel']}")
                 payload["detect_decoy_kernel"] = True
 
             # TODO. 还没搞懂啥东西
@@ -712,6 +718,8 @@ class KernelGymEnv(MultiTurnEnvironment):
 
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, dict]:
         self.history.append(action)
+
+        breakpoint()
 
         #! 构造 LLM 观测文本，重新构造一遍 task 对象，作为输入
         task = {

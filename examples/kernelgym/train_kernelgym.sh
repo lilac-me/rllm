@@ -25,7 +25,10 @@ export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 # 设置 Master 节点地址
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-export ASCEND_RT_VISIBLE_DEVICES="8,9,10,11,12,13,14,15"
+# export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7,8"
+
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 
 # ── NCCL / Tokenizers ─────────────────────────────────────────────────────────
 export TOKENIZERS_PARALLELISM=true
@@ -51,7 +54,7 @@ RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dir
 
 python3 -m examples.kernelgym.train_kernelgym \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=8 \
+    data.train_batch_size=1 \
     data.val_batch_size=16 \
     data.max_prompt_length=8192 \
     data.max_response_length=8192 \
@@ -69,20 +72,20 @@ python3 -m examples.kernelgym.train_kernelgym \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=8 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.entropy_coeff=0 \

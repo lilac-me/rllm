@@ -512,6 +512,7 @@ class AgentExecutionEngine:
         assert all(env is not None and isinstance(env, BaseEnv) for env in self.envs), "All environments must be inheriting from BaseEnv"
         assert all(env.is_multithread_safe() for env in self.envs), "All environments must be multithread safe for async engine"  # type: ignore
         max_concurrency = self.n_parallel_agents
+        logger.debug(f"Agent Execution Engine: n_paralel_agents: {self.n_parallel_agents}")
 
         self.executor = ThreadPoolExecutor(max_workers=max_concurrency)
 
