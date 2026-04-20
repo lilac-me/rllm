@@ -40,7 +40,14 @@ class RolloutExecutor:
         max_prompt_length = int(getattr(config.data, "max_prompt_length", 0) or 0)
         max_response_length = int(getattr(config.data, "max_response_length", 0) or 0)
         max_tokens = max_prompt_length + max_response_length
-        client_kwargs = dict(router_url=router_url, tokenizer=tokenizer, max_concurrency=self.max_concurrency, backend=rollout_name)
+        model_name = getattr(config.actor_rollout_ref.model, "path", None)
+        client_kwargs = dict(
+            router_url=router_url,
+            tokenizer=tokenizer,
+            max_concurrency=self.max_concurrency,
+            backend=rollout_name,
+            model_name=model_name,
+        )
         if max_tokens > 0:
             client_kwargs["max_tokens"] = max_tokens
 

@@ -18,12 +18,16 @@ class RolloutClient:
         max_concurrency: int = 4096,
         max_tokens=32768,
         backend: str = "sglang",
+        model_name: str | None = None,
     ):
         self.router_url = router_url
         self.tokenizer = tokenizer
         self.parser = ToolParser.get_parser(tokenizer)
         self._max_concurrency = max_concurrency
         self.backend = backend
+        # vLLM OpenAI-compatible endpoints require a served model identifier.
+        # Use configured model path/name when available; keep "default" as fallback.
+        self.model_name = model_name or "default"
 
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(
@@ -138,7 +142,7 @@ class RolloutClient:
 
         # Construct OpenAI /v1/completions request
         payload: dict[str, Any] = {
-            "model": "default",
+            "model": self.model_name,
             "prompt": output.all_tokens(),
             "logprobs": 1,
             "echo": False,
