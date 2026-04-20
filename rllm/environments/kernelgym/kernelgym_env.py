@@ -83,7 +83,7 @@ class _HybridHttpWorker:
                     except Exception:
                         pass
                     if resp.status_code == 200:
-                        print(f"[HybridWorker] HTTP 200OK. errcode(reason): {json.loads(resp.content.decode('utf-8') or '{}').get('error_code',None)}")
+                        logger.debug(f"[HybridWorker] HTTP 200 OK. errcode(reason): {json.loads(resp.content.decode('utf-8') or '{}').get('error_code',None)}")
                         break
                     if resp.status_code in (429, 503):
                         time.sleep(self._backoff(attempt, base=2 if resp.status_code == 429 else 5))
@@ -131,7 +131,7 @@ class _HybridHttpWorker:
                             if r.status_code == 200:
                                 result = r.json()
                                 result["status"] = status
-                                print(f"[HybridWorker] PULL Result: {result}")
+                                logger.debug(f"[HybridWorker] PULL Result: {result}")
                                 return result
                             return {"status": status, "error_message": f"Failed to fetch results: HTTP {r.status_code}"}
                             # return {"status": status, "error_message": data.get("error_message", f"Task {status}")}
@@ -211,7 +211,7 @@ class KernelGymEnv(MultiTurnEnvironment):
             if error_message == "Task failed":
                 error_message = result.get("error", "Task failed")
             print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
-            print(f"[HybridClient] Task failed result: {result}")
+            logger.debug(f"[HybridClient] Task failed result: {result}")
             return {
                 "reward": -1.0,
                 "speedup": 0.0,
@@ -337,7 +337,7 @@ class KernelGymEnv(MultiTurnEnvironment):
             if error_message == "Task failed":
                 error_message = result.get("error", "Task failed")
             print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
-            print(f"[HybridClient] Task failed result: {result}")
+            logger.debug(f"[HybridClient] Task failed result: {result}")
 
             return_result = {
                 "reward": penalty_score,
@@ -428,7 +428,7 @@ class KernelGymEnv(MultiTurnEnvironment):
             if error_message == "Task failed":
                 error_message = result.get("error", "Task failed")
             print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
-            print(f"[HybridClient] Task failed result: {result}")
+            logger.debug(f"[HybridClient] Task failed result: {result}")
 
             return_result = {
                 "reward": penalty_score,
