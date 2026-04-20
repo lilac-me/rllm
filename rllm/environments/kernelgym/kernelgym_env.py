@@ -83,6 +83,7 @@ class _HybridHttpWorker:
                     except Exception:
                         pass
                     if resp.status_code == 200:
+                        print(f"[HybridWorker] HTTP 200OK. errcode(reason): {json.loads(resp.content.decode('utf-8') or '{}').get('error_code',None)}")
                         break
                     if resp.status_code in (429, 503):
                         time.sleep(self._backoff(attempt, base=2 if resp.status_code == 429 else 5))
@@ -122,14 +123,18 @@ class _HybridHttpWorker:
                             except Exception:
                                 pass
                         if status in ("completed", "failed", "timeout", "cancelled"):
-                            if status == "completed":
-                                r = self._client.get(f"{self.server_url}/results/{task_id}")
-                                if r.status_code == 200:
-                                    result = r.json()
-                                    result["status"] = status
-                                    return result
-                                return {"status": status, "error_message": f"Failed to fetch results: HTTP {r.status_code}"}
-                            return {"status": status, "error_message": data.get("error_message", f"Task {status}")}
+                            # TODO. 这里的 completed failed timeout cancelled 分级不正确
+                            #! 我发现有许多执行失败的 被标记为 failed 但是模型并不知道哪里出错。
+                            #! 因此在这里，我暂时将 completed 这个逻辑注释掉，让每一次报错都能直接透传至 LLM
+                            # if status == "completed":
+                            r = self._client.get(f"{self.server_url}/results/{task_id}")
+                            if r.status_code == 200:
+                                result = r.json()
+                                result["status"] = status
+                                print(f"[HybridWorker] PULL Result: {result}")
+                                return result
+                            return {"status": status, "error_message": f"Failed to fetch results: HTTP {r.status_code}"}
+                            # return {"status": status, "error_message": data.get("error_message", f"Task {status}")}
                 except Exception:
                     pass
                 time.sleep(1.0)
@@ -151,7 +156,8 @@ class KernelGymEnv(MultiTurnEnvironment):
         super().__init__(task=task, max_turns=config.max_turns)
 
         assert task is not None
-        task["task_id"] = task.get("problem_id", "undefined_"+uuid.uuid4().hex[:16])
+        self.session_uuid = uuid.uuid4().hex[:16]
+        task["task_id"] = task.get("problem_id", "undefined")
         #! 任务相关的输入
         self.problem_id = task.get("task_id")
         self.reference_code = task.get("reference_code", "")
@@ -201,7 +207,7 @@ class KernelGymEnv(MultiTurnEnvironment):
 
     def calculate_reward_like_kernel(self, result: Dict[str, Any]) -> Dict[str, Any]:
         if result.get("status") != "completed":
-            error_message = result.get("error_message", "Task failed")
+            error_message = result.get("error_message", "Task failed")          # TODO. 这里获取的message有问题，总是Task Failed
             if error_message == "Task failed":
                 error_message = result.get("error", "Task failed")
             print(f"[HybridClient] calculate_reward_like_kernel error_message: {error_message}")
@@ -719,9 +725,12 @@ class KernelGymEnv(MultiTurnEnvironment):
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, dict]:
         self.history.append(action)
 
+        #! kernelGYM 要求 task_id 为 problem_session_round 的形式，如果错误匹配，可能不会触发校验，直接走缓存。
+        task_id = f"{self.task.get('problem_id', 'task')}_{self.session_uuid}_{uuid.uuid4().hex[:2]}{self.current_turn}"
+
         #! 构造 LLM 观测文本，重新构造一遍 task 对象，作为输入
         task = {
-            "task_id": self.task["task_id"], # TODO. 
+            "task_id": task_id,
             "reference_code": self.reference_code,
             "kernel_code": action,
             "backend": self.reference_backend,

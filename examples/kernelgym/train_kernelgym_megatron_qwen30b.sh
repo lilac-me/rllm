@@ -155,7 +155,7 @@ ARGS=(
   # =========================
   rllm.mask_truncated_samples=False
   +rllm.agent.engine_args.n_parallel_agents=64
-  rllm.agent.max_steps=3
+  rllm.agent.max_steps=5
   rllm.stepwise_advantage.enable=False
 
   # =========================
