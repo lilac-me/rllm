@@ -16,119 +16,68 @@ import asyncio
 import subprocess
 
 import ray
-from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, WorkerType
+from verl.experimental.agent_loop import AgentLoopManager
 from verl.utils.net_utils import get_free_port
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
-class InferenceManager(SeparateRayPPOTrainer):
+class InferenceManager:
     """
-    Manages inference servers (vLLM or SGLang) for async training.
-    Responsible for:
-    - Launching and managing inference worker processes
-    - Launching the router for load balancing (SGLang) or direct URL (vLLM)
-    - Clearing KV cache during weight synchronization
-    - Aborting/resuming generation on all replicas via Ray
+    Manages inference servers (vLLM or SGLang) for async training (standalone rollout).
+
+    Rollout replicas and ``CheckpointEngineWorker`` processes are created by
+    ``AgentLoopManager`` (verl 0.7.1+), not by a hybrid ``RayWorkerGroup``.
 
     Does NOT handle:
     - Dataset loading (owned by RolloutExecutor)
     - Staleness/queue sizing (owned by RolloutExecutor)
-    - Sample generation (owned by RolloutExecutor)
-    - Pause/resume of generation (owned by RolloutExecutor)
+    - Parameter sync (owned by ``FullyAsyncTrainer`` + ``CheckpointEngineManager``)
     """
 
-    def __init__(
-        self,
-        config,
-        tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
-        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-        processor=None,
-        device_name=None,
-    ):
-        # Store the tokenizer for text processing
+    def __init__(self, config, tokenizer, processor=None, device_name=None):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        self.device_name = device_name if device_name else config.trainer.device
+        self.async_rollout_manager = None
+        self.router_process = None
+        self.router_url = None
 
-        assert not self.hybrid_engine
+        assert not config.actor_rollout_ref.hybrid_engine
         assert self.config.data.train_batch_size == 0, "train_batch_size must be zero"
         assert self.config.data.gen_batch_size == 1, "gen_batch_size must be one"
         assert self.config.async_training.staleness_threshold >= 0, "staleness_threshold must larger than 0"
         assert self.config.async_training.trigger_parameter_sync_step >= 1, "trigger_parameter_sync_step must larger than 1"
 
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
-        self.ray_worker_group_cls = ray_worker_group_cls
-        self.device_name = device_name if device_name else self.config.trainer.device
-
-        self.ref_in_actor = False
-        self.kl_ctrl_in_reward = False
-        self.use_critic = False
-        self.use_reference_policy = False
-        self.use_rm = False
-
         self._validate_config()
 
-        # Worker groups: rollout_wg is same to actor_rollout_wg
-        self.rollout_wg = None
-        self.actor_rollout_wg = None
-        self.async_rollout_manager = None
-
-    def get_rollout_wg(self):
-        """Get rollout worker group"""
-        return self.rollout_wg
-
     def _validate_config(self):
-        # Validate asynchronous training configuration
         if not hasattr(self.config, "async_training"):
             raise ValueError("[InferenceManager] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
 
     async def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
-        self._init_resource_pools()
-        self._create_worker_classes()
-        self._init_worker_groups()
-        self._init_models()
-        await self._init_async_rollout_manager()
-
-    def _create_actor_rollout_classes(self):
-        # only create rollout
-        for role in [Role.Rollout]:
-            resource_pool = self.resource_pool_manager.get_resource_pool(role)
-            role_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[role],
-                config=self.config.actor_rollout_ref,
-                role=str(role),
-            )
-            self.resource_pool_to_cls[resource_pool][str(role)] = role_cls
-
-    def _init_models(self):
-        self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self.rollout_wg.init_model()
-        self.actor_rollout_wg = self.rollout_wg
-
-    async def _init_async_rollout_manager(self):
-        # create async rollout manager and request scheduler
+        """Launch standalone rollout replicas (``AgentLoopManager``, ``worker_group=None``)."""
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.agent_loop import AgentLoopManager
+        partial = getattr(self.config.async_training, "partial_rollout", False)
+        if partial:
+            from rllm.experimental.fully_async.async_agent_loop import FullyAsyncAgentLoopManager
 
-        self.async_rollout_mode = True
-        self.async_rollout_manager = await AgentLoopManager.create(
-            config=self.config,
-            worker_group=self.rollout_wg,
-        )
+            self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+                config=self.config,
+                worker_group=None,
+            )
+        else:
+            self.async_rollout_manager = await AgentLoopManager.create(
+                config=self.config,
+                worker_group=None,
+            )
+
+    def get_replicas(self):
+        """Rollout replicas for ``CheckpointEngineManager``."""
+        if self.async_rollout_manager is None:
+            raise RuntimeError("async_rollout_manager not initialized. Call init_workers() first.")
+        return self.async_rollout_manager.rollout_replicas
 
     def get_rollout_name(self) -> str:
         return getattr(self.config.actor_rollout_ref.rollout, "name", "sglang")
@@ -164,7 +113,6 @@ class InferenceManager(SeparateRayPPOTrainer):
             self.router_process = subprocess.Popen(cmd)
             self.router_url = f"http://{ip}:{actual_port}"
         else:
-            # vLLM / trtllm: connect directly to the first server (OpenAI-compatible HTTP)
             self.router_process = None
             self.router_url = urls[0]
             if len(urls) > 1:
@@ -178,12 +126,10 @@ class InferenceManager(SeparateRayPPOTrainer):
         return self.router_url
 
     async def abort_all_rollout_requests(self):
-        """Abort all in-flight requests on every rollout replica via Ray (backend-agnostic)."""
         replicas = self.async_rollout_manager.rollout_replicas
         await asyncio.gather(*[replica.abort_all_requests() for replica in replicas])
 
     async def resume_all_rollout_generation(self):
-        """Resume generation on every rollout replica via Ray (backend-agnostic)."""
         replicas = self.async_rollout_manager.rollout_replicas
         await asyncio.gather(*[replica.resume_generation() for replica in replicas])
 

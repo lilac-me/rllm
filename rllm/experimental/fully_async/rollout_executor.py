@@ -221,19 +221,32 @@ class RolloutExecutor:
         """Get total training steps for trainer initialization."""
         return self.total_train_steps
 
-    async def pause(self):
-        """Pause rollout, abort in-flight requests, and record idle start time for timing metrics."""
+    async def pause_business(self):
+        """Pause client-side rollout only (no abort). Used with ``CheckpointEngineManager`` weight sync."""
         self.is_paused = True
         if self.idle_start_time is None:
             self.idle_start_time = time.time()
         self.client.pause()
-        # Abort all in-flight requests via InferenceManager (backend-agnostic Ray calls)
+        print(f"[RolloutExecutor] pause_business at {self.idle_start_time:.2f}")
+
+    async def resume_business(self):
+        """Resume client-side rollout after sync (no resume_generation RPC)."""
+        self.is_paused = False
+        self.idle_start_time = None
+        self.continue_event.set()
+        self.client.resume()
+        print("[RolloutExecutor] resume_business")
+
+    async def pause(self):
+        """Pause rollout, abort in-flight requests, and record idle start time for timing metrics."""
+        await self.pause_business()
         if self.inference_manager is not None:
             await self.inference_manager.abort_all_rollout_requests.remote()
         else:
             from rllm.experimental.fully_async.utils import abort_async
+
             await abort_async(self.router_url)
-        print(f"[RolloutExecutor] Paused at {self.idle_start_time:.2f}")
+        print(f"[RolloutExecutor] Paused (with abort) at {self.idle_start_time:.2f}")
 
     async def resume(self):
         """Resume rollout and inference generation."""
@@ -241,12 +254,10 @@ class RolloutExecutor:
             await self.inference_manager.resume_all_rollout_generation.remote()
         else:
             from rllm.experimental.fully_async.utils import continue_generation_async
+
             await continue_generation_async(self.router_url)
-        self.is_paused = False
-        self.idle_start_time = None
-        self.continue_event.set()
-        self.client.resume()
-        print("[RolloutExecutor] Resumed")
+        await self.resume_business()
+        print("[RolloutExecutor] Resumed (with resume_generation)")
 
     async def _watch_task(self, interval: float = 20.0):
         """Periodically print debug stats for monitoring."""

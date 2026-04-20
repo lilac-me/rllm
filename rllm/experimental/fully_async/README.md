@@ -9,19 +9,21 @@ Fully asynchronous PPO training with decoupled rollout and training.
 │ RolloutExecutor │────▶│   MessageQueue   │────▶│ FullyAsyncTrainer│
 │  (async rollout)│     │ (trajectory buf) │     │   (PPO update)  │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
-        │                                                 │
-        │              ┌──────────────────┐               │
-        └──────────────│   ParamSync      │◀──────────────┘
-                       │ (weight updates) │
-                       └──────────────────┘
+        │                       ▲                         │
+        │                       │                         │
+        └───────────────────────┴─────────────────────────┘
+                    InferenceManager (standalone vLLM/SGLang)
+                              │
+                    verl CheckpointEngineManager
+                    (actor_wg ↔ rollout replicas)
 ```
 
 **Key Components:**
 - `rollout_executor.py` - Async rollout generation (backend-agnostic)
-- `inference_manager.py` - Manages inference servers (vLLM or SGLang) and abort/resume via Ray
-- `fully_async_trainer.py` - PPO trainer consuming from message queue
+- `inference_manager.py` - Standalone rollout: `AgentLoopManager.create(worker_group=None)` (no hybrid worker group)
+- `fully_async_trainer.py` - PPO trainer consuming from message queue; owns `CheckpointEngineManager` weight sync
+- `async_agent_loop.py` - Optional `FullyAsyncAgentLoopManager` when `async_training.partial_rollout` is true (retry after abort)
 - `message_queue.py` - Trajectory buffer between rollout and training
-- `param_sync.py` - Parameter synchronization from trainer to rollout
 - `client.py` - HTTP client with vLLM (OpenAI API) and SGLang (`/generate`) backends
 - `metric_utils.py` - Metrics aggregation across training steps
 - `utils.py` - Batch assembly and metric reduction utilities
@@ -31,6 +33,8 @@ Fully asynchronous PPO training with decoupled rollout and training.
 - `sglang` - Uses SGLang-native `/generate` API; `sglang_router` for multi-replica load balancing
 
 Set via `actor_rollout_ref.rollout.name` in Hydra config (default: `"sglang"`).
+
+Configure weight sync via `actor_rollout_ref.rollout.checkpoint_engine` (verl dataclass: `backend`, `update_weights_bucket_megabytes`, `engine_kwargs`). Use `hccl` on Ascend NPU.
 
 ## Installation
 

@@ -21,7 +21,7 @@ import time
 from pprint import pprint
 
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
@@ -29,22 +29,8 @@ from verl.utils.fs import copy_to_local
 from rllm.experimental.fully_async.fully_async_trainer import FullyAsyncTrainer
 from rllm.experimental.fully_async.inference_manager import InferenceManager
 from rllm.experimental.fully_async.message_queue import MessageQueue, MessageQueueClient
-from rllm.experimental.fully_async.param_sync import ParameterSynchronizer
 from rllm.experimental.fully_async.rollout_executor import RolloutExecutor
 from rllm.experimental.fully_async.utils import calculate_max_concurrency
-
-
-def _rollout_worker_remote_class(config):
-    """Ray worker class for ``Role.Rollout`` (standalone vLLM/SGLang), matching verl ``TaskRunner.add_actor_rollout_worker`` when ``use_legacy_worker_impl`` is ``disable``."""
-    use_legacy = config.trainer.get("use_legacy_worker_impl", "auto")
-    if use_legacy != "disable":
-        raise ValueError(
-            "Fully-async InferenceManager requires trainer.use_legacy_worker_impl=disable "
-            f"(verl separation path); got {use_legacy!r}."
-        )
-    from verl.workers.engine_workers import ActorRolloutRefWorker
-
-    return ray.remote(ActorRolloutRefWorker)
 
 
 def create_task_runner_with_rollout_fn(rollout_fn, val_rollout_fn=None):
@@ -95,7 +81,6 @@ class FullyAsyncTaskRunner:
         self.trainer = None
         self.message_queue = None
         self.message_queue_client = None
-        self.param_synchronizer = None
         self.rollout_executor = None
         self.router_url = None
 
@@ -121,14 +106,16 @@ class FullyAsyncTaskRunner:
 
         self.config = config
 
-        print("[ASYNC MAIN] Creating worker mapping and resource pools...")
-        self.role_worker_mapping, self.ray_worker_group_cls = create_role_worker_mapping(config)
-        # create_role_worker_mapping only returns train-side roles; InferenceManager still needs Role.Rollout.
-        if Role.Rollout not in self.role_worker_mapping:
-            self.role_worker_mapping = dict(self.role_worker_mapping)
-            self.role_worker_mapping[Role.Rollout] = _rollout_worker_remote_class(config)
+        # Standalone rollout uses ``config.rollout.{nnodes,n_gpus_per_node}``; verl AgentLoopManager reads
+        # ``actor_rollout_ref.rollout`` (see rllm-wip ``verl_launcher``).
+        with open_dict(config.actor_rollout_ref.rollout):
+            config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
+            config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
 
-        print("[ASYNC MAIN] Creating InferenceManager...")
+        print("[ASYNC MAIN] Creating worker mapping (train-side only)...")
+        self.role_worker_mapping, self.ray_worker_group_cls = create_role_worker_mapping(config)
+
+        print("[ASYNC MAIN] Creating InferenceManager (standalone rollout)...")
         self._create_inference_manager(config)
 
         print("[ASYNC MAIN] Creating RolloutExecutor...")
@@ -148,36 +135,24 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] Creating FullyAsyncTrainer...")
         self._create_trainer(config)
+        ray.get(self.trainer.init_workers.remote())
 
         # Set total_train_steps and MQ client on trainer
         ray.get(self.trainer.set_total_train_steps.remote(total_train_steps))
         ray.get(self.trainer.set_message_queue_client.remote(self.message_queue_client))
 
-        print("[ASYNC MAIN] Setting up parameter synchronization...")
-        self.param_synchronizer = ParameterSynchronizer.remote(
-            config=config,
-            trainer=self.trainer,
-            inference_manager=self.inference_manager,
-            mq=self.message_queue_client,
-        )
-        ray.get(self.trainer.set_parameter_synchronizer.remote(self.param_synchronizer))
-
-        # Set rollout_executor and router_url on param_synchronizer
-        ray.get(self.param_synchronizer.set_rollout_executor.remote(self.rollout_executor))
-        ray.get(self.param_synchronizer.set_router_url.remote(self.router_url))
+        print("[ASYNC MAIN] Setting up CheckpointEngineManager on trainer...")
+        replicas = ray.get(self.inference_manager.get_replicas.remote())
+        ray.get(self.trainer.setup_checkpoint_manager.remote(replicas))
+        ray.get(self.trainer.set_rollout_executor.remote(self.rollout_executor))
 
         # load checkpoint and sync parameter before doing anything
         val_before_train = config.trainer.get("val_before_train", True)
         # param_version resume from ckpt or default 0
         param_version = ray.get(self.trainer.load_checkpoint.remote())
         ray.get(self.rollout_executor.load_checkpoint.remote())
-        ray.get(
-            self.param_synchronizer.sync_weights.remote(
-                version=param_version,
-                validate=val_before_train,
-            )
-        )
-        ray.get(self.param_synchronizer.wait_last_valid.remote())
+        ray.get(self.trainer.initial_sync_and_validate.remote(param_version, val_before_train))
+        ray.get(self.trainer.wait_last_validate.remote())
 
         print("[ASYNC MAIN] All components initialized successfully")
 
@@ -213,26 +188,10 @@ class FullyAsyncTaskRunner:
         ray.get(self.rollout_executor.set_inference_manager.remote(self.inference_manager))
 
     def _create_inference_manager(self, config) -> None:
-        """Create InferenceManager which manages inference servers (vLLM or SGLang)."""
-        # verl 0.7.1+ (PR #5184) 的 create_resource_pool_manager 不再为 Role.Rollout
-        # 创建资源池（standalone 模式由 AgentLoopManager 自建）。rllm 仍走 hybrid
-        # 模式，需要手动构建 rollout 资源池。
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-
-        rollout_pool_spec = {
-            "rollout_pool": [config.rollout.n_gpus_per_node] * config.rollout.nnodes,
-        }
-        rollout_pool_manager = ResourcePoolManager(
-            resource_pool_spec=rollout_pool_spec,
-            mapping={Role.Rollout: "rollout_pool"},
-        )
-
+        """Create InferenceManager: standalone ``AgentLoopManager`` (no hybrid worker group)."""
         self.inference_manager = InferenceManager.remote(
             config=config,
             tokenizer=self.tokenizer,
-            role_worker_mapping={Role.Rollout: self.role_worker_mapping[Role.Rollout]},
-            resource_pool_manager=rollout_pool_manager,
-            ray_worker_group_cls=self.ray_worker_group_cls,
             processor=self.processor,
             device_name=config.trainer.device,
         )
@@ -256,8 +215,7 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(self.trainer.init_workers.remote())
-        print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
+        print("[ASYNC MAIN] FullyAsyncTrainer actor created (init_workers done in main flow)")
 
     def _run_training_loop(self):
         self.running = True

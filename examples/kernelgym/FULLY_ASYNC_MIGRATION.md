@@ -50,7 +50,7 @@ Dataset ──→ RolloutExecutor ──→ rollout_fn() ──→ MessageQueue 
                  │              │ Trajectory  │  → Sequence[] + reward + metadata
                  │              └─────────────┘
                  │
-          ParameterSynchronizer ← ─ ─ ─ ─ ─ ─ ─ ─ Trainer 参数更新
+          FullyAsyncTrainer + verl CheckpointEngineManager ← ─ ─ Trainer 参数同步（standalone rollout）
 ```
 
 ### 关键设计决策

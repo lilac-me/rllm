@@ -27,7 +27,9 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, apply_kl_penalty, compute_response_mask
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy
+from verl.checkpoint_engine import CheckpointEngineManager
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 
 from rllm.experimental.fully_async.message_queue import MessageQueueClient
@@ -86,7 +88,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ==================== fully async config ====================
 
         self.message_queue_client = None
-        self.param_synchronizer = None
+        self.checkpoint_manager: CheckpointEngineManager | None = None
+        self.rollout_executor = None
+        self._validate_ref = None
 
         # Statistics
         # we start from step 1
@@ -113,9 +117,43 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Set message queue client"""
         self.message_queue_client = message_queue_client
 
-    def set_parameter_synchronizer(self, param_synchronizer):
-        """Set parameter synchronizer"""
-        self.param_synchronizer = param_synchronizer
+    def setup_checkpoint_manager(self, replicas):
+        """Build ``CheckpointEngineManager`` (trainer actor group + standalone rollout replicas)."""
+        ckpt_cfg = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=ckpt_cfg,
+            trainer=self.actor_wg,
+            replicas=replicas,
+        )
+
+    def set_rollout_executor(self, rollout_executor):
+        """RolloutExecutor handle for pause/version/validate during weight sync."""
+        self.rollout_executor = rollout_executor
+
+    def wait_last_validate(self):
+        if self._validate_ref is not None:
+            ray.get(self._validate_ref)
+            self._validate_ref = None
+
+    async def initial_sync_and_validate(self, param_version: int, validate: bool):
+        """First weight push to rollout + optional validation (after trainer/executor checkpoints)."""
+        if self.checkpoint_manager is None or self.rollout_executor is None:
+            raise RuntimeError("Call setup_checkpoint_manager and set_rollout_executor before initial_sync_and_validate")
+        ray.get(self.rollout_executor.pause_business.remote())
+        try:
+            await self.checkpoint_manager.update_weights(global_steps=param_version)
+        finally:
+            pass
+        ray.get(self.rollout_executor.update_param_version.remote(param_version))
+        ray.get(self.rollout_executor.update_staleness_tracking.remote())
+        ray.get(self.rollout_executor.resume_business.remote())
+        need_validate = (
+            self.config.rollout.test_freq > 0
+            and param_version % self.config.rollout.test_freq == 0
+            and param_version > 0
+        ) or validate
+        if need_validate:
+            self._validate_ref = self.rollout_executor.validate.remote(param_version, 0)
 
     def set_total_train_steps(self, total_train_steps):
         self.total_train_steps = total_train_steps
@@ -172,8 +210,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Starting FullyAsyncTrainer...")
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
-        if self.param_synchronizer is None:
-            raise ValueError("param_synchronizer client not set. Call set_parameter_synchronizer() first.")
+        if self.checkpoint_manager is None:
+            raise ValueError("checkpoint_manager not set. Call setup_checkpoint_manager() first.")
+        if self.rollout_executor is None:
+            raise ValueError("rollout_executor not set. Call set_rollout_executor() first.")
 
         from verl.utils.tracking import Tracking
 
@@ -217,12 +257,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # final parameter sync and validate
         # 1. waiting remaining validate task
-        ray.get(self.param_synchronizer.wait_last_valid.remote())
+        self.wait_last_validate()
         self._log_validation_data()
         # 2. perform addtional parameter_sync and validate if trainer already updated
         if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
             await self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
+            self.wait_last_validate()
             self._log_validation_data()
         self.progress_bar.close()
 
@@ -289,7 +329,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self.current_param_version,
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
-        ray.get(self.param_synchronizer.rollout_executor_save_checkpoint.remote(local_global_step_folder))
+        ray.get(self.rollout_executor.save_checkpoint.remote(local_global_step_folder))
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:
@@ -342,6 +382,28 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         return self.current_param_version
 
+    async def _sync_weights_to_rollout(self, validate: bool, global_steps: int | None):
+        """Business pause → ``CheckpointEngineManager.update_weights`` → version/staleness → resume → optional validate."""
+        ray.get(self.rollout_executor.pause_business.remote())
+        try:
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        finally:
+            pass
+        rollout_executor_timing = ray.get(self.rollout_executor.update_param_version.remote(self.current_param_version))
+        ray.get(self.rollout_executor.update_staleness_tracking.remote())
+        ray.get(self.rollout_executor.resume_business.remote())
+
+        need_validate = (
+            self.config.rollout.test_freq > 0
+            and self.current_param_version % self.config.rollout.test_freq == 0
+            and self.current_param_version > 0
+        ) or validate
+        if need_validate:
+            self._validate_ref = self.rollout_executor.validate.remote(self.current_param_version, global_steps or 0)
+        else:
+            self._validate_ref = None
+        return rollout_executor_timing
+
     async def _trigger_parameter_sync_after_step(self, validate: bool = False, global_steps: int = None):
         """
         Trigger parameter synchronization after training step
@@ -361,18 +423,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.metrics_aggregator.reset()
         timing_param_sync = {}
         with marked_timer("timing_s/wait_last_valid", timing_param_sync):
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
+            self.wait_last_validate()
         # Log validation data from the PREVIOUS sync (now completed)
         self._log_validation_data()
         with marked_timer("timing_s/param_sync", timing_param_sync):
-            rollout_executor_timing = ray.get(
-                self.param_synchronizer.sync_weights.remote(
-                    self.current_param_version,
-                    validate=validate,
-                    global_steps=global_steps,
-                )
-            )
-        # Validation is now handled by RolloutExecutor, triggered by ParameterSynchronizer
+            rollout_executor_timing = await self._sync_weights_to_rollout(validate=validate, global_steps=global_steps)
+        # Validation is scheduled inside _sync_weights_to_rollout (async RolloutExecutor.validate)
         # Merge rollout executor timing metrics (rollouter/active_time, rollouter/version_time, rollouter/idle_ratio)
         if rollout_executor_timing:
             timing_param_sync.update(rollout_executor_timing)
