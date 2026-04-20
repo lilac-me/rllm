@@ -188,6 +188,7 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     \
+    trainer.use_legacy_worker_impl=disable \
     trainer.logger=[console] \
     trainer.val_before_train=False \
     trainer.save_freq=${save_freq} \

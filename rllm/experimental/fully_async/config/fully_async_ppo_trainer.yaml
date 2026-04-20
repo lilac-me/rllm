@@ -6,6 +6,11 @@ defaults:
   - ppo_trainer
   - _self_
 
+# verl.experimental.separation.utils.create_role_worker_mapping requires this
+# when ENABLE_FULLY_ASYNC is set (see verl fully_async_ppo_* configs).
+trainer:
+  use_legacy_worker_impl: disable
+
 async_training:
 
   # Maximum samples staleness threshold

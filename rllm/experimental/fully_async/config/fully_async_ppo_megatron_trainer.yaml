@@ -6,6 +6,11 @@ defaults:
   - ppo_megatron_trainer
   - _self_
 
+# verl.experimental.separation.utils.create_role_worker_mapping requires this
+# when ENABLE_FULLY_ASYNC is set (see verl fully_async_ppo_* configs).
+trainer:
+  use_legacy_worker_impl: disable
+
 # Override hybrid_engine: fully-async uses separate rollout processes
 actor_rollout_ref:
   hybrid_engine: False
