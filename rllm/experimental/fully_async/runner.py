@@ -34,6 +34,19 @@ from rllm.experimental.fully_async.rollout_executor import RolloutExecutor
 from rllm.experimental.fully_async.utils import calculate_max_concurrency
 
 
+def _rollout_worker_remote_class(config):
+    """Ray worker class for ``Role.Rollout`` (standalone vLLM/SGLang), matching verl ``TaskRunner.add_actor_rollout_worker`` when ``use_legacy_worker_impl`` is ``disable``."""
+    use_legacy = config.trainer.get("use_legacy_worker_impl", "auto")
+    if use_legacy != "disable":
+        raise ValueError(
+            "Fully-async InferenceManager requires trainer.use_legacy_worker_impl=disable "
+            f"(verl separation path); got {use_legacy!r}."
+        )
+    from verl.workers.engine_workers import ActorRolloutRefWorker
+
+    return ray.remote(ActorRolloutRefWorker)
+
+
 def create_task_runner_with_rollout_fn(rollout_fn, val_rollout_fn=None):
     """
     Factory function that creates a FullyAsyncTaskRunner class with a custom rollout_fn baked in.
@@ -110,6 +123,10 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] Creating worker mapping and resource pools...")
         self.role_worker_mapping, self.ray_worker_group_cls = create_role_worker_mapping(config)
+        # create_role_worker_mapping only returns train-side roles; InferenceManager still needs Role.Rollout.
+        if Role.Rollout not in self.role_worker_mapping:
+            self.role_worker_mapping = dict(self.role_worker_mapping)
+            self.role_worker_mapping[Role.Rollout] = _rollout_worker_remote_class(config)
 
         print("[ASYNC MAIN] Creating InferenceManager...")
         self._create_inference_manager(config)
