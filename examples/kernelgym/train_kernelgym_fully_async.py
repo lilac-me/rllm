@@ -23,6 +23,25 @@ from .kernelgym_rollout import kernelgym_rollout
 # Factory: build rollout_fn with kernel config captured via closure
 # ---------------------------------------------------------------------------
 
+def _row_kwargs_to_task(kwargs: dict) -> dict:
+    """Normalize a dataloader row for ``kernelgym_rollout``.
+
+    ``prepare_kernelbench_data`` registers ``{"task": {...}, "backend": ...}``.
+    Mock / hand-rolled sets often use a flat dict with ``reference_code`` at
+    the top level. ``RolloutExecutor`` expands each parquet/row dict as
+    ``**kwargs``.
+    """
+    inner = kwargs.get("task")
+    if isinstance(inner, dict):
+        task = dict(inner)
+        for k, v in kwargs.items():
+            if k == "task":
+                continue
+            task.setdefault(k, v)
+        return task
+    return dict(kwargs)
+
+
 def make_rollout_fn(kernel_cfg: dict):
     """Return an ``async def rollout_fn(client, tokenizer, **kwargs)`` with
     KernelGYM evaluation parameters baked in via closure.
@@ -47,7 +66,7 @@ def make_rollout_fn(kernel_cfg: dict):
         start_time = time.time()
         param_version_start = client.cur_version
 
-        task = dict(kwargs)
+        task = _row_kwargs_to_task(kwargs)
 
         result = await kernelgym_rollout(
             client=client,
