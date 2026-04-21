@@ -31,7 +31,8 @@ class RolloutExecutor:
 
         num_servers = config.rollout.n_gpus_per_node * config.rollout.nnodes
         # Allow override from config, default to 128 * num_servers
-        self.max_concurrent_rollout = getattr(config.rollout, "max_concurrent_rollout", 128 * num_servers)
+        # self.max_concurrent_rollout = getattr(config.rollout, "max_concurrent_rollout", 128 * num_servers)
+        self.max_concurrent_rollout = 8
         print(f"[RolloutExecutor] num_servers={num_servers}, max_concurrent_rollout={self.max_concurrent_rollout}")
 
         self.result_dict = defaultdict(list)

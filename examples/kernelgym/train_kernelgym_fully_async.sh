@@ -54,7 +54,7 @@ n_nodes_train=${N_NODES_TRAIN:-1}
 rollout_mode="async"
 rollout_name=${ROLLOUT_NAME:-"vllm"}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-$((1024 * 24))}
+max_prompt_length=${MAX_PROMPT_LENGTH:-$((1024 * 8))}
 max_response_length=${MAX_RESPONSE_LENGTH:-$((1024 * 8))}
 
 temperature=1.0
@@ -62,7 +62,7 @@ top_p=1.0
 top_k=-1          # -1 for vLLM rollout, 0 for HF rollout
 val_top_p=0.7     # validation uses lower randomness
 
-n_resp_per_prompt=${N_RESP:-4}
+n_resp_per_prompt=${N_RESP:-2}
 train_prompt_mini_bsz=${TRAIN_MINI_BSZ:-4}
 
 total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$((32 * 100))}
@@ -74,7 +74,7 @@ staleness_threshold=${STALENESS:-0.5}
 trigger_parameter_sync_step=${SYNC_STEP:-2}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
-required_samples=${REQUIRED_SAMPLES:-32}
+required_samples=${REQUIRED_SAMPLES:-8}
 
 # Algorithm
 adv_estimator=grpo
