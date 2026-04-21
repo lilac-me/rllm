@@ -12,6 +12,7 @@ The function mirrors the conversation flow from ``KernelAgent`` +
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -156,6 +157,15 @@ def _compute_reward_simple(
 # Kernel evaluation via HTTP (non-blocking, uses httpx async)
 # ---------------------------------------------------------------------------
 
+_EVAL_SEMAPHORE = None
+
+def _get_eval_semaphore() -> asyncio.Semaphore:
+    global _EVAL_SEMAPHORE
+    if _EVAL_SEMAPHORE is None:
+        # 限制 KernelGYM 评测的最大并发数，防止发包过多导致 HTTP TimeOut
+        _EVAL_SEMAPHORE = asyncio.Semaphore(32)
+    return _EVAL_SEMAPHORE
+
 async def _evaluate_kernel_async(
     task: dict,
     kernel_code: str,
@@ -212,9 +222,17 @@ async def _evaluate_kernel_async(
             "error_message": msg,
         }
 
+    # Server-side ``timeout`` is only a hint inside the payload; the HTTP client must
+    # allow long enough **read** time for queued work (many concurrent rollouts -> Kernel
+    # backlog). A bare ``timeout + 60`` is easy to mis-tune; use explicit phases.
+    read_s = max(float(timeout) * 3.0, float(timeout) + 300.0, 600.0)
+    httpx_timeout = httpx.Timeout(connect=60.0, read=read_s, write=60.0, pool=read_s)
+
     try:
-        async with httpx.AsyncClient(timeout=timeout + 60) as http_client:
-            resp = await http_client.post(f"{server_url}/evaluate", json=payload)
+        sema = _get_eval_semaphore()
+        async with sema:
+            async with httpx.AsyncClient(timeout=httpx_timeout) as http_client:
+                resp = await http_client.post(f"{server_url}/evaluate", json=payload)
             if resp.status_code >= 400:
                 body = (resp.text or "")[:4000]
                 return _fail(
@@ -231,7 +249,12 @@ async def _evaluate_kernel_async(
             except ValueError as exc:
                 return _fail(f"invalid JSON from evaluate: {exc}", body_preview=(resp.text or "")[:2000])
     except httpx.RequestError as exc:
-        return _fail(f"transport: {exc!r}", exc_type=type(exc).__name__)
+        return _fail(
+            f"transport: {exc!r}",
+            exc_type=type(exc).__name__,
+            httpx_read_timeout_s=read_s,
+            payload_timeout_s=timeout,
+        )
     except Exception as exc:
         return _fail(f"{type(exc).__name__}: {exc!r}")
 
