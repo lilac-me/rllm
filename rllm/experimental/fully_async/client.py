@@ -6,8 +6,9 @@ import httpx
 from rllm.experimental.fully_async.protocol import OutputChunk, OutputWithVersion
 from rllm.parser.tool_parser import ToolParser
 
-# ── Sampling params that vLLM OpenAI API only accepts in extra_body ──
-_VLLM_EXTRA_BODY_KEYS = {"top_k", "repetition_penalty", "min_p", "min_tokens"}
+# ── vLLM /v1/completions: these are top-level fields on CompletionRequest (not nested extra_body).
+# ``extra_body`` is for the OpenAI *Python* client SDK, not raw JSON to the HTTP API.
+_VLLM_COMPLETIONS_ROOT_KEYS = {"top_k", "repetition_penalty", "min_p", "min_tokens"}
 
 
 class RolloutClient:
@@ -134,12 +135,6 @@ class RolloutClient:
         if "max_new_tokens" in sp:
             sp["max_tokens"] = sp.pop("max_new_tokens")
 
-        # Build extra_body for vLLM-specific params not in OpenAI spec
-        extra_body: dict[str, Any] = {}
-        for key in list(sp.keys()):
-            if key in _VLLM_EXTRA_BODY_KEYS:
-                extra_body[key] = sp.pop(key)
-
         # Construct OpenAI /v1/completions request
         payload: dict[str, Any] = {
             "model": self.model_name,
@@ -147,13 +142,15 @@ class RolloutClient:
             "logprobs": 1,
             "echo": False,
         }
+        # vLLM-specific sampling params (CompletionRequest top-level; do not wrap in extra_body)
+        for key in list(sp.keys()):
+            if key in _VLLM_COMPLETIONS_ROOT_KEYS:
+                payload[key] = sp.pop(key)
+
         # Map standard sampling params
         for key in ("temperature", "top_p", "max_tokens", "stop", "n", "frequency_penalty", "presence_penalty"):
             if key in sp:
                 payload[key] = sp[key]
-
-        if extra_body:
-            payload["extra_body"] = extra_body
 
         response = await self._post(self.router_url + "/v1/completions", payload)
 
