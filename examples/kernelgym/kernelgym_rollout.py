@@ -51,7 +51,8 @@ Your previous kernel submission was evaluated. Here is the feedback:
 {feedback}
 
 Please revise your `ModelNew` implementation to fix the issues above. \
-Remember to wrap your final code in `<kernel>` ... `</kernel>` tags.
+Remember to wrap your **complete** final code in `<kernel>` ... `</kernel>` tags \
+(the code inside tags must be substantive — at least a full kernel, not a few words).
 """
 
 
@@ -77,25 +78,52 @@ def _strip_thinking(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     return out
 
 
+def _content_for_kernel_extraction(response: str) -> str:
+    """Align with ``KernelAgent.update_from_model`` (``kernelgym_agent.py``).
+
+    When the model emits exactly one ``</redacted_thinking>`` marker, kernel code is
+    taken from the suffix (answer) only — same string that would be passed to
+    ``KernelGymEnv.step`` in the hybrid path.
+    """
+    if response.count("</redacted_thinking>") == 1:
+        _, _, answer = response.partition("</redacted_thinking>")
+        return answer.strip()
+    return response.strip()
+
+
+# KernelGYM server validates ``kernel_code`` length (e.g. >= 10). Prefer extractions that satisfy it.
+_MIN_KERNEL_CODE_CHARS = 10
+
+
 def _extract_kernel_code(text: str) -> str:
     """Extract kernel code from an LLM response.
 
-    Priority:
-    1. ``<kernel>...</kernel>`` tags.
-    2. Last ```python|cuda|triton ... ``` fenced block.
-    3. Entire text as fallback.
+    Collects candidates from ``<kernel>`` blocks and fenced code blocks, then prefers the
+    **longest** segment that meets ``_MIN_KERNEL_CODE_CHARS`` so accidental tiny
+    ``<kernel>and</kernel>`` matches do not beat a real ```triton``` block (first turn
+    uses fenced code per system prompt; revision turns use ``<kernel>`` tags).
     """
-    tag_match = re.search(r"<kernel>(.*?)</kernel>", text, re.DOTALL)
-    if tag_match:
-        return tag_match.group(1).strip()
+    candidates: list[str] = []
+    for m in re.finditer(r"<kernel>(.*?)</kernel>", text, re.DOTALL):
+        s = m.group(1).strip()
+        if s:
+            candidates.append(s)
 
     fence_matches = re.findall(
         r"```(?:python|cuda|triton)?\n?(.*?)```", text, re.DOTALL
     )
-    if fence_matches:
-        return fence_matches[-1].strip()
+    candidates.extend(s.strip() for s in fence_matches if s.strip())
 
-    return text.strip()
+    whole = text.strip()
+    if whole:
+        candidates.append(whole)
+
+    if not candidates:
+        return ""
+
+    long_enough = [c for c in candidates if len(c) >= _MIN_KERNEL_CODE_CHARS]
+    pool = long_enough if long_enough else candidates
+    return max(pool, key=len)
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +219,12 @@ async def _evaluate_kernel_async(
     prefix_max_len = max_task_id_len - (1 + len(suffix))
     safe_prefix = problem_id[:prefix_max_len] if prefix_max_len > 0 else "task"
     task_id = f"{safe_prefix}_{suffix}"
+    kc = (kernel_code or "").strip()
+
     payload = {
         "task_id": task_id,
         "reference_code": task.get("reference_code", ""),
-        "kernel_code": kernel_code,
+        "kernel_code": kc,
         "toolkit": task.get("toolkit", toolkit),
         "backend_adapter": task.get("backend_adapter", backend_adapter),
         "backend": task.get("backend", backend),
@@ -206,7 +236,6 @@ async def _evaluate_kernel_async(
         "workflow": task.get("workflow", "kernelbench"),
     }
 
-    kc = kernel_code or ""
     ref = payload.get("reference_code") or ""
 
     def _fail(msg: str, **extra: Any) -> dict[str, Any]:
@@ -221,6 +250,14 @@ async def _evaluate_kernel_async(
             "status": "failed",
             "error_message": msg,
         }
+
+    if len(kc) < _MIN_KERNEL_CODE_CHARS:
+        return _fail(
+            f"kernel_code too short ({len(kc)} chars; min {_MIN_KERNEL_CODE_CHARS})",
+            kernel_len=len(kc),
+            ref_len=len(ref),
+            skipped_http=True,
+        )
 
     # Server-side ``timeout`` is only a hint inside the payload; the HTTP client must
     # allow long enough **read** time for queued work (many concurrent rollouts -> Kernel
@@ -325,8 +362,8 @@ async def kernelgym_rollout(
             trajectory.append(output.to_sequence())
             total_completion_tokens += output.num_output_tokens
 
-            # --- Extract kernel code ---
-            kernel_code = _extract_kernel_code(content)
+            # --- Extract kernel code (same input scope as hybrid ``KernelAgent`` → ``env.step``) ---
+            kernel_code = _extract_kernel_code(_content_for_kernel_extraction(content))
 
             # --- Evaluate ---
             eval_start = time.time()
