@@ -29,7 +29,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
 # ── Paths ────────────────────────────────────────────────────────────────
-MODEL_PATH=${MODEL_PATH:-"/home/g00841271/Qwen3-Coder-30B-A3B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"/home/g00841271/Qwen3-8B"}
 CKPTS_DIR=${CKPTS_DIR:-"./checkpoints/kernelgym-fully-async"}
 
 # Dataset (registered name or file path)
@@ -39,14 +39,14 @@ TRAIN_FILE=${TRAIN_FILE:-""}
 TEST_FILE=${TEST_FILE:-""}
 
 # KernelGYM evaluation server
-KERNEL_SERVER_URL=${KERNEL_SERVER_URL:-"http://localhost:8000"}
+KERNEL_SERVER_URL=${KERNEL_SERVER_URL:-"http://80.48.5.53:8002"}
 KERNEL_BACKEND=${KERNEL_BACKEND:-"triton"}
 KERNEL_MAX_TURNS=${KERNEL_MAX_TURNS:-3}
 KERNEL_TIMEOUT=${KERNEL_TIMEOUT:-300}
 
 # ── Cluster topology ─────────────────────────────────────────────────────
 n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
-n_gpus_training=${N_GPUS_TRAINING:-4}
+n_gpus_training=${N_GPUS_TRAINING:-8}
 n_nodes_rollout=${N_NODES_ROLLOUT:-1}
 n_nodes_train=${N_NODES_TRAIN:-1}
 
@@ -67,14 +67,14 @@ train_prompt_mini_bsz=${TRAIN_MINI_BSZ:-4}
 
 total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$((32 * 100))}
 test_freq=${TEST_FREQ:-9999}
-save_freq=${SAVE_FREQ:-50}
+save_freq=${SAVE_FREQ:-9999}
 
 # Async training control
 staleness_threshold=${STALENESS:-0.5}
 trigger_parameter_sync_step=${SYNC_STEP:-2}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
-required_samples=${REQUIRED_SAMPLES:-128}
+required_samples=${REQUIRED_SAMPLES:-32}
 
 # Algorithm
 adv_estimator=grpo
@@ -135,7 +135,6 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.entropy_coeff=0 \
     \
