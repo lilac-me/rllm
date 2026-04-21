@@ -172,7 +172,15 @@ async def _evaluate_kernel_async(
 
     import httpx
 
-    task_id = f"{task.get('problem_id', 'task')}_{uuid.uuid4().hex[:16]}"
+    # KernelGYM service enforces task_id length <= 100.
+    # Keep a deterministic prefix from problem_id and a random suffix for uniqueness.
+    problem_id = str(task.get("problem_id", "task"))
+    suffix = uuid.uuid4().hex[:16]
+    max_task_id_len = 100
+    # Reserve 1 char for "_" + suffix.
+    prefix_max_len = max_task_id_len - (1 + len(suffix))
+    safe_prefix = problem_id[:prefix_max_len] if prefix_max_len > 0 else "task"
+    task_id = f"{safe_prefix}_{suffix}"
     payload = {
         "task_id": task_id,
         "reference_code": task.get("reference_code", ""),
