@@ -188,20 +188,44 @@ async def _evaluate_kernel_async(
         "workflow": task.get("workflow", "kernelbench"),
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout + 60) as http_client:
-            resp = await http_client.post(f"{server_url}/evaluate", json=payload)
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as exc:
-        logger.warning("KernelGYM eval failed for %s: %s", task_id, exc)
+    kc = kernel_code or ""
+    ref = payload.get("reference_code") or ""
+
+    def _fail(msg: str, **extra: Any) -> dict[str, Any]:
+        if extra:
+            logger.warning("KernelGYM eval failed for %s: %s | %s", task_id, msg, extra)
+        else:
+            logger.warning("KernelGYM eval failed for %s: %s", task_id, msg)
         return {
             "compiled": False,
             "correctness": False,
             "speedup": None,
             "status": "failed",
-            "error_message": str(exc),
+            "error_message": msg,
         }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout + 60) as http_client:
+            resp = await http_client.post(f"{server_url}/evaluate", json=payload)
+            if resp.status_code >= 400:
+                body = (resp.text or "")[:4000]
+                return _fail(
+                    f"HTTP {resp.status_code}",
+                    http_status=resp.status_code,
+                    body_preview=body,
+                    kernel_len=len(kc),
+                    ref_len=len(ref),
+                    backend=payload.get("backend"),
+                    kernel_empty=not kc.strip(),
+                )
+            try:
+                return resp.json()
+            except ValueError as exc:
+                return _fail(f"invalid JSON from evaluate: {exc}", body_preview=(resp.text or "")[:2000])
+    except httpx.RequestError as exc:
+        return _fail(f"transport: {exc!r}", exc_type=type(exc).__name__)
+    except Exception as exc:
+        return _fail(f"{type(exc).__name__}: {exc!r}")
 
 
 # ---------------------------------------------------------------------------
