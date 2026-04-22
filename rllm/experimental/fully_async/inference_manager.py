@@ -114,14 +114,17 @@ class InferenceManager:
             self.router_url = f"http://{ip}:{actual_port}"
         else:
             self.router_process = None
-            self.router_url = urls[0]
+            # Multi-replica: join all URLs so RolloutClient can round-robin across
+            # them.  Single-replica deployments get a plain URL (no comma), which
+            # is handled identically by the client.
+            self.router_url = ",".join(urls)
             if len(urls) > 1:
                 print(
-                    f"[InferenceManager] WARNING: {rollout_name} has {len(urls)} replicas but only "
-                    f"the first ({self.router_url}) is used. Multi-replica load balancing requires "
-                    f"an external L7 proxy."
+                    f"[InferenceManager] {rollout_name} has {len(urls)} replicas; "
+                    f"RolloutClient will round-robin across: {urls}"
                 )
-            print(f"[InferenceManager] Using {rollout_name} server directly at {self.router_url}")
+            else:
+                print(f"[InferenceManager] Using {rollout_name} server directly at {self.router_url}")
 
         return self.router_url
 

@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 from typing import Any
 
 import httpx
@@ -21,7 +22,14 @@ class RolloutClient:
         backend: str = "sglang",
         model_name: str | None = None,
     ):
-        self.router_url = router_url
+        # Support multiple backend URLs (comma-separated) for vLLM multi-replica
+        # round-robin load balancing.  Single-URL and SGLang cases are unaffected.
+        raw_urls = [u.strip() for u in router_url.split(",") if u.strip()]
+        self._urls: list[str] = raw_urls if raw_urls else [router_url]
+        self._url_cycle = itertools.cycle(self._urls)
+        # Kept for backward compat (abort/resume helpers, logging, etc.)
+        self.router_url = self._urls[0]
+
         self.tokenizer = tokenizer
         self.parser = ToolParser.get_parser(tokenizer)
         self._max_concurrency = max_concurrency
@@ -42,6 +50,15 @@ class RolloutClient:
         self.max_tokens = max_tokens
         self.resume_event = asyncio.Event()
         self.resume_event.set()
+
+    def _next_url(self) -> str:
+        """Return the next backend URL in round-robin order.
+
+        For a single-URL client this always returns the same URL.
+        For multi-replica vLLM deployments this distributes requests evenly
+        across all replicas without external infrastructure changes.
+        """
+        return next(self._url_cycle)
 
     @property
     def max_concurrency(self) -> int:
@@ -93,7 +110,7 @@ class RolloutClient:
             "return_logprob": True,
         }
 
-        response = await self._post(self.router_url + "/generate", payload)
+        response = await self._post(self._next_url() + "/generate", payload)
 
         finish_reason_obj = response["meta_info"].get("finish_reason")
         output.finish_reason = finish_reason_obj["type"] if finish_reason_obj else "unknown"
@@ -152,7 +169,7 @@ class RolloutClient:
             if key in sp:
                 payload[key] = sp[key]
 
-        response = await self._post(self.router_url + "/v1/completions", payload)
+        response = await self._post(self._next_url() + "/v1/completions", payload)
 
         choice = response["choices"][0]
         finish_reason_raw = choice.get("finish_reason", "unknown") or "unknown"
