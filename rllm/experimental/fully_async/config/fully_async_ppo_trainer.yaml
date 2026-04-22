@@ -81,3 +81,31 @@ actor_rollout_ref:
   actor:
     # Whether to use rollout log probs for training
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+
+# KernelGYM (fully-async / examples.kernelgym.train_kernelgym_fully_async) — used via ``config.kernel``
+kernel:
+  server_url: http://localhost:8000
+  max_turns: 3
+  timeout: 300
+  task_timeout_in_client: 600
+  num_correct_trials: 5
+  num_perf_trials: 100
+  toolkit: kernelbench
+  backend_adapter: kernelbench
+  backend: cuda
+  reference_backend: null
+  max_retries: 3
+  rate_limit: 8
+  acquire_timeout: 120
+  reward_func_name: calculate_reward_like_kernel
+  is_valid: true
+  detect_decoy_kernel: true
+  enable_profiling: true
+  verbose_errors: true
+  workflow: kernelbench
+  rerun_on_anomaly_speedup: true
+  reward_config: {}
+  # Whether to stop the multi-turn loop as soon as the kernel compiles and is
+  # correct.  Set to false for speedup-based rewards (calculate_reward_speedup /
+  # calculate_reward_weighted) so the agent can continue to improve performance.
+  early_exit_on_correct: false

@@ -43,6 +43,12 @@ KERNEL_SERVER_URL=${KERNEL_SERVER_URL:-"http://80.48.5.53:8002"}
 KERNEL_BACKEND=${KERNEL_BACKEND:-"triton"}
 KERNEL_MAX_TURNS=${KERNEL_MAX_TURNS:-3}
 KERNEL_TIMEOUT=${KERNEL_TIMEOUT:-300}
+KERNEL_RATE_LIMIT=${KERNEL_RATE_LIMIT:-8}          # max concurrent /evaluate submits per server
+KERNEL_ACQUIRE_TIMEOUT=${KERNEL_ACQUIRE_TIMEOUT:-120}  # semaphore acquire wait timeout (s)
+KERNEL_REWARD_FUNC=${KERNEL_REWARD_FUNC:-"calculate_reward_like_kernel"}  # or calculate_reward_speedup / calculate_reward_weighted
+KERNEL_REFERENCE_BACKEND=${KERNEL_REFERENCE_BACKEND:-""}  # leave empty to use KERNEL_BACKEND
+KERNEL_RERUN_ON_ANOMALY=${KERNEL_RERUN_ON_ANOMALY:-True}   # re-evaluate anomalous speedup once
+KERNEL_EARLY_EXIT=${KERNEL_EARLY_EXIT:-False}              # False keeps multi-turn alive for speedup-based reward
 
 # ── Cluster topology ─────────────────────────────────────────────────────
 n_gpus_rollout=${N_GPUS_ROLLOUT:-4}
@@ -218,4 +224,10 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     ++kernel.toolkit=kernelbench \
     ++kernel.timeout=${KERNEL_TIMEOUT} \
     ++kernel.num_correct_trials=5 \
-    ++kernel.num_perf_trials=100
+    ++kernel.num_perf_trials=100 \
+    ++kernel.rate_limit=${KERNEL_RATE_LIMIT} \
+    ++kernel.acquire_timeout=${KERNEL_ACQUIRE_TIMEOUT} \
+    ++kernel.reward_func_name=${KERNEL_REWARD_FUNC} \
+    ++kernel.rerun_on_anomaly_speedup=${KERNEL_RERUN_ON_ANOMALY} \
+    ++kernel.early_exit_on_correct=${KERNEL_EARLY_EXIT} \
+    $([ -n "${KERNEL_REFERENCE_BACKEND}" ] && echo "++kernel.reference_backend=${KERNEL_REFERENCE_BACKEND}")

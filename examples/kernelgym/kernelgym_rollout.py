@@ -8,6 +8,10 @@ The function mirrors the conversation flow from ``KernelAgent`` +
 ``KernelGymEnv`` but talks to the LLM through ``RolloutClient``
 (HTTP-based, version-aware) instead of the synchronous
 ``AgentExecutionEngine``.
+
+Eval + reward are aligned with rllm-071: ``POST /evaluate`` then poll
+``/status`` + ``/results``, then the same reward functions as
+``KernelGymEnv`` (``calculate_reward_like_kernel`` / weighted / speedup).
 """
 
 from __future__ import annotations
@@ -16,7 +20,18 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from typing import Any, Optional
+
+from rllm.environments.kernelgym.kernelgym_eval_hybrid_async import (
+    async_submit_and_poll,
+)
+from rllm.environments.kernelgym.kernelgym_reward_ops import (
+    KernelGymHybridRewardParams,
+    KernelGymRewardOps,
+    preflight_failure_result,
+    preflight_validate,
+)
 
 from rllm.experimental.fully_async.protocol import Trajectory
 
@@ -60,6 +75,7 @@ Remember to wrap your **complete** final code in `<kernel>` ... `</kernel>` tags
 # Kernel code extraction
 # ---------------------------------------------------------------------------
 
+
 def _strip_thinking(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     """Return a shallow copy of *messages* with ``<think>...</think>`` blocks
     removed from all assistant messages except the last one.
@@ -79,30 +95,18 @@ def _strip_thinking(messages: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _content_for_kernel_extraction(response: str) -> str:
-    """Align with ``KernelAgent.update_from_model`` (``kernelgym_agent.py``).
-
-    When the model emits exactly one ``</redacted_thinking>`` marker, kernel code is
-    taken from the suffix (answer) only — same string that would be passed to
-    ``KernelGymEnv.step`` in the hybrid path.
-    """
-    if response.count("</redacted_thinking>") == 1:
-        _, _, answer = response.partition("</redacted_thinking>")
+    """Align with ``KernelAgent.update_from_model`` (``kernelgym_agent.py``)."""
+    if response.count("</think>") == 1:
+        _, _, answer = response.partition("</think>")
         return answer.strip()
     return response.strip()
 
 
-# KernelGYM server validates ``kernel_code`` length (e.g. >= 10). Prefer extractions that satisfy it.
 _MIN_KERNEL_CODE_CHARS = 10
 
 
 def _extract_kernel_code(text: str) -> str:
-    """Extract kernel code from an LLM response.
-
-    Collects candidates from ``<kernel>`` blocks and fenced code blocks, then prefers the
-    **longest** segment that meets ``_MIN_KERNEL_CODE_CHARS`` so accidental tiny
-    ``<kernel>and</kernel>`` matches do not beat a real ```triton``` block (first turn
-    uses fenced code per system prompt; revision turns use ``<kernel>`` tags).
-    """
+    """Extract kernel code from an LLM response (same as before)."""
     candidates: list[str] = []
     for m in re.finditer(r"<kernel>(.*?)</kernel>", text, re.DOTALL):
         s = m.group(1).strip()
@@ -127,8 +131,9 @@ def _extract_kernel_code(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Feedback builder (same logic as KernelGymEnv._build_feedback)
+# Feedback builder
 # ---------------------------------------------------------------------------
+
 
 def _build_feedback(
     compiled: bool,
@@ -136,7 +141,7 @@ def _build_feedback(
     speedup: Optional[float],
     error_message: Optional[str],
 ) -> str:
-    lines = []
+    lines: list[str] = []
     if not compiled:
         lines.append("❌ Compilation FAILED.")
         if error_message:
@@ -158,147 +163,161 @@ def _build_feedback(
 
 
 # ---------------------------------------------------------------------------
-# Reward computation (lightweight fallback, same as kernelgym_env.py)
+# Hybrid evaluate + rllm-071 reward (async)
 # ---------------------------------------------------------------------------
 
-_W_COMPILED = 0.1
-_W_CORRECT = 0.3
-_W_SPEEDUP = 0.6
-_SPEEDUP_CLIP_MAX = 10.0
+_EVAL_SEMAPHORE: asyncio.Semaphore | None = None
 
 
-def _compute_reward_simple(
-    compiled: bool,
-    correctness: Optional[bool],
-    speedup: Optional[float],
-) -> float:
-    r = _W_COMPILED * float(compiled)
-    if correctness:
-        r += _W_CORRECT
-    if speedup is not None and speedup > 0:
-        clipped = min(speedup, _SPEEDUP_CLIP_MAX)
-        r += _W_SPEEDUP * (clipped / _SPEEDUP_CLIP_MAX)
-    return round(r, 4)
-
-
-# ---------------------------------------------------------------------------
-# Kernel evaluation via HTTP (non-blocking, uses httpx async)
-# ---------------------------------------------------------------------------
-
-_EVAL_SEMAPHORE = None
-
-def _get_eval_semaphore() -> asyncio.Semaphore:
+def _get_global_eval_semaphore() -> asyncio.Semaphore:
     global _EVAL_SEMAPHORE
     if _EVAL_SEMAPHORE is None:
-        # 限制 KernelGYM 评测的最大并发数，防止发包过多导致 HTTP TimeOut
         _EVAL_SEMAPHORE = asyncio.Semaphore(32)
     return _EVAL_SEMAPHORE
 
-async def _evaluate_kernel_async(
+
+async def _evaluate_and_score_turn(
     task: dict,
     kernel_code: str,
+    *,
     server_url: str,
-    timeout: int = 300,
-    num_correct_trials: int = 5,
-    num_perf_trials: int = 100,
-    toolkit: str = "kernelbench",
-    backend_adapter: str = "kernelbench",
-    backend: str = "cuda",
+    reward_ops: KernelGymRewardOps,
+    num_correct_trials: int,
+    num_perf_trials: int,
+    per_task_timeout: int,
+    per_task_timeout_in_client: int,
+    max_retries: int | None,
+    rate_limit: int,
+    acquire_timeout: int,
+    reference_backend: str | None,
+    toolkit: str,
+    backend_adapter: str,
+    workflow: str,
+    is_valid: bool,
+    detect_decoy_kernel: bool,
+    enable_profiling: bool,
+    verbose_errors: bool,
+    rerun_on_anomaly_speedup: bool,
 ) -> dict[str, Any]:
-    """POST to KernelGYM eval server asynchronously."""
-    import uuid
-
-    import httpx
-
-    # KernelGYM service enforces task_id length <= 100.
-    # Keep a deterministic prefix from problem_id and a random suffix for uniqueness.
+    """Run async submit/poll, apply hybrid reward, optional anomaly re-run."""
+    kc = (kernel_code or "").strip()
     problem_id = str(task.get("problem_id", "task"))
     suffix = uuid.uuid4().hex[:16]
     max_task_id_len = 100
-    # Reserve 1 char for "_" + suffix.
     prefix_max_len = max_task_id_len - (1 + len(suffix))
     safe_prefix = problem_id[:prefix_max_len] if prefix_max_len > 0 else "task"
     task_id = f"{safe_prefix}_{suffix}"
-    kc = (kernel_code or "").strip()
 
-    payload = {
-        "task_id": task_id,
-        "reference_code": task.get("reference_code", ""),
-        "kernel_code": kc,
-        "toolkit": task.get("toolkit", toolkit),
-        "backend_adapter": task.get("backend_adapter", backend_adapter),
-        "backend": task.get("backend", backend),
-        "entry_point": task.get("entry_point", "Model"),
-        "num_correct_trials": num_correct_trials,
-        "num_perf_trials": num_perf_trials,
-        "timeout": timeout,
-        "priority": "normal",
-        "workflow": task.get("workflow", "kernelbench"),
-    }
+    entry_point = str(task.get("entry_point", "Model"))
+    ref_code = str(task.get("reference_code", ""))
 
-    ref = payload.get("reference_code") or ""
-
-    def _fail(msg: str, **extra: Any) -> dict[str, Any]:
-        if extra:
-            logger.warning("KernelGYM eval failed for %s: %s | %s", task_id, msg, extra)
-        else:
-            logger.warning("KernelGYM eval failed for %s: %s", task_id, msg)
-        return {
-            "compiled": False,
-            "correctness": False,
-            "speedup": None,
+    def _synthetic_fail(msg: str) -> dict[str, Any]:
+        ret = {
             "status": "failed",
             "error_message": msg,
+            "error": msg,
+            "task_id": task_id,
+            "compiled": False,
+            "correctness": False,
+            "speedup": 0.0,
         }
+        return reward_ops.apply_reward(ret)
 
     if len(kc) < _MIN_KERNEL_CODE_CHARS:
-        return _fail(
-            f"kernel_code too short ({len(kc)} chars; min {_MIN_KERNEL_CODE_CHARS})",
-            kernel_len=len(kc),
-            ref_len=len(ref),
-            skipped_http=True,
+        return _synthetic_fail(
+            f"kernel_code too short ({len(kc)} chars; min {_MIN_KERNEL_CODE_CHARS})"
         )
 
-    # Server-side ``timeout`` is only a hint inside the payload; the HTTP client must
-    # allow long enough **read** time for queued work (many concurrent rollouts -> Kernel
-    # backlog). A bare ``timeout + 60`` is easy to mis-tune; use explicit phases.
-    read_s = max(float(timeout) * 3.0, float(timeout) + 300.0, 600.0)
-    httpx_timeout = httpx.Timeout(connect=60.0, read=read_s, write=60.0, pool=read_s)
+    ok, missing = preflight_validate(ref_code, kc, entry_point)
+    if not ok:
+        logger.info("KernelGYM preflight failed: %s", missing)
+        pre = preflight_failure_result(
+            f"Client validation failed: missing {missing}",
+            penalty=reward_ops.p.penalty_score,
+            task_id=task_id,
+        )
+        return reward_ops.apply_reward(pre)
 
-    try:
-        sema = _get_eval_semaphore()
+    p_timeout = int(task.get("task_timeout", per_task_timeout))
+    p_client = int(
+        task.get("task_timeout_in_client", per_task_timeout_in_client)
+    )
+    if p_client < p_timeout:
+        p_client = p_timeout
+
+    backend_value = task.get("reference_backend", reference_backend)
+    if backend_value is None:
+        backend_value = task.get("backend", "cuda")
+
+    payload: dict[str, Any] = {
+        # Always use locally-generated task_id: never inherit from dataset row to
+        # guarantee uniqueness across concurrent rollouts (H2 fix).
+        "task_id": task_id,
+        "reference_code": ref_code,
+        "kernel_code": kc,
+        "backend": backend_value,
+        "num_correct_trials": int(task.get("num_correct_trials", num_correct_trials)),
+        "num_perf_trials": int(task.get("num_perf_trials", num_perf_trials)),
+        "timeout": p_timeout,
+        "priority": "normal",
+        "entry_point": entry_point,
+        "is_valid": bool(task.get("is_valid", is_valid)),
+        "verbose_errors": bool(task.get("verbose_errors", verbose_errors)),
+        "enable_profiling": bool(task.get("enable_profiling", enable_profiling)),
+        "detect_decoy_kernel": bool(task.get("detect_decoy_kernel", detect_decoy_kernel)),
+        "reference_backend": task.get("reference_backend", reference_backend),
+    }
+    if payload["is_valid"]:
+        payload["detect_decoy_kernel"] = True
+
+    # Optional fields for server versions that expect KernelBench-style metadata
+    payload["toolkit"] = str(task.get("toolkit", toolkit))
+    payload["backend_adapter"] = str(task.get("backend_adapter", backend_adapter))
+    payload["workflow"] = str(task.get("workflow", workflow))
+
+    async def _one_eval(override_task_id: str | None = None) -> dict[str, Any]:
+        # Use override_task_id when provided (e.g. anomaly rerun) so each
+        # submission has a unique task_id and the server cannot return a cached
+        # result from the previous attempt (H1 fix).
+        p = payload if override_task_id is None else {**payload, "task_id": override_task_id}
+        sema = _get_global_eval_semaphore()
         async with sema:
-            async with httpx.AsyncClient(timeout=httpx_timeout) as http_client:
-                resp = await http_client.post(f"{server_url}/evaluate", json=payload)
-            if resp.status_code >= 400:
-                body = (resp.text or "")[:4000]
-                return _fail(
-                    f"HTTP {resp.status_code}",
-                    http_status=resp.status_code,
-                    body_preview=body,
-                    kernel_len=len(kc),
-                    ref_len=len(ref),
-                    backend=payload.get("backend"),
-                    kernel_empty=not kc.strip(),
-                )
-            try:
-                return resp.json()
-            except ValueError as exc:
-                return _fail(f"invalid JSON from evaluate: {exc}", body_preview=(resp.text or "")[:2000])
-    except httpx.RequestError as exc:
-        return _fail(
-            f"transport: {exc!r}",
-            exc_type=type(exc).__name__,
-            httpx_read_timeout_s=read_s,
-            payload_timeout_s=timeout,
+            raw = await async_submit_and_poll(
+                server_url,
+                p,
+                default_timeout=p_timeout,
+                client_timeout=p_client,
+                max_retries=max_retries,
+                acquire_timeout=acquire_timeout,
+                rate_limit=rate_limit,
+            )
+        merged = reward_ops.apply_reward(raw)
+        return merged
+
+    merged = await _one_eval()
+
+    su = float(merged.get("speedup") or 0.0)
+    if (
+        rerun_on_anomaly_speedup
+        and su > reward_ops.p.speedup_reward_upper_bound
+    ):
+        logger.warning(
+            "KernelGYM: speedup %.4f > upper bound %.4f, re-executing once",
+            su,
+            reward_ops.p.speedup_reward_upper_bound,
         )
-    except Exception as exc:
-        return _fail(f"{type(exc).__name__}: {exc!r}")
+        # Generate a fresh task_id so the server treats this as a new request
+        # and does not return the anomalous cached result (H1 fix).
+        rerun_task_id = f"{safe_prefix}_{uuid.uuid4().hex[:16]}"
+        merged = await _one_eval(override_task_id=rerun_task_id)
+
+    return merged
 
 
 # ---------------------------------------------------------------------------
 # Core rollout: multi-turn agent loop
 # ---------------------------------------------------------------------------
+
 
 async def kernelgym_rollout(
     client,
@@ -307,25 +326,50 @@ async def kernelgym_rollout(
     system_prompt: str | None = None,
     kernel_server_url: str = "http://localhost:8000",
     kernel_eval_timeout: int = 300,
+    kernel_eval_client_timeout: int | None = None,
     num_correct_trials: int = 5,
     num_perf_trials: int = 100,
     toolkit: str = "kernelbench",
     backend_adapter: str = "kernelbench",
     backend: str = "cuda",
+    reference_backend: str | None = None,
+    is_valid: bool = True,
+    detect_decoy_kernel: bool = True,
+    enable_profiling: bool = True,
+    verbose_errors: bool = True,
+    max_retries: int | None = 3,
+    rate_limit: int = 8,
+    acquire_timeout: int = 120,
+    reward_params: KernelGymHybridRewardParams | None = None,
+    reward_ops: KernelGymRewardOps | None = None,
+    workflow: str = "kernelbench",
+    rerun_on_anomaly_speedup: bool = True,
+    early_exit_on_correct: bool = False,
     sampling_params: dict | None = None,
 ) -> dict[str, Any]:
-    """Run a complete KernelGYM multi-turn episode.
-
-    Returns a dict containing ``trajectory``, ``messages``, ``reward``,
-    and various metrics — same shape the top-level ``rollout_fn`` expects.
-    """
+    """Run a complete KernelGYM multi-turn episode (071-aligned eval + reward)."""
     system_prompt = system_prompt or _SYSTEM_PROMPT
     reference_code = task.get("reference_code", "")
+
+    if reward_ops is not None:
+        rops = reward_ops
+    else:
+        rp = reward_params or KernelGymHybridRewardParams()
+        rops = KernelGymRewardOps(rp)
+
+    client_t = int(
+        kernel_eval_client_timeout
+        if kernel_eval_client_timeout is not None
+        else max(kernel_eval_timeout, 300)
+    )
 
     trajectory = Trajectory(sequences=[], reward=0, metadata={})
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": _INITIAL_USER_TEMPLATE.format(reference_code=reference_code)},
+        {
+            "role": "user",
+            "content": _INITIAL_USER_TEMPLATE.format(reference_code=reference_code),
+        },
     ]
 
     sampling_params = sampling_params or {
@@ -343,12 +387,12 @@ async def kernelgym_rollout(
     last_result: dict[str, Any] = {}
     overlong = False
     num_turns = 0
+    ref_b = reference_backend if reference_backend is not None else backend
 
     try:
         for turn in range(max_turns):
             num_turns = turn + 1
 
-            # --- LLM generation ---
             gen_start = time.time()
             chat_messages = _strip_thinking(messages) if turn > 0 else messages
             response_msg, output = await client.chat_completion(
@@ -362,64 +406,86 @@ async def kernelgym_rollout(
             trajectory.append(output.to_sequence())
             total_completion_tokens += output.num_output_tokens
 
-            # --- Extract kernel code (same input scope as hybrid ``KernelAgent`` → ``env.step``) ---
             kernel_code = _extract_kernel_code(_content_for_kernel_extraction(content))
 
-            # --- Evaluate ---
             eval_start = time.time()
-            result = await _evaluate_kernel_async(
-                task=task,
-                kernel_code=kernel_code,
+            last_result = await _evaluate_and_score_turn(
+                task,
+                kernel_code,
                 server_url=kernel_server_url,
-                timeout=kernel_eval_timeout,
+                reward_ops=rops,
                 num_correct_trials=num_correct_trials,
                 num_perf_trials=num_perf_trials,
+                per_task_timeout=kernel_eval_timeout,
+                per_task_timeout_in_client=client_t,
+                max_retries=max_retries,
+                rate_limit=rate_limit,
+                acquire_timeout=acquire_timeout,
+                reference_backend=ref_b,
                 toolkit=toolkit,
                 backend_adapter=backend_adapter,
-                backend=backend,
+                workflow=workflow,
+                is_valid=is_valid,
+                detect_decoy_kernel=detect_decoy_kernel,
+                enable_profiling=enable_profiling,
+                verbose_errors=verbose_errors,
+                rerun_on_anomaly_speedup=rerun_on_anomaly_speedup,
             )
-            eval_time = time.time() - eval_start
-            total_eval_time += eval_time
-            last_result = result
+            total_eval_time += time.time() - eval_start
 
-            compiled = result.get("compiled", False)
-            correctness = result.get("correctness")
-            speedup = result.get("speedup")
-            error_msg = result.get("error_message")
-
-            if "reward" in result and isinstance(result["reward"], (int, float)):
-                turn_reward = float(result["reward"])
+            compiled = bool(last_result.get("compiled", False))
+            correctness = last_result.get("correctness")
+            speedup = last_result.get("speedup")
+            if isinstance(speedup, (int, float)):
+                spv: Optional[float] = float(speedup)
             else:
-                turn_reward = _compute_reward_simple(compiled, correctness, speedup)
+                spv = None
+            error_msg: str | None = last_result.get("error")
+            if not error_msg:
+                error_msg = last_result.get("error_message")
 
-            last_reward = turn_reward
-            best_reward = max(best_reward, turn_reward)
+            last_reward = rops.score_from_merged(last_result)
+            best_reward = max(best_reward, last_reward)
 
-            is_last_turn = (turn == max_turns - 1)
-            if is_last_turn:
+            if turn == max_turns - 1:
                 break
 
-            if compiled and correctness:
+            # early_exit_on_correct=True: stop as soon as the kernel compiles and
+            # is correct, regardless of speedup.  For speedup-based rewards
+            # (calculate_reward_speedup / calculate_reward_weighted) leave this
+            # False so subsequent turns can continue to improve performance.
+            if early_exit_on_correct and compiled and correctness:
                 break
 
-            # --- Append feedback and continue ---
-            feedback = _build_feedback(compiled, correctness, speedup, error_msg)
+            feedback = _build_feedback(
+                compiled,
+                bool(correctness) if correctness is not None else None,
+                spv,
+                error_msg,
+            )
             messages.append(
-                {"role": "user", "content": _REVISION_USER_TEMPLATE.format(feedback=feedback)}
+                {
+                    "role": "user",
+                    "content": _REVISION_USER_TEMPLATE.format(feedback=feedback),
+                }
             )
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         import traceback
 
         overlong = True
-        logger.warning("KernelGYM rollout error for %s: %s\n%s",
-                        task.get("problem_id", "?"), exc, traceback.format_exc())
+        logger.warning(
+            "KernelGYM rollout error for %s: %s\n%s",
+            task.get("problem_id", "?"),
+            exc,
+            traceback.format_exc(),
+        )
 
-    # Mask all responses when overlong (context exceeded / generation error)
     if overlong:
         for seq in trajectory.sequences:
             seq.response_masks = [0] * len(seq.response_masks)
 
+    lr = last_result
     metrics = {
         "num_turns": num_turns,
         "total_generation_time": total_generation_time,
@@ -427,9 +493,9 @@ async def kernelgym_rollout(
         "total_completion_tokens": total_completion_tokens,
         "last_reward": last_reward,
         "best_reward": best_reward,
-        "compiled": float(last_result.get("compiled", False)),
-        "correctness": float(last_result.get("correctness", False) or False),
-        "speedup": float(last_result.get("speedup") or 0.0),
+        "compiled": float(lr.get("compiled", False)),
+        "correctness": float(lr.get("correctness", False) or False),
+        "speedup": float(lr.get("speedup") or 0.0),
         "problem_id": task.get("problem_id", "unknown"),
         "overlong": float(overlong),
         "merged_step": len(trajectory.merge()),

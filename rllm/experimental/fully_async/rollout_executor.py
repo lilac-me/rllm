@@ -179,10 +179,10 @@ class RolloutExecutor:
         # Aggregate all numeric metrics from user-returned metadata
         all_metadata = [m for _, m in results]
         aggregated_user_metrics = {}
-        if all_metadata:
+        if all_metadata and all_metadata[0] is not None:
             # Collect all keys that have numeric values
             for key in all_metadata[0].keys():
-                values = [m.get(key) for m in all_metadata if key in m]
+                values = [m.get(key) for m in all_metadata if m is not None and key in m]
                 # Only aggregate numeric types
                 if values and all(isinstance(v, int | float | bool) for v in values):
                     aggregated_user_metrics[f"val/{key}"] = float(np.mean([float(v) for v in values]))

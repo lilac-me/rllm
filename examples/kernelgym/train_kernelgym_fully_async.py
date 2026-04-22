@@ -14,6 +14,10 @@ import time
 
 import hydra
 
+from rllm.environments.kernelgym.kernelgym_reward_ops import (
+    KernelGymHybridRewardParams,
+    KernelGymRewardOps,
+)
 from rllm.experimental.fully_async.runner import AsyncAgentTrainer
 
 from .kernelgym_rollout import kernelgym_rollout
@@ -51,16 +55,45 @@ def make_rollout_fn(kernel_cfg: dict):
     server URL, max turns, backend, etc. come from the Hydra config and must
     be captured here.
     """
+    # M4/M5: OmegaConf DictConfig is NOT a plain dict — isinstance(rc, dict)
+    # returns False, which causes reward_config.penalties.* to be silently
+    # dropped in KernelGymHybridRewardParams.from_kernel_mapping.  Convert to
+    # a plain Python dict here so all downstream .get() and isinstance() calls
+    # work correctly regardless of whether Hydra is used.
+    try:
+        from omegaconf import OmegaConf
+        kernel_cfg = OmegaConf.to_container(kernel_cfg, resolve=True, throw_on_missing=False)
+    except Exception:  # omegaconf not installed or already a plain dict
+        pass
+    if not isinstance(kernel_cfg, dict):
+        kernel_cfg = dict(kernel_cfg)
 
     kernel_server_url = kernel_cfg.get("server_url", "http://localhost:8000")
     max_turns = int(kernel_cfg.get("max_turns", 3))
     kernel_eval_timeout = int(kernel_cfg.get("timeout", 300))
+    kernel_eval_client_timeout = kernel_cfg.get("task_timeout_in_client")
+    if kernel_eval_client_timeout is not None:
+        kernel_eval_client_timeout = int(kernel_eval_client_timeout)
     num_correct_trials = int(kernel_cfg.get("num_correct_trials", 5))
     num_perf_trials = int(kernel_cfg.get("num_perf_trials", 100))
     toolkit = kernel_cfg.get("toolkit", "kernelbench")
     backend_adapter = kernel_cfg.get("backend_adapter", toolkit)
     backend = kernel_cfg.get("backend", "cuda")
+    reference_backend = kernel_cfg.get("reference_backend")
     system_prompt = kernel_cfg.get("system_prompt", None)
+    max_retries = kernel_cfg.get("max_retries", 3)
+    rate_limit = int(kernel_cfg.get("rate_limit", 8))
+    acquire_timeout = int(kernel_cfg.get("acquire_timeout", 120))
+    is_valid = bool(kernel_cfg.get("is_valid", True))
+    detect_decoy_kernel = bool(kernel_cfg.get("detect_decoy_kernel", True))
+    enable_profiling = bool(kernel_cfg.get("enable_profiling", True))
+    verbose_errors = bool(kernel_cfg.get("verbose_errors", True))
+    workflow = str(kernel_cfg.get("workflow", "kernelbench"))
+    rerun_on_anomaly = bool(kernel_cfg.get("rerun_on_anomaly_speedup", True))
+    early_exit_on_correct = bool(kernel_cfg.get("early_exit_on_correct", False))
+
+    reward_params = KernelGymHybridRewardParams.from_kernel_mapping(kernel_cfg)
+    reward_ops = KernelGymRewardOps(reward_params)
 
     async def rollout_fn(client, tokenizer, **kwargs):
         start_time = time.time()
@@ -75,11 +108,24 @@ def make_rollout_fn(kernel_cfg: dict):
             system_prompt=system_prompt,
             kernel_server_url=kernel_server_url,
             kernel_eval_timeout=kernel_eval_timeout,
+            kernel_eval_client_timeout=kernel_eval_client_timeout,
             num_correct_trials=num_correct_trials,
             num_perf_trials=num_perf_trials,
             toolkit=toolkit,
             backend_adapter=backend_adapter,
             backend=backend,
+            reference_backend=reference_backend,
+            max_retries=max_retries,
+            rate_limit=rate_limit,
+            acquire_timeout=acquire_timeout,
+            is_valid=is_valid,
+            detect_decoy_kernel=detect_decoy_kernel,
+            enable_profiling=enable_profiling,
+            verbose_errors=verbose_errors,
+            workflow=workflow,
+            rerun_on_anomaly_speedup=rerun_on_anomaly,
+            early_exit_on_correct=early_exit_on_correct,
+            reward_ops=reward_ops,
         )
 
         trajectory = result["trajectory"]
