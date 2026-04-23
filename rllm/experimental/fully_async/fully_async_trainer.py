@@ -616,6 +616,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return data
 
     def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None):
+        from datetime import datetime as _dt
+        def _dbg(msg):
+            print(f"[FullyAsyncTrainer][DEBUG] {_dt.now().strftime('%H:%M:%S.%f')[:-3]} {msg}", flush=True)
+
+        _dbg(f"_process_batch_common ENTER | batch_size={batch.batch['input_ids'].shape} | local_trigger_step={local_trigger_step}")
+        _dbg(f"  use_reference_policy={self.use_reference_policy} use_critic={self.use_critic} critic_warmup={self.config.trainer.critic_warmup} global_steps={self.global_steps}")
+
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
             def compute_old_log_prob(batch):
@@ -665,6 +672,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # add this to ensure to eliminate boundary value stem from packing
             batch.batch["old_log_probs"] = batch.batch["old_log_probs"] * batch.batch["response_mask"]
 
+        _dbg("old_log_prob DONE")
+
         if self.use_reference_policy:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, color="olive"):
@@ -679,6 +688,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             with marked_timer("values", timing_raw, color="cyan"):
                 values = self.critic_wg.compute_values(batch)
                 batch = batch.union(values)
+
+        _dbg("ref_policy & critic DONE (or skipped)")
 
         with marked_timer("adv", timing_raw, color="brown"):
             # compute rewards. apply_kl_penalty if available
@@ -712,7 +723,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             #     config=self.config.algorithm,
             # )
+            _dbg("computing GRPO advantage...")
             batch = self.compute_grpo_advantage(batch, norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo)
+            _dbg("GRPO advantage DONE")
 
         # Some of the rows in batch are padded to be multiple of actor
         # world size, we need to set the attention mask and response mask
@@ -731,13 +744,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             critic_output_metrics = reduce_metrics_with_flatten(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
 
+        _dbg(f"padding/mask fixup DONE | ignore_count={sum(1 for x in ignore_in_loss if x)}")
+
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                _dbg(f">>> _update_actor ENTER | batch keys={list(batch.batch.keys())}")
                 actor_output = self._update_actor(batch)
+                _dbg("<<< _update_actor DONE")
 
             actor_output_metrics = reduce_metrics_with_flatten(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
+        _dbg("_process_batch_common EXIT")
         return batch, {}
