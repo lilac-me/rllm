@@ -57,7 +57,7 @@ ARGS=(
   # =========================
   # data
   # =========================
-  data.train_batch_size=8
+  data.train_batch_size=16
   data.val_batch_size=16
   data.max_prompt_length=16384      # 24K
   data.max_response_length=16384    # 18K
@@ -136,6 +136,7 @@ ARGS=(
   # rollout
   # =========================
   actor_rollout_ref.rollout.tensor_model_parallel_size=2
+  actor_rollout_ref.rollout.calculate_log_probs=True        # 记录 训推的 log_prob 确认是否存在diff
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.mode=async
   actor_rollout_ref.rollout.enforce_eager=False
@@ -143,7 +144,7 @@ ARGS=(
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.8
   actor_rollout_ref.rollout.max_model_len=98304
-  actor_rollout_ref.rollout.n=8
+  actor_rollout_ref.rollout.n=4
   actor_rollout_ref.rollout.val_kwargs.n=4
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0

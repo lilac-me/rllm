@@ -1,0 +1,30 @@
+cluster_name: rllm-ascend-prod
+
+ssh:
+  user: root
+  port: 8022
+
+global:
+  workdir: /home/g00841271/rllm-071
+  python_bin: python3
+  master_addr: rllm-node-61
+  master_port: 29500
+  npus_per_node: 16
+
+ray:
+  head_port: 6380
+  dashboard_port: 8266
+  temp_dir: /tmp/ray
+
+services:
+  reward:
+    host: rllm-node-61
+    port: 8002
+
+nodes:
+  - host: rllm-node-61
+    role: head
+    rank: 0
+  - host: rllm-node-53
+    role: worker
+    rank: 1

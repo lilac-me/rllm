@@ -227,9 +227,14 @@ extra-info
 *.parquet
 litellm_proxy_config_autogen.yaml
 
+!/datasets/kernelbench/*.parquet
+
+
 *.db
 *.db*
 
 *.pickle
 *.csv
 !res[0-9].log
+
+kernel_meta

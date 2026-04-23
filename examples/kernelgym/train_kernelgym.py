@@ -1,4 +1,6 @@
 import hydra
+import os
+os.environ["RLLM_HOME"]=os.path.abspath(os.path.join(os.path.dirname(__file__),"../../"))      #! 为了方便能读取到Dataset
 
 from rllm.agents.kernelgym_agent import KernelAgent
 from rllm.data.dataset import Dataset, DatasetRegistry
@@ -34,8 +36,8 @@ def _load_or_register(name: str, split: str, fallback_path: str) -> Dataset:
 # @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer_megatron", version_base=None)
 def main(config):
-    train_fallback = config.get("data", {}).get("train_files", "data/kernelbench_train.jsonl")
-    val_fallback = config.get("data", {}).get("val_files", "data/kernelbench_val.jsonl")
+    train_fallback = config.get("data", {}).get("train_files", "level_1-00000-of-00001.parquet")
+    val_fallback = config.get("data", {}).get("val_files", "level_1-00000-of-00001.parquet")
 
     train_dataset = _load_or_register("kernelbench", "train", train_fallback)
     test_dataset = _load_or_register("kernelbench", "test", val_fallback)
