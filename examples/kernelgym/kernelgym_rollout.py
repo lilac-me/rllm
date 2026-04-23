@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 import uuid
@@ -176,6 +177,23 @@ def _get_global_eval_semaphore() -> asyncio.Semaphore:
     return _EVAL_SEMAPHORE
 
 
+async def _mock_raw_eval_result(task_id: str) -> dict[str, Any]:
+    """Plausible server-shaped dict for ``reward_ops.apply_reward`` (no HTTP)."""
+    await asyncio.sleep(0.01)
+    compiled = random.random() < 0.82
+    correctness = compiled and random.random() < 0.65
+    speedup = round(random.uniform(0.85, 2.4), 3) if correctness else None
+    return {
+        "status": "completed",
+        "task_id": task_id,
+        "compiled": compiled,
+        "correctness": correctness,
+        "speedup": speedup,
+        "error_message": None,
+        "decoy_kernel": False,
+    }
+
+
 async def _evaluate_and_score_turn(
     task: dict,
     kernel_code: str,
@@ -198,6 +216,7 @@ async def _evaluate_and_score_turn(
     enable_profiling: bool,
     verbose_errors: bool,
     rerun_on_anomaly_speedup: bool,
+    mock_eval: bool = False,
 ) -> dict[str, Any]:
     """Run async submit/poll, apply hybrid reward, optional anomaly re-run."""
     kc = (kernel_code or "").strip()
@@ -237,6 +256,12 @@ async def _evaluate_and_score_turn(
             task_id=task_id,
         )
         return reward_ops.apply_reward(pre)
+
+    if mock_eval:
+        logger.debug("KernelGYM mock_eval: skip HTTP, task_id=%s", task_id)
+        raw = await _mock_raw_eval_result(task_id)
+        merged = reward_ops.apply_reward(raw)
+        return merged
 
     p_timeout = int(task.get("task_timeout", per_task_timeout))
     p_client = int(
@@ -346,6 +371,7 @@ async def kernelgym_rollout(
     rerun_on_anomaly_speedup: bool = True,
     early_exit_on_correct: bool = False,
     sampling_params: dict | None = None,
+    mock_eval: bool = False,
 ) -> dict[str, Any]:
     """Run a complete KernelGYM multi-turn episode (071-aligned eval + reward)."""
     system_prompt = system_prompt or _SYSTEM_PROMPT
@@ -430,6 +456,7 @@ async def kernelgym_rollout(
                 enable_profiling=enable_profiling,
                 verbose_errors=verbose_errors,
                 rerun_on_anomaly_speedup=rerun_on_anomaly_speedup,
+                mock_eval=mock_eval,
             )
             total_eval_time += time.time() - eval_start
 

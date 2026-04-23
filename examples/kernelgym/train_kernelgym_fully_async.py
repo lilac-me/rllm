@@ -5,10 +5,17 @@ decoupled rollout + PPO training with message-queue hand-off.
 
 Usage:
     python -m examples.kernelgym.train_kernelgym_fully_async [hydra overrides ...]
+
+Mock eval (no KernelGYM HTTP; random plausible eval + normal reward path):
+
+- Set env ``RLLM_KERNELGYM_MOCK_EVAL`` to ``1`` / ``true`` / ``yes`` (or ``0`` / ``false`` to force off).
+  If unset, ``kernel.mock_eval`` in Hydra is used.
+- In ``train_kernelgym_fully_async.sh`` the variable defaults to ``0``; run e.g. ``RLLM_KERNELGYM_MOCK_EVAL=1 bash ...`` to enable.
 """
 
 from __future__ import annotations
 
+import os
 import random
 import time
 
@@ -44,6 +51,19 @@ def _row_kwargs_to_task(kwargs: dict) -> dict:
             task.setdefault(k, v)
         return task
     return dict(kwargs)
+
+
+def _mock_eval_effective(kernel_cfg: dict) -> bool:
+    """Respect env ``RLLM_KERNELGYM_MOCK_EVAL`` if set; else ``kernel_cfg['mock_eval']``."""
+    raw = os.environ.get("RLLM_KERNELGYM_MOCK_EVAL")
+    if raw is None or str(raw).strip() == "":
+        return bool(kernel_cfg.get("mock_eval", False))
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    return bool(kernel_cfg.get("mock_eval", False))
 
 
 def make_rollout_fn(kernel_cfg: dict):
@@ -91,6 +111,7 @@ def make_rollout_fn(kernel_cfg: dict):
     workflow = str(kernel_cfg.get("workflow", "kernelbench"))
     rerun_on_anomaly = bool(kernel_cfg.get("rerun_on_anomaly_speedup", True))
     early_exit_on_correct = bool(kernel_cfg.get("early_exit_on_correct", False))
+    mock_eval = _mock_eval_effective(kernel_cfg)
 
     reward_params = KernelGymHybridRewardParams.from_kernel_mapping(kernel_cfg)
     reward_ops = KernelGymRewardOps(reward_params)
@@ -126,6 +147,7 @@ def make_rollout_fn(kernel_cfg: dict):
             rerun_on_anomaly_speedup=rerun_on_anomaly,
             early_exit_on_correct=early_exit_on_correct,
             reward_ops=reward_ops,
+            mock_eval=mock_eval,
         )
 
         trajectory = result["trajectory"]

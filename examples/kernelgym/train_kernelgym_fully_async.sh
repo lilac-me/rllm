@@ -14,6 +14,9 @@ set -xeuo pipefail
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG_POST_MORTEM=0
 
+# KernelGYM: 1 = skip real eval HTTP (random plausible eval, same reward path). Unset/empty → use Hydra kernel.mock_eval.
+export RLLM_KERNELGYM_MOCK_EVAL="${RLLM_KERNELGYM_MOCK_EVAL:-0}"
+
 # NPU memory allocator – limit segment splitting to reduce fragmentation
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
 
@@ -154,8 +157,11 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=2 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=1 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False \
+    actor_rollout_ref.actor.megatron.recompute_granularity=null \
+    actor_rollout_ref.actor.megatron.recompute_method=null \
     \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -172,7 +178,7 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     actor_rollout_ref.actor.megatron.optimizer_offload=${actor_offload} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.context_parallel_size=2 \
+    actor_rollout_ref.actor.megatron.context_parallel_size=1 \
     \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \

@@ -111,3 +111,5 @@ kernel:
   # correct.  Set to false for speedup-based rewards (calculate_reward_speedup /
   # calculate_reward_weighted) so the agent can continue to improve performance.
   early_exit_on_correct: false
+  # If true, skip KernelGYM HTTP eval and use random plausible eval + reward (pipeline smoke test).
+  mock_eval: false
