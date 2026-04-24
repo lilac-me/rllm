@@ -197,7 +197,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                         batch = batch.union(final_gen_batch_output)
                         batch = self._pad_dataproto_to_world_size(batch=batch)
                     else:
-                        final_gen_batch_output, generate_metrics = self.generate_agent_trajectory(timing_raw=timing_raw, meta_info=batch.meta_info)
+                        final_gen_batch_output, generate_metrics = self.generate_agent_trajectory(timing_raw=timing_raw, meta_info=batch.meta_info, global_steps=self.global_steps)
                         batch = batch.union(final_gen_batch_output)
                         metrics.update(generate_metrics)
                     
@@ -581,7 +581,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         return metric_dict
 
-    def generate_agent_trajectory(self, timing_raw=None, meta_info=None):
+    def generate_agent_trajectory(self, timing_raw=None, meta_info=None, global_steps=0):
         """
         Generates agent trajectories by interacting with the environment. Does not close or reset the environment afterwards
 
@@ -600,7 +600,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         with marked_timer("collect_trajectory", timing_raw):
             trajectories = []
             if self.async_rollout_mode:
-                gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Token")
+                gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Token", global_steps=global_steps)
                 for _, trajectory in enumerate(gen_seq_generator):
                     trajectories.append(trajectory)
             else:
@@ -659,6 +659,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         metrics = {}
 
         for traj in trajectories:
+            # ['prompt_tokens', 'response_tokens', 'response_masks', 'trajectory_reward', 'idx', 'chat_completions', 'metrics']
             prompt_tokens = traj["prompt_tokens"]
             response_tokens = traj["response_tokens"]
             # test if trajectory is empty
@@ -781,7 +782,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             show_workflow_metadata=False,
         )
 
-    def generate_agent_trajectories_async(self, timing_raw=None, meta_info=None, mode="Token"):
+    def generate_agent_trajectories_async(self, timing_raw=None, meta_info=None, mode="Token", global_steps=0):
         """
         Generates agent trajectories asynchronously using the agent execution engine.
 
@@ -804,7 +805,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         def runner():
             async def consume():
-                async for item in self.agent_execution_engine.trajectory_generator(timing_raw=timing_raw, mode=mode, meta_info=meta_info):
+                async for item in self.agent_execution_engine.trajectory_generator(timing_raw=timing_raw, mode=mode, meta_info=meta_info, global_steps=global_steps):
                     queue.put(item)
                 queue.put(None)  # sentinel to signal done
 
@@ -956,6 +957,38 @@ class AgentPPOTrainer(RayPPOTrainer):
     def _stepwise_advantage_broadcast(self, last_step_batch, other_step_batch):
         """
         Broadcast the advantage from last_step_batch to all other steps.
+        batch: {
+            non_tensor_batch: {
+                idxs: 
+                    含义: 
+                    来自: _batch_tensors_and_build_data_proto / _transform_agent_steps
+                    数据格式: 
+                step_nums:
+                    含义:  
+                    来自: _batch_tensors_and_build_data_proto / _transform_agent_steps
+                    数据格式:
+                is_last_step:
+                    含义: 
+                    来自: 
+                is_pad_step:
+                    含义: 
+                    来自: 
+                batch_id:
+                    含义: 
+                    来自: 
+                step_ids:
+                    含义: 
+                    来自:
+                    
+            "idxs": np.array(all_steps_idx_list),
+            "step_nums": np.array(all_steps_step_num),
+            "is_last_step": np.array(all_steps_is_last_step_list),
+            "is_pad_step": np.array([False for _ in range(len(all_steps_idx_list))]),
+            "batch_id": np.array([batch_id for _ in range(len(all_steps_idx_list))]),  # in case need to differentiate which iteration the step is coming from
+            "step_ids": np.array(all_steps_step_ids),
+            }
+        }
+
         """
 
         # NOTE: Currently takes the average of advantages. For GRPO, advantage and returns is uniform for each token so this makes no difference.

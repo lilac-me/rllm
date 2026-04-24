@@ -50,8 +50,8 @@ def _hf_row_to_record(row: dict) -> dict:
 
 def prepare_kernelbench_data(
     output_dir: str = "data",
-    train_levels: tuple[int, ...] = (1, 2),
-    val_levels: tuple[int, ...] = (3,),
+    train_levels: tuple[int, ...] = (1,),
+    val_levels: tuple[int, ...] = (1,),
     register: bool = True,
 ) -> tuple:
     """Download KernelBench and write train/val JSONL files.

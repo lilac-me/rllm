@@ -181,7 +181,7 @@ class AgentExecutionEngine:
             env.idx = idx
         self.agents = agents
 
-    async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
+    async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", global_steps=0, **kwargs):
         """Run a single agent's trajectory asynchronously"""
         agent = self.agents[idx]
         env = self.envs[idx]
@@ -267,7 +267,7 @@ class AgentExecutionEngine:
             start_time = time.time()
 
             try:
-                next_observation, reward, done, info = await asyncio.wait_for(loop.run_in_executor(self.executor, env.step, action), timeout=(self.trajectory_timeout - total_time))
+                next_observation, reward, done, info = await asyncio.wait_for(loop.run_in_executor(self.executor, env.step, action, global_steps), timeout=(self.trajectory_timeout - total_time))
             except asyncio.TimeoutError:
                 termination_reason = "ENV_TIMEOUT"
                 if step_idx == 0:
@@ -495,18 +495,18 @@ class AgentExecutionEngine:
 
         return prompt_tokens, response_tokens, response_masks, is_valid_trajectory
 
-    async def run_agent_trajectory_with_retry(self, idx, seed=0, mode="Text", **kwargs):
+    async def run_agent_trajectory_with_retry(self, idx, seed=0, mode="Text", global_steps=0, **kwargs):
         for _ in range(self.retry_limit):
             try:
                 application_id = str(uuid.uuid4())
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, global_steps=global_steps, **kwargs), timeout=7200)
             except Exception:
                 traceback.print_exc()
                 continue
         traceback.print_exc()
         raise Exception(f"Trajectory {idx} cannot complete. Please check the log message")
 
-    async def trajectory_generator(self, reset_seed=0, timing_raw=None, mode="Text", **kwargs):
+    async def trajectory_generator(self, reset_seed=0, timing_raw=None, mode="Text", global_steps=0, **kwargs):
         if timing_raw is None:
             timing_raw = {}
         assert all(env is not None and isinstance(env, BaseEnv) for env in self.envs), "All environments must be inheriting from BaseEnv"
@@ -528,6 +528,7 @@ class AgentExecutionEngine:
                         idx=env_idx,
                         seed=reset_seed,
                         mode=mode,
+                        global_steps=global_steps,
                         **kwargs,
                     )
                 except Exception as e:

@@ -31,16 +31,17 @@ class _HybridHttpWorker:
             headers={"Content-Type": "application/json"},
         )
         # TokenBucketWorker 是一个全局视角的 token 计数器
-        self._rate_limit_worker = TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+        # self._rate_limit_worker = TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
 
     def _backoff(self, attempt: int, base: int = 2, cap: int = 30) -> float:
         return min(base ** attempt, cap)
 
     def get_token_in_use(self) -> int:
-        try:
-            return ray.get(self._rate_limit_worker.get_current_count.remote())
-        except Exception:
-            return -1
+        # try:
+        #     return ray.get(self._rate_limit_worker.get_current_count.remote())
+        # except Exception:
+        #     return -1
+        return 0
 
     def submit_and_poll(self, task_data: Dict[str, Any], client_timeout: int, max_retries: Optional[int]) -> Dict[str, Any]:
         """Submit task and poll for results.
@@ -58,16 +59,16 @@ class _HybridHttpWorker:
             unlimited = max_retries is None or max_retries == -1
             while unlimited or attempt < (max_retries or 0):
                 try:
-                    # Acquire token with timeout.
-                    acquire_ref = self._rate_limit_worker.acquire.remote()
-                    ready, _ = ray.wait([acquire_ref], timeout=self.acquire_timeout)
-                    if not ready:
-                        try:
-                            curr = ray.get(self._rate_limit_worker.get_current_count.remote())
-                        except Exception:
-                            curr = -1
-                        print(f"[HybridWorker] acquire timeout tokens_in_use={curr}")
-                        return {"status": "failed", "error_message": "rate limiter acquire timeout"}
+                #     # Acquire token with timeout.
+                #     acquire_ref = self._rate_limit_worker.acquire.remote()
+                #     ready, _ = ray.wait([acquire_ref], timeout=self.acquire_timeout)
+                #     if not ready:
+                #         try:
+                #             curr = ray.get(self._rate_limit_worker.get_current_count.remote())
+                #         except Exception:
+                #             curr = -1
+                #         print(f"[HybridWorker] acquire timeout tokens_in_use={curr}")
+                #         return {"status": "failed", "error_message": "rate limiter acquire timeout"}
                     # Log once on first attempt to help debug "server did not receive request".
                     if attempt == 0:
                         print(f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}")
@@ -78,10 +79,10 @@ class _HybridHttpWorker:
                     except Exception:
                         pass
                     # Release token immediately after submission.
-                    try:
-                        self._rate_limit_worker.release.remote()
-                    except Exception:
-                        pass
+                    # try:
+                    #     self._rate_limit_worker.release.remote()
+                    # except Exception:
+                    #     pass
                     if resp.status_code == 200:
                         logger.debug(f"[HybridWorker] HTTP 200 OK. errcode(reason): {json.loads(resp.content.decode('utf-8') or '{}').get('error_code',None)}")
                         break
@@ -91,20 +92,20 @@ class _HybridHttpWorker:
                         continue
                     resp.raise_for_status()
                 except (httpx.TimeoutException, httpx.ConnectError) as e:
-                    try:
-                        self._rate_limit_worker.release.remote()
-                    except Exception:
-                        pass
+                    # try:
+                    #     self._rate_limit_worker.release.remote()
+                    # except Exception:
+                    #     pass
                     if unlimited or attempt < (max_retries or 0) - 1:
                         time.sleep(self._backoff(attempt))
                         attempt += 1
                         continue
                     return {"status": "failed", "error_message": str(e)}
                 except Exception as e:
-                    try:
-                        self._rate_limit_worker.release.remote()
-                    except Exception:
-                        pass
+                    # try:
+                    #     self._rate_limit_worker.release.remote()
+                    # except Exception:
+                    #     pass
                     return {"status": "failed", "error_message": str(e)}
 
             # Poll status at a fixed 1s interval.
@@ -722,11 +723,11 @@ class KernelGymEnv(MultiTurnEnvironment):
         return self.task, {}
 
 
-    def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, dict]:
+    def step(self, action: str, global_steps: int = 0) -> Tuple[Dict[str, Any], float, bool, dict]:
         self.history.append(action)
 
         #! kernelGYM 要求 task_id 为 problem_session_round 的形式，如果错误匹配，可能不会触发校验，直接走缓存。
-        task_id = f"{self.task.get('problem_id', 'task')}_{self.session_uuid}_{uuid.uuid4().hex[:2]}{self.current_turn}"
+        task_id = f"{self.task.get('problem_id', 'task')}_{self.session_uuid}_{uuid.uuid4().hex[:2]}|i{global_steps}|{self.current_turn}"
 
         #! 构造 LLM 观测文本，重新构造一遍 task 对象，作为输入
         task = {
