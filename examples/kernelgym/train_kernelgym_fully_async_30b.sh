@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
+export ASCEND_LAUNCH_BLOCKING=1
+export RAY_max_disk_usage_fraction=0.99
 
 # ── KernelGYM Fully-Async Training Launch Script ─────────────────────────
 # Mirrors the structure of 8b_stale05_rs.sh / verl_fully_async_mega.sh but
@@ -14,8 +16,8 @@ set -xeuo pipefail
 export HYDRA_FULL_ERROR=1
 export RAY_DEBUG_POST_MORTEM=0
 
-# NPU memory allocator – limit segment splitting to reduce fragmentation
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048
+# NPU memory allocator ? limit segment splitting to reduce fragmentation
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:1024
 
 # NPU / HCCL transport
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
@@ -29,7 +31,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
 # ── Paths ────────────────────────────────────────────────────────────────
-MODEL_PATH=${MODEL_PATH:-"/home/g00841271/Qwen3-8B"}
+MODEL_PATH=${MODEL_PATH:-"/home/g00841271/cszhou_sft_weight/global_step_100"}
 CKPTS_DIR=${CKPTS_DIR:-"./checkpoints/kernelgym-fully-async"}
 
 # Dataset (registered name or file path)
@@ -41,7 +43,7 @@ TEST_FILE=${TEST_FILE:-""}
 # KernelGYM evaluation server
 KERNEL_SERVER_URL=${KERNEL_SERVER_URL:-"http://80.48.5.53:8002"}
 KERNEL_BACKEND=${KERNEL_BACKEND:-"triton"}
-KERNEL_MAX_TURNS=${KERNEL_MAX_TURNS:-3}
+KERNEL_MAX_TURNS=${KERNEL_MAX_TURNS:-2}
 KERNEL_TIMEOUT=${KERNEL_TIMEOUT:-300}
 
 # ── Cluster topology ─────────────────────────────────────────────────────
@@ -54,8 +56,8 @@ n_nodes_train=${N_NODES_TRAIN:-1}
 rollout_mode="async"
 rollout_name=${ROLLOUT_NAME:-"vllm"}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-$((1024 * 8))}
-max_response_length=${MAX_RESPONSE_LENGTH:-$((1024 * 8))}
+max_prompt_length=${MAX_PROMPT_LENGTH:-$((1024 * 16))}
+max_response_length=${MAX_RESPONSE_LENGTH:-$((1024 * 16))}
 
 temperature=1.0
 top_p=1.0
@@ -63,7 +65,7 @@ top_k=-1          # -1 for vLLM rollout, 0 for HF rollout
 val_top_p=0.7     # validation uses lower randomness
 
 n_resp_per_prompt=${N_RESP:-2}
-train_prompt_mini_bsz=${TRAIN_MINI_BSZ:-4}
+train_prompt_mini_bsz=${TRAIN_MINI_BSZ:-2}
 
 total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$((32 * 100))}
 test_freq=${TEST_FREQ:-9999}
@@ -71,7 +73,7 @@ save_freq=${SAVE_FREQ:-9999}
 
 # Async training control
 staleness_threshold=${STALENESS:-0.5}
-trigger_parameter_sync_step=${SYNC_STEP:-2}
+trigger_parameter_sync_step=${SYNC_STEP:-1}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
 required_samples=${REQUIRED_SAMPLES:-2}
@@ -87,7 +89,7 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 ref_offload=True
 actor_offload=False
-enforce_eager=False
+enforce_eager=True
 nccl_timeout=7200                  # Megatron 长序列任务需要更大超时 (ref: verl_fully_async_mega.sh)
 
 USE_MBRIDGE=${USE_MBRIDGE:-True}
@@ -109,6 +111,8 @@ if [ -n "$TEST_FILE" ]; then
 else
     DATA_ARGS+=(data.val_dataset_name="$VAL_DATASET_NAME")
 fi
+
+#   +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
 
 # ── Launch ───────────────────────────────────────────────────────────────
 PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
@@ -140,16 +144,19 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     \
     actor_rollout_ref.model.use_remove_padding=True \
     +actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    actor_rollout_ref.nccl_timeout=${nccl_timeout} \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     \
     +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=2 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    actor_rollout_ref.nccl_timeout=${nccl_timeout} \
+    \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
     \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -167,14 +174,31 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.context_parallel_size=2 \
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=8 \
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
     \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4 \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1 \
+    actor_rollout_ref.ref.megatron.context_parallel_size=2 \
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size=8 \
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1 \
+    actor_rollout_ref.ref.megatron.param_offload=${ref_offload} \
+    actor_rollout_ref.ref.megatron.use_mbridge=${USE_MBRIDGE} \
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=${USE_DIST_CKPT} \
+    \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     +actor_rollout_ref.rollout.enable_sleep_mode=False \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.enforce_eager=${enforce_eager} \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
@@ -192,7 +216,7 @@ PYTHONUNBUFFERED=1 python -m examples.kernelgym.train_kernelgym_fully_async \
     trainer.val_before_train=False \
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=disable \
     trainer.nnodes=${n_nodes_train} \
     trainer.n_gpus_per_node=${n_gpus_training} \
     trainer.total_epochs=100 \
