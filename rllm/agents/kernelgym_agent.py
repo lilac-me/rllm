@@ -40,18 +40,37 @@ _INITIAL_USER_TEMPLATE = """
 
 ##########
 _REVISION_USER_TEMPLATE = """\
-Your previous kernel submission was evaluated. Here is the feedback:
+Now you have received the server feedback for your last implementation. Based on that and all your previous responses, improve the implementation.
 
+Here is the server feedback. Please refer to this feedback to improve the implementation:
+Server feedback (status/metrics/errors):
 {feedback}
 
-Please revise your `ModelNew` implementation to fix the issues above. \
-Remember to wrap your final code in `<kernel>` ... `</kernel>` tags.
+Return an improved Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.
 """
 
 # TODO. fix err: "RuntimeError: grid should be less than 65536!"
 # TODO. ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
 # TODO. RuntimeError: ModelNew requires x.device.type == 'ascend'
 # TODO. ValueError('program_id axis must be 0, 1, or 2 but got 3')
+
+
+def extract_kernel_code(solution_str: str) -> str:
+    """Extract kernel code from model response (aligned with rllm-071)."""
+    patterns = [
+        r"# Kernel Implementation\s*\n(.*?)(?=# End|$)",
+        r"```python\s*# Kernel\s*\n(.*?)```",
+        r"# Your implementation:\s*\n(.*?)(?=# End|$)",
+        r"# Generated kernel:\s*\n(.*?)(?=# End|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, solution_str, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    code_blocks = re.findall(r"```(?:\w+)?\s*\n?(.*?)```", solution_str, re.DOTALL)
+    if code_blocks:
+        return code_blocks[-1].strip()
+    return solution_str
 
 
 class KernelAgent(BaseAgent):
@@ -144,8 +163,8 @@ class KernelAgent(BaseAgent):
     def update_from_model(self, response: str, **kwargs: Any) -> Action:
         """Update internal state with the model's response and return an Action.
 
-        The action payload is the raw LLM response string (the environment will
-        extract the kernel code from it via ``_extract_kernel_code``).
+        Extracts kernel code using the same logic as rllm-071, adds the standard
+        import prefix, and patches ``class ModelNew:`` → ``class ModelNew(nn.Module):``.
         """
         self.messages.append({"role": "assistant", "content": response})
 
@@ -158,11 +177,22 @@ class KernelAgent(BaseAgent):
             if response.count("</think>") == 1:
                 thought, sep, answer = response.partition("</think>")
                 cur_step.thought = thought + sep
-                action = Action(action=answer.strip())
+                raw = answer.strip()
             else:
                 cur_step.thought = ""
-                action = Action(action=response.strip())
+                raw = response.strip()
 
+            kernel_code = extract_kernel_code(raw)
+            kernel_code = (
+                "import triton\n"
+                "import triton.language as tl\n"
+                "import torch\n"
+                "import torch.nn as nn\n"
+                + kernel_code
+            )
+            if "class ModelNew:" in kernel_code:
+                kernel_code = kernel_code.replace("class ModelNew:", "class ModelNew(nn.Module):")
+            action = Action(action=kernel_code.strip())
             cur_step.action = action
 
         return action

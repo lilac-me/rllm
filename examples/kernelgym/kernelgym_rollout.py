@@ -19,11 +19,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import re
 import time
 import uuid
 from typing import Any, Optional
 
+from rllm.agents.kernelgym_agent import KernelAgent
 from rllm.environments.kernelgym.kernelgym_eval_hybrid_async import (
     async_submit_and_poll,
 )
@@ -38,98 +38,7 @@ from rllm.experimental.fully_async.protocol import Trajectory
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Prompt templates (aligned with kernelgym_agent.py)
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-You are looking at this PyTorch code and thinking it could be optimized with Triton. You need to create a Triton version with the `ModelNew`. This triton version must be execution on Ascend NPU platforms.
-
-Please firstly analyze this code and think hard how you can optimize it. YOU MUST wrap your final code in a ```triton ... ``` code block. No other code block markers are acceptable.
-
-**Please output and show your thinking, plan,
-analysis etc., before your coding, which should be as
-more as possible.**
-
-Here's the PyTorch code:
-
-"""
-
-_INITIAL_USER_TEMPLATE = """
-```python
-{reference_code}
-```
-"""
-
-_REVISION_USER_TEMPLATE = """\
-Your previous kernel submission was evaluated. Here is the feedback:
-
-{feedback}
-
-Please revise your `ModelNew` implementation to fix the issues above. \
-Remember to wrap your **complete** final code in `<kernel>` ... `</kernel>` tags \
-(the code inside tags must be substantive — at least a full kernel, not a few words).
-"""
-
-
-# ---------------------------------------------------------------------------
-# Kernel code extraction
-# ---------------------------------------------------------------------------
-
-
-def _strip_thinking(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Return a shallow copy of *messages* with ``<think>...</think>`` blocks
-    removed from all assistant messages except the last one.
-
-    This mirrors ``KernelAgent.chat_completions`` so the LLM context window
-    is not polluted by reasoning traces from earlier turns.
-    """
-    import copy
-
-    out = copy.deepcopy(messages)
-    for msg in out[:-1]:
-        if msg["role"] == "assistant":
-            _, sep, after = msg["content"].partition("</think>")
-            if sep:
-                msg["content"] = after
-    return out
-
-
-def _content_for_kernel_extraction(response: str) -> str:
-    """Align with ``KernelAgent.update_from_model`` (``kernelgym_agent.py``)."""
-    if response.count("</think>") == 1:
-        _, _, answer = response.partition("</think>")
-        return answer.strip()
-    return response.strip()
-
-
 _MIN_KERNEL_CODE_CHARS = 10
-
-
-def _extract_kernel_code(text: str) -> str:
-    """Extract kernel code from an LLM response (same as before)."""
-    candidates: list[str] = []
-    for m in re.finditer(r"<kernel>(.*?)</kernel>", text, re.DOTALL):
-        s = m.group(1).strip()
-        if s:
-            candidates.append(s)
-
-    fence_matches = re.findall(
-        r"```(?:python|cuda|triton)?\n?(.*?)```", text, re.DOTALL
-    )
-    candidates.extend(s.strip() for s in fence_matches if s.strip())
-
-    whole = text.strip()
-    if whole:
-        candidates.append(whole)
-
-    if not candidates:
-        return ""
-
-    long_enough = [c for c in candidates if len(c) >= _MIN_KERNEL_CODE_CHARS]
-    pool = long_enough if long_enough else candidates
-    return max(pool, key=len)
-
 
 # ---------------------------------------------------------------------------
 # Feedback builder
@@ -374,14 +283,15 @@ async def kernelgym_rollout(
     mock_eval: bool = False,
 ) -> dict[str, Any]:
     """Run a complete KernelGYM multi-turn episode (071-aligned eval + reward)."""
-    system_prompt = system_prompt or _SYSTEM_PROMPT
-    reference_code = task.get("reference_code", "")
-
     if reward_ops is not None:
         rops = reward_ops
     else:
         rp = reward_params or KernelGymHybridRewardParams()
         rops = KernelGymRewardOps(rp)
+
+    agent = KernelAgent(system_prompt=system_prompt)
+    agent.reset()
+    agent.update_from_env(observation=task, reward=0.0, done=False, info={})
 
     client_t = int(
         kernel_eval_client_timeout
@@ -389,14 +299,7 @@ async def kernelgym_rollout(
         else max(kernel_eval_timeout, 300)
     )
 
-    trajectory = Trajectory(sequences=[], reward=0, metadata={})
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": _INITIAL_USER_TEMPLATE.format(reference_code=reference_code),
-        },
-    ]
+    protocol_trajectory = Trajectory(sequences=[], reward=0, metadata={})
 
     sampling_params = sampling_params or {
         "temperature": 1.0,
@@ -420,24 +323,21 @@ async def kernelgym_rollout(
             num_turns = turn + 1
 
             gen_start = time.time()
-            chat_messages = _strip_thinking(messages) if turn > 0 else messages
+            messages = agent.chat_completions
             response_msg, output = await client.chat_completion(
-                chat_messages, sampling_params=sampling_params
+                messages, sampling_params=sampling_params
             )
             gen_time = time.time() - gen_start
             total_generation_time += gen_time
 
-            content = response_msg.get("content", "") or ""
-            messages.append({"role": "assistant", "content": content})
-            trajectory.append(output.to_sequence())
+            action = agent.update_from_model(response_msg.get("content", ""))
+            protocol_trajectory.append(output.to_sequence())
             total_completion_tokens += output.num_output_tokens
-
-            kernel_code = _extract_kernel_code(_content_for_kernel_extraction(content))
 
             eval_start = time.time()
             last_result = await _evaluate_and_score_turn(
                 task,
-                kernel_code,
+                action.action,
                 server_url=kernel_server_url,
                 reward_ops=rops,
                 num_correct_trials=num_correct_trials,
@@ -490,11 +390,11 @@ async def kernelgym_rollout(
                 spv,
                 error_msg,
             )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": _REVISION_USER_TEMPLATE.format(feedback=feedback),
-                }
+            agent.update_from_env(
+                observation=feedback,
+                reward=last_reward,
+                done=False,
+                info=last_result,
             )
 
     except Exception as exc:  # noqa: BLE001
@@ -509,7 +409,7 @@ async def kernelgym_rollout(
         )
 
     if overlong:
-        for seq in trajectory.sequences:
+        for seq in protocol_trajectory.sequences:
             seq.response_masks = [0] * len(seq.response_masks)
 
     lr = last_result
@@ -525,12 +425,12 @@ async def kernelgym_rollout(
         "speedup": float(lr.get("speedup") or 0.0),
         "problem_id": task.get("problem_id", "unknown"),
         "overlong": float(overlong),
-        "merged_step": len(trajectory.merge()),
+        "merged_step": len(protocol_trajectory.merge()),
     }
 
     return {
-        "trajectory": trajectory,
-        "messages": messages,
+        "trajectory": protocol_trajectory,
+        "messages": agent.messages,
         "reward": last_reward,
         "metrics": metrics,
     }
