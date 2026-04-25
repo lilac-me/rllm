@@ -37,6 +37,7 @@ from verl.utils.tracking import Tracking
 
 from rllm.engine.agent_sdk_engine import AgentSdkEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
+from rllm.experimental.verl.metrics import calculate_debug_metrics_compat
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason
 import os
@@ -434,10 +435,8 @@ class AgentSdkTrainer(RayPPOTrainer):
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
-                            from verl.utils.debug.metrics import calculate_debug_metrics
-
-                            debug_metrics = calculate_debug_metrics(batch)
-                            metrics.update(debug_metrics)
+                            # TODO: we may want to add diff of probs too.
+                            metrics.update(calculate_debug_metrics_compat(batch))
 
                             # This follows VERL's pattern: compute IS weights from old_log_probs vs rollout_log_probs
                             rollout_corr_config = getattr(self.config.algorithm, "rollout_correction", None)
