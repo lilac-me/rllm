@@ -146,6 +146,14 @@ code-tools = [
     "together>=1.4",
 ]
 
+harbor = [
+    "harbor==0.3.0 ; python_version >= '3.12'",
+]
+
+[tool.uv.sources]
+rllm-model-gateway = { path = "./rllm-model-gateway", editable = true }
+
+
 [tool.uv]
 override-dependencies = [
     "litellm[proxy]>=1.80.0,<1.82.7",

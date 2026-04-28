@@ -36,7 +36,7 @@ def _flatten_token_input(token_input: TinkerTokenInput) -> TinkerTokenInput:
     return flattened
 
 
-def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
+def trajectory_to_datums(traj: Trajectory, router_replay: bool = False) -> list[tinker.Datum]:
     """
     Return one or more Datum objects corresponding to the trajectory.
     If the sequence grows by appending, i.e., each successive observation contains
@@ -61,6 +61,7 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         sampled_logprobs: list[float] = []
         advantages: list[float] = []
         mask: list[float] = []
+        routing_matrices: list[str] = []
 
         @classmethod
         def clear(cls):
@@ -68,6 +69,7 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
             cls.sampled_logprobs = []
             cls.advantages = []
             cls.mask = []
+            cls.routing_matrices = []
 
     def make_datum_from_state():
         all_tokens_T = _flat_token_input_to_model_input(SequenceAccumulator.full_sequence)
@@ -77,6 +79,9 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         advantages_T = SequenceAccumulator.advantages[1:]
         mask_T = SequenceAccumulator.mask[1:]
         assert input_tokens_T.length == len(target_tokens_T) == len(sampled_logprobs_T) == len(advantages_T) == len(mask_T)
+        if router_replay and SequenceAccumulator.routing_matrices:
+            rm_shifted = SequenceAccumulator.routing_matrices[1:]  # match rightshift
+            input_tokens_T = input_tokens_T.model_copy(update={"routing_matrices": rm_shifted})
         return tinker.Datum(
             model_input=input_tokens_T,
             loss_fn_inputs={
@@ -118,6 +123,9 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         SequenceAccumulator.sampled_logprobs.extend([0.0] * delta_token_input_length + output_logprobs)
         SequenceAccumulator.advantages.extend([0] * delta_token_input_length + advantages)
         SequenceAccumulator.mask.extend([0.0] * delta_token_input_length + [1.0] * len(output_token_ids))
+        if router_replay:
+            step_rm = step.routing_matrices or []
+            SequenceAccumulator.routing_matrices.extend([""] * delta_token_input_length + (list(step_rm) if step_rm else [""] * len(output_token_ids)))
 
     if SequenceAccumulator.full_sequence:
         data.append(make_datum_from_state())
@@ -137,21 +145,79 @@ def transform_trajectory_groups_to_datums(
     If the `estimator_map` is used in the algorithm config, we return a dictionary of datums, keyed by the trajectory group role.
     Otherwise, we return a list of datums.
     """
-    # step 1: compute the advantages for each group using the common functionality
-    # this fills the `advantage` attribute of all the steps in the trajectory groups
-    adv_metrics = collect_reward_and_advantage_from_trajectory_groups(trajectory_groups, algorithm_config)
+    # step 1: compute advantages (skip if already pre-computed by buffer)
+    has_advantages = any(step.advantage is not None for group in trajectory_groups for traj in group.trajectories for step in traj.steps)
+    if has_advantages:
+        adv_metrics = {}
+    else:
+        adv_metrics = collect_reward_and_advantage_from_trajectory_groups(trajectory_groups, algorithm_config)
 
     if algorithm_config.estimator_map:
         datums_dict = defaultdict(list)
     else:
         datums = []
 
-    # step 2: iterate over all steps and build the Tinker Datum objects
+    # step 2: iterate over all steps and build the Tinker Datum objects.
+    # Track per-trajectory split count, per-Datum response length, and
+    # per-Datum action-token fraction so the caller can log the same
+    # metrics across backends. Metric semantics shared with verl's
+    # transform_episodes_to_dataproto:
+    #   - steps_per_traj: number of training rows/datums one trajectory
+    #     becomes after prefix-merging. =1 for healthy cumulative agents;
+    #     >1 indicates a prefix break (re-tokenization quirk, mid-
+    #     trajectory context reset).
+    #   - step_response_length: length of the response region per row,
+    #     i.e. everything from the first action token onward (action
+    #     tokens + interleaved observation tokens), excluding the initial
+    #     prompt.
+    #   - merge_compression_ratio (batch-level scalar): total agent
+    #     steps ÷ total emitted rows. =N for a fully cumulative N-turn
+    #     batch; =1 means no merging (per-step rows or all single-step).
+    #   - action_token_ratio: fraction of response tokens that are
+    #     trainable (mask=1) per row. =1.0 for single-step rows (no
+    #     observations); <1.0 for merged multi-turn (tool/observation
+    #     tokens are mask=0 between actions).
+    steps_per_traj = []
+    step_response_lengths = []
+    action_token_ratios = []
+    total_agent_steps = 0
     for group in trajectory_groups:
         for trajectory in group.trajectories:
+            total_agent_steps += len(trajectory.steps)
+            traj_datums = trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay)
+            steps_per_traj.append(len(traj_datums))
+            for d in traj_datums:
+                mask_data = d.loss_fn_inputs["mask"].data
+                # Response region = total Datum length - leading prompt
+                # length. Mask is 0 over the initial prompt (before any
+                # action) and 0/1-interleaved after, so the first mask=1
+                # position is the prompt boundary.
+                first_action = next(
+                    (i for i, m in enumerate(mask_data) if m > 0.5),
+                    len(mask_data),
+                )
+                resp_len = len(mask_data) - first_action
+                action_count = sum(1 for m in mask_data[first_action:] if m > 0.5)
+                step_response_lengths.append(resp_len)
+                action_token_ratios.append(action_count / resp_len if resp_len > 0 else 0.0)
             if algorithm_config.estimator_map:
-                datums_dict[group.group_role].extend(trajectory_to_datums(trajectory))
+                datums_dict[group.group_role].extend(traj_datums)
             else:
-                datums.extend(trajectory_to_datums(trajectory))
+                datums.extend(traj_datums)
+
+    if steps_per_traj:
+        import numpy as _np
+
+        total_emitted_rows = sum(steps_per_traj)
+        adv_metrics["batch/steps_per_traj/mean"] = _np.mean(steps_per_traj)
+        adv_metrics["batch/steps_per_traj/min"] = _np.min(steps_per_traj)
+        adv_metrics["batch/steps_per_traj/max"] = _np.max(steps_per_traj)
+        adv_metrics["batch/step_response_length/mean"] = _np.mean(step_response_lengths)
+        adv_metrics["batch/step_response_length/min"] = _np.min(step_response_lengths)
+        adv_metrics["batch/step_response_length/max"] = _np.max(step_response_lengths)
+        adv_metrics["batch/action_token_ratio/mean"] = _np.mean(action_token_ratios)
+        adv_metrics["batch/action_token_ratio/min"] = _np.min(action_token_ratios)
+        adv_metrics["batch/action_token_ratio/max"] = _np.max(action_token_ratios)
+        adv_metrics["batch/merge_compression_ratio"] = total_agent_steps / total_emitted_rows if total_emitted_rows > 0 else 0.0
 
     return (datums if not algorithm_config.estimator_map else datums_dict), adv_metrics
