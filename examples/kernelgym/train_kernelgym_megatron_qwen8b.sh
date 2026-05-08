@@ -124,7 +124,7 @@ ARGS=(
   actor_rollout_ref.rollout.enforce_eager=False
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.75
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.70
   actor_rollout_ref.rollout.max_model_len=32768
   actor_rollout_ref.rollout.n=16
   actor_rollout_ref.rollout.val_kwargs.n=4
@@ -199,6 +199,9 @@ ARGS=(
 
   rllm.debug_rollout.save=True
   rllm.debug_rollout.load_path=null
+
+  # rllm.debug_rollout.save=False
+  # rllm.debug_rollout.load_path=/home/g00841271/rllm-071/checkpoints/rllm-agent/kernelgym-dr8b/debug_rollouts/rollout_step_1.pt
 )
 
 # python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"

@@ -4,8 +4,11 @@ python scripts/eval_pass_at_k.py \
     --kernelgym-url http://localhost:8302 \
     --data-path data/kernelbench_val.jsonl \
     --output-dir results/pass_at_k \
+    --max-tokens 8192 \
+    --task-timeout 300 \
+    --task-timeout-in-client 600 \
     --num-rollouts 8 \
     --max-turns 5 \
-    --num-workers 72 \
+    --num-workers 64 \
     --k-values 1,3,5,8 \
     --show-worker-logs
