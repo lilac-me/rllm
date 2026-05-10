@@ -37,7 +37,18 @@ class WorkflowTaskRunner(TaskRunner):
         from verl.utils.config import validate_config
         from verl.utils.fs import copy_to_local
 
-        print(f"WorkflowTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        from rllm.experimental.verl.utils import sync_config
+
+        # hydra_overrides is forwarded from the launcher process via kwargs since
+        # Hydra context doesn't survive across Ray actor boundaries (19983fe4).
+        hydra_overrides = kwargs.get("hydra_overrides", None)
+
+        print(f"VerlTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        OmegaConf.register_new_resolver("mul", lambda x, y: int(x) * int(y))
+        sync_config(config, hydra_overrides=hydra_overrides)
+        OmegaConf.resolve(config)
+        sync_config(config, hydra_overrides=hydra_overrides)
+        config.trainer.use_legacy_worker_impl = "disable"
         pprint(OmegaConf.to_container(config))
         OmegaConf.register_new_resolver("mul", lambda x, y: int(x) * int(y))
         OmegaConf.resolve(config)

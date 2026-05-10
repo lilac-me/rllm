@@ -177,6 +177,13 @@ class VerlBackend(BackendProtocol[Iterable, DataProto], RayPPOTrainer):
             # automatically set the stepwise_advantage_mode to "broadcast", the warning is already shown in AlgorithmConfig.from_config
             self.config.rllm.stepwise_advantage.mode = "broadcast"
 
+        router_replay_mode = self.config.rllm.algorithm.get("router_replay", "disabled")
+        if router_replay_mode != "disabled":
+            strategy = self.config.actor_rollout_ref.actor.strategy
+            if strategy != "megatron":
+                raise ValueError(f"router_replay={router_replay_mode!r} requires actor.strategy='megatron', got {strategy!r}")
+
+
     def get_dataloader(self, dataset: Dataset | None, trainer_state: TrainerState) -> Iterable:
         """Get dataloader. Note that for Verl backend, the RayPPOTrainer init already creates the dataloaders."""
         if trainer_state.is_training:
@@ -367,6 +374,12 @@ class VerlBackend(BackendProtocol[Iterable, DataProto], RayPPOTrainer):
             if "rollout_log_probs" in batch.batch:
                 metrics.update(calculate_debug_metrics_compat(batch))
 
+        # NOTE: 19983fe4 (R2 router_replay actor-side routed_experts propagation) was
+        # SKIPPED here — it depends on a separate upstream refactor of process_backend_batch
+        # introducing `tu`/`batch_td`/`no_padding_2_padding`/`bypass_mode` symbols absent
+        # in this branch. R3 entry (rollout-side + transform-side) still works through
+        # verl_engine.py / transform.py / utils.py. For R2, fall back to verl-native CLI
+        # (actor.router_replay.mode=R2) rather than going through rllm.algorithm.router_replay.
         # Compute reference log_probs if using reference policy
         if self.use_reference_policy:
             with simple_timer("ref", timing_dict):

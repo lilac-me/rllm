@@ -143,6 +143,15 @@ class AlgorithmConfig:
     lr_schedule: Literal["linear", "cosine", "constant"] = "constant"
     warmup_steps_ratio: float = 0.0
 
+    # Custom loss / rollout correction fields (used by Fireworks backend with cookbook losses)
+    kl_beta: float = 0.0
+    eps_clip: float = 0.2
+    eps_clip_high: float | None = None
+    loss_agg_mode: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", None] = None
+    rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    router_replay: Literal["disabled", "R2", "R3"] = "disabled"
+
+
     @classmethod
     def from_config(cls, config: DictConfig) -> "AlgorithmConfig":
         """Create an AlgorithmConfig from a dictionary configuration.
@@ -152,15 +161,25 @@ class AlgorithmConfig:
         Returns:
             AlgorithmConfig: The AlgorithmConfig built from the configuration.
         """
+        # NOTE: kept HEAD's from_config(config) signature (callers untouched).
+        # Added 19983fe4's new fields (router_replay + rollout_correction family)
+        # by reading from config.rllm.algorithm, so the new dataclass fields are
+        # populated without rewriting upstream's algorithm_config-based signature.
+        algorithm_config = config.rllm.algorithm
         return cls(
             estimator=rLLMAdvantageEstimator(config.algorithm.adv_estimator),
             stepwise_advantage_mode=config.rllm.stepwise_advantage.mode,
             norm_adv_by_std_in_grpo=config.rllm.stepwise_advantage.get("norm_adv_by_std_in_grpo", True),
             use_rllm=config.rllm.stepwise_advantage.get("use_rllm", False),
-            use_precomputed_advantage=config.rllm.algorithm.get("use_precomputed_advantage", False),
-            loss_fn=config.rllm.algorithm.get("loss_fn", None),
-            lr_schedule=config.rllm.algorithm.get("lr_schedule", "constant"),
-            warmup_steps_ratio=config.rllm.algorithm.get("warmup_steps_ratio", 0.0),
+            use_precomputed_advantage=algorithm_config.get("use_precomputed_advantage", False),
+            loss_fn=algorithm_config.get("loss_fn", None),
+            lr_schedule=algorithm_config.get("lr_schedule", "constant"),
+            warmup_steps_ratio=algorithm_config.get("warmup_steps_ratio", 0.0),
+            kl_beta=algorithm_config.get("kl_beta", 0.0),
+            eps_clip=algorithm_config.get("eps_clip", 0.2),
+            eps_clip_high=algorithm_config.get("eps_clip_high", None),
+            loss_agg_mode=algorithm_config.get("loss_agg_mode", None),
+            router_replay=algorithm_config.get("router_replay", "disabled"),
         )
 
     def __post_init__(self):

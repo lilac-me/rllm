@@ -52,12 +52,18 @@ algorithm:
   gamma: 1.0
   lam: 0.95
   norm_adv_by_std_in_grpo: true
-  use_rllm: false
-  # When true, always use pre-computed step.advantage from the workflow (e.g. distillation)
-  # and skip advantage computation (GRPO/REINFORCE). Missing advantages default to 0.
-  use_precomputed_advantage: false
-  # for tinker backend only (avaiable options: importance_sampling, ppo, cispo, dro, cross_entropy)
-  loss_fn: null
+  use_rllm: false         # kept HEAD value; upstream sets null (deprecated)
+  use_precomputed_advantage: false # use pre-computed step.advantage from the workflow (e.g. distillation)
+  loss_fn: null           # backend-specific values; null = backend default
+  loss_agg_mode: null     # [null, token-mean, seq-mean-token-sum, seq-mean-token-mean]
+  kl_beta: 0.0            # KL penalty coefficient
+  eps_clip: 0.2           # PPO clip epsilon
+  eps_clip_high: null     # Asymmetric upper clip bound (null = symmetric)
+  router_replay: disabled # Router Replay: "disabled" | "R2" (training-side record) | "R3" (rollout-side record)
+  rollout_correction:
+    bypass_mode: null     # true = pi_old = pi_rollout, false = pi_old is computed (null = backend default)
+    tis_mode: null        # null = disabled, "token" or "sequence" = TIS importance sampling level
+    tis_cap: 2.0          # Upper clamp on TIS importance weight
 
 # Stepwise advantage
 # TODO(listar2000): deprecate the `per_step` mode and refactor this config.
