@@ -906,6 +906,8 @@ class AgentPPOTrainer(RayPPOTrainer):
         all_prompts_list = []
         all_responses_list = []
         all_rollout_logprobs_list = []
+        raw_completion_lens = []
+        retokenized_response_lens = []
 
         step_numbers = []  # number of steps of each episode, 0 indexed
         all_steps_idx_list = []
@@ -937,6 +939,8 @@ class AgentPPOTrainer(RayPPOTrainer):
                 response_tokens = _to_token_tensor(step.get("completion_ids"), "completion_ids", idx, step_idx)
                 all_prompts_list.append(prompt_tokens)
                 all_responses_list.append(response_tokens)
+                raw_completion_lens.append(response_tokens.numel())
+                retokenized_response_lens.append(len(self.tokenizer.encode(step.get("response", ""), add_special_tokens=False)))
 
                 step_logprobs = step.get("logprobs")
                 has_logprobs = step_logprobs is not None
@@ -970,6 +974,18 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_steps_step_num.extend([len(episode_steps) for _ in range(len(episode_steps))])
             all_steps_step_ids.extend([f"{uids[idx]}_step{i}" for i in range(len(episode_steps))])
             all_steps_masked_out.extend([masked_out for _ in range(len(episode_steps))])
+
+        if raw_completion_lens:
+            print(
+                "[response_len_debug] "
+                f"global_step={self.global_steps} "
+                f"raw_mean={np.mean(raw_completion_lens):.2f} "
+                f"retok_mean={np.mean(retokenized_response_lens):.2f} "
+                f"raw_max={np.max(raw_completion_lens)} "
+                f"retok_max={np.max(retokenized_response_lens)} "
+                f"n_steps={len(raw_completion_lens)}",
+                flush=True,
+            )
 
         # left pad prompts
         max_prompt_length = self.config.data.max_prompt_length
