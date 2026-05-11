@@ -22,7 +22,21 @@ The evaluation system measures:
 ```bash
 # Download and prepare KernelBench level1 data
 python -m examples.kernelgym.prepare_kernelbench_data
+
+# Or convert NPUKernelBench into the same JSONL task format
+python scripts/eval_pass_at_k.py \
+    --data-path /home/robomaster/Research/AscendOpGenAgent/benchmarks/NPUKernelBench \
+    --npukernelbench-jsonl-output data/npukernelbench_eval.jsonl \
+    --convert-only
 ```
+
+For NPUKernelBench, each JSONL row is one operator, not one testcase. The
+converter inlines the operator's JSON cases into `reference_code` and exposes a
+KernelGym-compatible `get_inputs()`. The patched KernelGym correctness path
+detects `get_input_groups()` and iterates every JSON case from that operator in
+one evaluation request, so one model rollout tests all cases without sending
+repeated LLM requests for the same operator. `get_inputs()` stays fixed to the
+first case for reference/performance timing.
 
 ### 2. Run Evaluation
 
@@ -65,6 +79,8 @@ python scripts/analyze_pass_at_k.py \
 | `VLLM_URL` | `http://localhost:8000/v1` | OpenAI-compatible LLM endpoint |
 | `KERNELGYM_URL` | `http://localhost:8002` | KernelGym server URL |
 | `DATA_PATH` | `data/kernelbench_train.jsonl` | Path to KernelBench data |
+| `NPUKERNELBENCH_LEVELS` | empty | Optional levels when `DATA_PATH` is an NPUKernelBench directory |
+| `NPUKERNELBENCH_JSONL_OUTPUT` | empty | Optional path to save converted NPUKernelBench JSONL |
 | `RESUME` | `0` | Optional explicit resume flag; existing saved rollouts also trigger auto-resume |
 | `TRAIN_ID` | empty | Optional dashboard train id passed through to `eval_pass_at_k.py` |
 | `OUTPUT_DIR` | `results/pass_at_k_<timestamp>` | Output directory |
@@ -83,6 +99,9 @@ python scripts/analyze_pass_at_k.py \
 --kernelgym-url     KernelGym server URL
 --data-path         Path to KernelBench data
 --hf-split          HuggingFace split name (default: level_1)
+--npukernelbench-levels  Optional comma-separated levels when --data-path is an NPUKernelBench directory
+--npukernelbench-jsonl-output  Optional output path for converted NPUKernelBench JSONL
+--convert-only      Convert/load data and exit without running evaluation
 --output-dir        Output directory
 --num-rollouts      Number of rollouts per problem
 --max-turns         Maximum turns per rollout

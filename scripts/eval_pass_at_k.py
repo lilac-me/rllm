@@ -13,6 +13,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import signal
 import sqlite3
 import time
@@ -38,6 +39,8 @@ logger = logging.getLogger("eval_pass_at_k")
 
 MESSAGE_PASSTHROUGH_MARKER = "<|message_passthrough|>"
 LEGACY_MESSAGE_PASSTHROUGH_MARKER = "<|message_passtrhough|>"
+NPUKERNELBENCH_ADAPTER_HEADER = "# --- NPUKernelBench input-groups adapter ---"
+NPUKERNELBENCH_DEFAULT_JSONL = "data/npukernelbench_eval.jsonl"
 
 
 def split_message_passthrough(action: str) -> tuple[str, str]:
@@ -623,6 +626,15 @@ def _run_single_rollout(
     entry_point = task.get("entry_point", "Model")
     rollout_id = f"{problem_id}_{uuid4().hex[:8]}"
     result = RolloutResult(rollout_id=rollout_id, problem_id=problem_id)
+    reward_args = args
+    task_num_correct_trials = task.get("num_correct_trials")
+    task_num_perf_trials = task.get("num_perf_trials")
+    if task_num_correct_trials is not None or task_num_perf_trials is not None:
+        reward_args = argparse.Namespace(**vars(args))
+        if task_num_correct_trials is not None:
+            reward_args.num_correct_trials = int(task_num_correct_trials)
+        if task_num_perf_trials is not None:
+            reward_args.num_perf_trials = int(task_num_perf_trials)
 
     from openai import OpenAI
 
@@ -635,8 +647,10 @@ def _run_single_rollout(
             "entry_point": entry_point,
             "is_valid": args.is_valid_eval,
             "eval_tag": args.eval_tag,
+            "num_correct_trials": getattr(reward_args, "num_correct_trials", args.num_correct_trials),
+            "num_perf_trials": getattr(reward_args, "num_perf_trials", args.num_perf_trials),
         },
-        config=build_reward_config(args),
+        config=build_reward_config(reward_args),
         message_passthrough=True,
     )
     agent = KernelAgent(message_passthrough=True)
@@ -707,37 +721,204 @@ def _run_single_rollout(
     return result
 
 
-def load_kernelbench_data(data_path: str, hf_split: str = "level_1") -> list[dict[str, Any]]:
+def natural_sort_key(value: Any) -> list[Any]:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
+
+
+def build_task_record(
+    *,
+    problem_id: Any,
+    reference_code: str,
+    entry_point: str = "Model",
+    **extra: Any,
+) -> dict[str, Any]:
+    task = {
+        "problem_id": str(problem_id),
+        "reference_code": reference_code,
+        "entry_point": entry_point or "Model",
+    }
+    for key, value in extra.items():
+        if value is not None:
+            task[key] = value
+    return task
+
+
+def parse_jsonl_cases(json_path: Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    with json_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cases.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {json_path}:{line_no}: {exc}") from exc
+    if not cases:
+        raise ValueError(f"No testcase records found in {json_path}")
+    return cases
+
+
+def make_npukernelbench_reference_code(source_code: str, source_path: Path, cases: list[dict[str, Any]]) -> str:
+    case_jsonl = "\n".join(json.dumps(case, ensure_ascii=False) for case in cases)
+    fake_source_path = str(source_path)
+    header = f'''{NPUKERNELBENCH_ADAPTER_HEADER}
+import builtins as _npukernelbench_builtins
+import io as _npukernelbench_io
+
+__file__ = {fake_source_path!r}
+_NPUKERNELBENCH_JSONL = {case_jsonl!r}
+_NPUKERNELBENCH_CASE_LINES = [line for line in _NPUKERNELBENCH_JSONL.splitlines() if line.strip()]
+_NPUKERNELBENCH_ACTIVE_JSONL = None
+_NPUKERNELBENCH_REAL_OPEN = _npukernelbench_builtins.open
+
+
+def open(file, *args, **kwargs):
+    mode = args[0] if args else kwargs.get("mode", "r")
+    file_name = str(file)
+    if "r" in str(mode) and file_name.endswith(".json") and not file_name.endswith("_all_case.json"):
+        data = _NPUKERNELBENCH_ACTIVE_JSONL
+        if data is None:
+            data = _NPUKERNELBENCH_JSONL
+        return _npukernelbench_io.StringIO(data)
+    return _NPUKERNELBENCH_REAL_OPEN(file, *args, **kwargs)
+
+'''
+    footer = '''
+
+def get_inputs():
+    global _NPUKERNELBENCH_ACTIVE_JSONL
+    if not _NPUKERNELBENCH_CASE_LINES:
+        return []
+    line = _NPUKERNELBENCH_CASE_LINES[0]
+    _NPUKERNELBENCH_ACTIVE_JSONL = line + "\\n"
+    try:
+        input_groups = get_input_groups()
+    finally:
+        _NPUKERNELBENCH_ACTIVE_JSONL = None
+    if not input_groups:
+        return []
+    return input_groups[0]
+'''
+    return f"{header}{source_code.rstrip()}{footer}\n"
+
+
+def parse_npukernelbench_levels(levels: str | None) -> set[str] | None:
+    if not levels:
+        return None
+    parsed: set[str] = set()
+    for raw in levels.split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        parsed.add(value if value.startswith("level") else f"level{value}")
+    return parsed or None
+
+
+def find_npukernelbench_sources(root: Path, levels: str | None = None) -> list[Path]:
+    selected_levels = parse_npukernelbench_levels(levels)
+    py_paths: list[Path] = []
+    for py_path in root.glob("level*/*.py"):
+        if selected_levels is not None and py_path.parent.name not in selected_levels:
+            continue
+        json_path = py_path.with_suffix(".json")
+        if json_path.exists():
+            py_paths.append(py_path)
+    return sorted(py_paths, key=natural_sort_key)
+
+
+def load_npukernelbench_data(
+    data_path: str,
+    *,
+    levels: str | None = None,
+    jsonl_output: str | None = None,
+) -> list[dict[str, Any]]:
+    root = Path(data_path).expanduser()
+    if not root.exists():
+        raise FileNotFoundError(f"NPUKernelBench path does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"NPUKernelBench path must be a directory: {root}")
+
     tasks: list[dict[str, Any]] = []
-    path = Path(data_path)
+    records: list[dict[str, Any]] = []
+    for py_path in find_npukernelbench_sources(root, levels=levels):
+        json_path = py_path.with_suffix(".json")
+        cases = parse_jsonl_cases(json_path)
+        source_code = py_path.read_text(encoding="utf-8")
+        reference_code = make_npukernelbench_reference_code(source_code, py_path, cases)
+        problem_id = f"npukernelbench_{py_path.parent.name}_{py_path.stem}"
+        task = build_task_record(
+            problem_id=problem_id,
+            reference_code=reference_code,
+            entry_point="Model",
+            npukernelbench={
+                "source_py": str(py_path),
+                "case_json": str(json_path),
+                "level": py_path.parent.name,
+                "num_cases": len(cases),
+            },
+        )
+        tasks.append(task)
+        records.append({"task": task, "backend": "triton"})
+
+    if jsonl_output:
+        out_path = Path(jsonl_output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info("Wrote %d NPUKernelBench task(s) to %s", len(records), out_path)
+
+    logger.info("Loaded %d NPUKernelBench task(s) from %s", len(tasks), root)
+    return tasks
+
+
+def task_from_mapping(data: dict[str, Any], default_problem_id: str) -> dict[str, Any]:
+    # NPUKernelBench correctness is driven by get_input_groups(), so any legacy
+    # converted num_correct_trials value is only metadata and must not cap cases.
+    num_correct_trials = None if data.get("npukernelbench") else data.get("num_correct_trials")
+    return build_task_record(
+        problem_id=data.get("problem_id", default_problem_id),
+        reference_code=data.get("reference_code", ""),
+        entry_point=data.get("entry_point", "Model"),
+        description=data.get("description"),
+        num_correct_trials=num_correct_trials,
+        num_perf_trials=data.get("num_perf_trials"),
+        npukernelbench=data.get("npukernelbench"),
+    )
+
+
+def load_kernelbench_data(
+    data_path: str,
+    hf_split: str = "level_1",
+    *,
+    npukernelbench_levels: str | None = None,
+    npukernelbench_jsonl_output: str | None = None,
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    path = Path(data_path).expanduser()
+    if path.is_dir():
+        return load_npukernelbench_data(
+            str(path),
+            levels=npukernelbench_levels,
+            jsonl_output=npukernelbench_jsonl_output,
+        )
     if path.suffix in (".parquet", ".jsonl") or path.exists():
         import pandas as pd
 
         if path.suffix == ".jsonl":
-            df = pd.read_json(data_path, lines=True)
+            df = pd.read_json(str(path), lines=True)
         else:
-            df = pd.read_parquet(data_path)
+            df = pd.read_parquet(str(path))
         for idx, row in df.iterrows():
             row_dict = row.to_dict()
             if "task" in row_dict:
                 t = row_dict["task"]
                 if isinstance(t, str):
                     t = json.loads(t)
-                tasks.append(
-                    {
-                        "problem_id": t.get("problem_id", f"task_{idx}"),
-                        "reference_code": t.get("reference_code", ""),
-                        "entry_point": t.get("entry_point", "Model"),
-                    }
-                )
+                tasks.append(task_from_mapping(t, f"task_{idx}"))
             elif "reference_code" in row_dict:
-                tasks.append(
-                    {
-                        "problem_id": row_dict.get("problem_id", f"task_{idx}"),
-                        "reference_code": row_dict["reference_code"],
-                        "entry_point": row_dict.get("entry_point", "Model"),
-                    }
-                )
+                tasks.append(task_from_mapping(row_dict, f"task_{idx}"))
             elif "extra_info" in row_dict:
                 extra = row_dict.get("extra_info", {}) or {}
                 if isinstance(extra, str):
@@ -745,11 +926,13 @@ def load_kernelbench_data(data_path: str, hf_split: str = "level_1") -> list[dic
                 ref_code = extra.get("ground_truth", extra.get("task_code", ""))
                 if ref_code:
                     tasks.append(
-                        {
-                            "problem_id": str(extra.get("uuid", extra.get("op_name", f"task_{idx}"))),
-                            "reference_code": ref_code,
-                            "entry_point": extra.get("entry_point", "Model"),
-                        }
+                        build_task_record(
+                            problem_id=extra.get("uuid", extra.get("op_name", f"task_{idx}")),
+                            reference_code=ref_code,
+                            entry_point=extra.get("entry_point", "Model"),
+                            num_correct_trials=extra.get("num_correct_trials"),
+                            num_perf_trials=extra.get("num_perf_trials"),
+                        )
                     )
             elif "code" in row_dict:
                 level = row_dict.get("level", "")
@@ -875,6 +1058,21 @@ def main():
     parser.add_argument("--kernelgym-url", default="http://localhost:8002")
     parser.add_argument("--data-path", default="data/kernelbench_train.jsonl")
     parser.add_argument("--hf-split", default="level_1")
+    parser.add_argument(
+        "--npukernelbench-levels",
+        default="",
+        help="Comma-separated NPUKernelBench levels to include when --data-path is a NPUKernelBench directory, e.g. 0,1,2.",
+    )
+    parser.add_argument(
+        "--npukernelbench-jsonl-output",
+        default="",
+        help="Optional path to write the converted NPUKernelBench JSONL dataset.",
+    )
+    parser.add_argument(
+        "--convert-only",
+        action="store_true",
+        help="Only convert/load the dataset and write --npukernelbench-jsonl-output; do not run LLM evaluation.",
+    )
     parser.add_argument("--output-dir", default="results/pass_at_k")
     parser.add_argument(
         "--resume",
@@ -947,11 +1145,28 @@ def main():
     args = parser.parse_args()
 
     k_values = [int(k.strip()) for k in args.k_values.split(",")]
-    os.makedirs(args.output_dir, exist_ok=True)
-    db = InteractionDatabase(os.path.join(args.output_dir, "interactions.db"))
-    tasks = load_kernelbench_data(args.data_path, args.hf_split)
+    data_path_obj = Path(args.data_path).expanduser()
+    npukernelbench_jsonl_output = args.npukernelbench_jsonl_output or None
+    if args.convert_only and data_path_obj.is_dir() and not npukernelbench_jsonl_output:
+        npukernelbench_jsonl_output = NPUKERNELBENCH_DEFAULT_JSONL
+
+    tasks = load_kernelbench_data(
+        args.data_path,
+        args.hf_split,
+        npukernelbench_levels=args.npukernelbench_levels,
+        npukernelbench_jsonl_output=npukernelbench_jsonl_output,
+    )
     if args.limit_problems:
         tasks = tasks[: args.limit_problems]
+    if args.convert_only:
+        if npukernelbench_jsonl_output:
+            print(f"Converted {len(tasks)} task(s) to {npukernelbench_jsonl_output}")
+        else:
+            print(f"Loaded {len(tasks)} task(s); no conversion output requested")
+        return
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    db = InteractionDatabase(os.path.join(args.output_dir, "interactions.db"))
     task_ids = {task["problem_id"] for task in tasks}
     run_metadata = db.load_metadata()
     loaded_results = db.load_rollouts()
@@ -976,6 +1191,8 @@ def main():
             "train_id": args.train_id,
             "data_path": args.data_path,
             "hf_split": args.hf_split,
+            "npukernelbench_levels": args.npukernelbench_levels,
+            "npukernelbench_jsonl_output": npukernelbench_jsonl_output,
             "limit_problems": args.limit_problems,
             "num_rollouts": args.num_rollouts,
             "max_turns": args.max_turns,

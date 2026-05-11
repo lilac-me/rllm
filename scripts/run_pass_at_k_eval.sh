@@ -8,6 +8,8 @@ set -e
 VLLM_URL="${VLLM_URL:-http://localhost:8000/v1}"
 KERNELGYM_URL="${KERNELGYM_URL:-http://localhost:8002}"
 DATA_PATH="${DATA_PATH:-data/kernelbench_train.jsonl}"
+NPUKERNELBENCH_LEVELS="${NPUKERNELBENCH_LEVELS:-}"
+NPUKERNELBENCH_JSONL_OUTPUT="${NPUKERNELBENCH_JSONL_OUTPUT:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/pass_at_k_$(date +%Y%m%d_%H%M%S)}"
 NUM_ROLLOUTS="${NUM_ROLLOUTS:-10}"
 MAX_TURNS="${MAX_TURNS:-3}"
@@ -23,6 +25,8 @@ echo "=========================================="
 echo "VLLM URL: $VLLM_URL"
 echo "KernelGym URL: $KERNELGYM_URL"
 echo "Data Path: $DATA_PATH"
+echo "NPUKernelBench Levels: ${NPUKERNELBENCH_LEVELS:-<all>}"
+echo "NPUKernelBench JSONL Output: ${NPUKERNELBENCH_JSONL_OUTPUT:-<none>}"
 echo "Output Dir: $OUTPUT_DIR"
 echo "Num Rollouts: $NUM_ROLLOUTS"
 echo "Max Turns: $MAX_TURNS"
@@ -49,6 +53,14 @@ CMD="python scripts/eval_pass_at_k.py \
     --max-turns $MAX_TURNS \
     --k-values $K_VALUES \
     --num-workers $NUM_WORKERS"
+
+if [ -n "$NPUKERNELBENCH_LEVELS" ]; then
+    CMD="$CMD --npukernelbench-levels $NPUKERNELBENCH_LEVELS"
+fi
+
+if [ -n "$NPUKERNELBENCH_JSONL_OUTPUT" ]; then
+    CMD="$CMD --npukernelbench-jsonl-output $NPUKERNELBENCH_JSONL_OUTPUT"
+fi
 
 if [ -n "$LIMIT_PROBLEMS" ]; then
     CMD="$CMD --limit-problems $LIMIT_PROBLEMS"
