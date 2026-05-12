@@ -907,6 +907,9 @@ class AgentPPOTrainer(RayPPOTrainer):
         all_prompts_list = []
         all_responses_list = []
         all_rollout_logprobs_list = []
+        raw_completion_lens = []
+        retokenized_response_lens = []
+        response_gap_verbose_done = False
 
         step_numbers = []  # number of steps of each episode, 0 indexed
         all_steps_idx_list = []
@@ -938,6 +941,50 @@ class AgentPPOTrainer(RayPPOTrainer):
                 response_tokens = _to_token_tensor(step.get("completion_ids"), "completion_ids", idx, step_idx)
                 all_prompts_list.append(prompt_tokens)
                 all_responses_list.append(response_tokens)
+                resp_text = step.get("response", "") or ""
+                raw_n = int(response_tokens.numel())
+                retok_ids = self.tokenizer.encode(resp_text, add_special_tokens=False)
+                retok_n = len(retok_ids)
+                raw_completion_lens.append(raw_n)
+                retokenized_response_lens.append(retok_n)
+
+                gap = raw_n - retok_n
+                if (
+                    not response_gap_verbose_done
+                    and abs(gap) >= 80
+                    and self.global_steps <= 20
+                ):
+                    response_gap_verbose_done = True
+                    tk = self.tokenizer
+                    raw_ids = response_tokens.detach().cpu().tolist()
+                    special_ids = set(getattr(tk, "all_special_ids", []) or [])
+                    spec_positions = [(i, tid, tk.convert_ids_to_tokens([tid])[0]) for i, tid in enumerate(raw_ids) if tid in special_ids]
+
+                    preview_n = min(128, raw_n, max(1, retok_n))
+                    raw_pieces = tk.convert_ids_to_tokens(raw_ids[:preview_n])
+                    ret_pieces = tk.convert_ids_to_tokens(retok_ids[:preview_n])
+
+                    head_noskip = tk.decode(raw_ids[: min(384, raw_n)], skip_special_tokens=False)
+                    head_skip = tk.decode(raw_ids[: min(384, raw_n)], skip_special_tokens=True)
+
+                    print(
+                        "[response_len_debug_gap_tokens] "
+                        f"global_step={self.global_steps} traj_idx={idx} step_idx={step_idx} "
+                        f"raw_n={raw_n} retok_n={retok_n} gap={gap}",
+                        flush=True,
+                    )
+                    print(f"  raw_convert_ids_to_tokens[:{preview_n}]=", raw_pieces, flush=True)
+                    print(f"  retok_convert_ids_to_tokens[:{preview_n}]=", ret_pieces, flush=True)
+                    tail_k = min(64, raw_n, retok_n)
+                    if tail_k > 0:
+                        print(f"  raw_convert_ids_to_tokens[-{tail_k}:]=", tk.convert_ids_to_tokens(raw_ids[-tail_k:]), flush=True)
+                        print(f"  retok_convert_ids_to_tokens[-{tail_k}:]=", tk.convert_ids_to_tokens(retok_ids[-tail_k:]), flush=True)
+                    if spec_positions:
+                        print(f"  special_ids_in_completion (pos,id,piece), first 60: {spec_positions[:60]}", flush=True)
+                    else:
+                        print("  special_ids_in_completion: (none matched tokenizer.all_special_ids)", flush=True)
+                    print(f"  decode(raw_slice, skip_special_tokens=False)[:800]=\n{head_noskip[:800]!r}", flush=True)
+                    print(f"  decode(raw_slice, skip_special_tokens=True )[:800]=\n{head_skip[:800]!r}", flush=True)
 
                 step_logprobs = step.get("logprobs")
                 has_logprobs = step_logprobs is not None
@@ -971,6 +1018,18 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_steps_step_num.extend([len(episode_steps) for _ in range(len(episode_steps))])
             all_steps_step_ids.extend([f"{uids[idx]}_step{i}" for i in range(len(episode_steps))])
             all_steps_masked_out.extend([masked_out for _ in range(len(episode_steps))])
+
+        if raw_completion_lens:
+            print(
+                "[response_len_debug] "
+                f"global_step={self.global_steps} "
+                f"raw_mean={np.mean(raw_completion_lens):.2f} "
+                f"retok_mean={np.mean(retokenized_response_lens):.2f} "
+                f"raw_max={np.max(raw_completion_lens)} "
+                f"retok_max={np.max(retokenized_response_lens)} "
+                f"n_steps={len(raw_completion_lens)}",
+                flush=True,
+            )
 
         # left pad prompts
         max_prompt_length = self.config.data.max_prompt_length
