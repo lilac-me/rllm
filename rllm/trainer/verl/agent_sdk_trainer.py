@@ -39,7 +39,36 @@ from rllm.engine.agent_sdk_engine import AgentSdkEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason
+import os
+import sys
+import time
+import socket
+import traceback
+import faulthandler
+import sys
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger(__name__)
+faulthandler.enable(all_threads=True)
 
+
+def dbg(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    host = socket.gethostname()
+    pid = os.getpid()
+    rank = os.getenv("RANK", "NA")
+    local_rank = os.getenv("LOCAL_RANK", "NA")
+    msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
+    path = f"/home/g00841271/rllm_{socket.gethostname()}_{os.getpid()}.log"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{time.time()} {msg}\n")
+        f.flush()
+    
 
 class AgentSdkTrainer(RayPPOTrainer):
     """PPO trainer for agent workflows with stepwise advantage and rejection sampling."""
@@ -212,6 +241,14 @@ class AgentSdkTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
 
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+        
         batch = None
         solve_none = 0
         solve_all = 0
@@ -224,10 +261,15 @@ class AgentSdkTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
+            dbg(f"epoch {epoch}, step {self.global_steps} started")
             for batch_dict in self.train_dataloader:
-                do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.get("profile_steps") is not None else False
+                # do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.get("profile_steps") is not None else False
                 with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(do_profile)
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_tasks += len(new_batch.batch)
@@ -237,9 +279,14 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     # generate trajectories
-                    final_gen_batch_output = self.generate_trajectories(batch=new_batch, timing_raw=timing_raw)
-                    self.checkpoint_manager.sleep_replicas()
-
+                    with marked_timer("gen", timing_raw, color="red"):
+                        if curr_step_profile:
+                            self.async_rollout_manager.start_profile()
+                        final_gen_batch_output = self.generate_trajectories(batch=new_batch, timing_raw=timing_raw)
+                        self.checkpoint_manager.sleep_replicas()
+                        if curr_step_profile:
+                            self.async_rollout_manager.stop_profile()
+                            
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
                     new_batch = new_batch.sample_level_repeat(repeat_counts)
@@ -368,13 +415,22 @@ class AgentSdkTrainer(RayPPOTrainer):
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
+
+                        if "entropys" in old_log_prob.batch:
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                        else:
+                            metrics.update({"actor/entropy": 0.0})
+                        
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
@@ -485,7 +541,9 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
+                            dbg(f"into checkpoint_manager")
                             self.checkpoint_manager.update_weights(self.global_steps)
+                            dbg(f"out checkpoint_manager")
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -507,7 +565,18 @@ class AgentSdkTrainer(RayPPOTrainer):
                     metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
-                    self._stop_profiling(do_profile)
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
 
                 # training metrics
                 metrics.update(
@@ -737,6 +806,7 @@ class AgentSdkTrainer(RayPPOTrainer):
         if not world_sizes:
             return batch
 
+        world_sizes.append(self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n)
         world_size = reduce(math.lcm, world_sizes)
 
         batch = self._remove_padding(batch)  # Remove any padded steps from the batch (just in case)

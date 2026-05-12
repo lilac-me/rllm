@@ -44,8 +44,35 @@ from pathlib import Path
 from rllm.types import Trajectory
 from rllm.sdk.proxy.metadata_slug import assemble_routing_metadata, build_proxied_base_url
 
+import os
+import sys
+import time
+import socket
+import traceback
+import faulthandler
+import sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger(__name__)
+faulthandler.enable(all_threads=True)
 
+
+def dbg(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    host = socket.gethostname()
+    pid = os.getpid()
+    rank = os.getenv("RANK", "NA")
+    local_rank = os.getenv("LOCAL_RANK", "NA")
+    msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
+    path = f"/home/p00938733/rllm_{socket.gethostname()}_{os.getpid()}.log"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{time.time()} {msg}\n")
+        f.flush()
+    
 # ---------------------------------------------------------------------------
 # NPU operator mock (align with openhands-npu bring-up)
 # ---------------------------------------------------------------------------
@@ -177,10 +204,10 @@ _NPU_INSTRUCTION_TEMPLATE = """# 当前任务
 """
 
 
-def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
+def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str:
     pwd = Path(__file__).parent
     _WORKSPACE_PKG = pwd / "workspace"
-    workspace = tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-", dir=pwd/"workspace_temp")
+    workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=pwd/"workspace_temp")
     op_name = task.get("op_name", "operator")
     arch = task.get("arch", "ascend910b1")
     instruction = task.get("instruction", "Implement a simple vector_add-style operator.")
@@ -188,6 +215,7 @@ def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
 
 
     shutil.copytree(_WORKSPACE_PKG, workspace, dirs_exist_ok=True)
+    os.utime(workspace, None)
 
     # for name in _OPERATOR_SEED_NAMES:
     #     src = os.path.join(_WORKSPACE_PKG, name)
@@ -222,14 +250,13 @@ def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
 # Metrics & reward
 # ---------------------------------------------------------------------------
 
-def _load_metrics(workspace_dir: str) -> dict[str, Any] | None:
-    path = os.path.join(workspace_dir, "metrics.json")
+def _has_metrics(path: str) -> dict[str, Any] | None:
     if os.path.exists(path):
         try:
             with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("[openhands-npu] bad metrics.json: %s", exc)
+            dbg("[openhands-npu] bad metrics.json: %s, %s", exc, path) # TODO
     return None
 
 
@@ -256,15 +283,17 @@ def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) 
     if not os.path.exists(impl_file):
         logger.info("[openhands-npu] no impl file %s -> reward=0.0", impl_file)
         return 0.0
-
     # TODO: consider rejecting empty/stub-only impl files (os.path.getsize check)
 
-    perf = _load_metrics(workspace_dir)
+
+    basic_path = os.path.join(workspace_dir, "metrics.json")
+    perf = _has_metrics(basic_path)
     if not perf:
         logger.info("[openhands-npu] impl present but no metrics -> reward=0.2")
         return 0.2
 
     reward = _reward_from_metrics(perf)
+    dbg(f'KKKKKK, {perf}, {reward}')
 
     best_path = os.path.join(workspace_dir, "metrics_best.json")
     if os.path.exists(best_path):
@@ -281,6 +310,8 @@ def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) 
                 reward = best_reward
         except (json.JSONDecodeError, OSError):
             pass
+    
+    dbg(f'MMMMMMM, {os.path.exists(impl_file)}, {os.path.exists(best_path)}, {reward}')
 
     logger.info("[openhands-npu] final reward=%.3f", reward)
     return reward
@@ -297,27 +328,30 @@ def _archive_npu_artifacts(
     Controlled by env OPENHANDS_ARTIFACT_DIR. No-op if unset/empty.
     Never raises — archival failure must not affect training.
     """
+    metric_dir = workspace_dir + "/agent_workdir"
     if not _ARTIFACT_DIR:
         return
-    if not os.path.isdir(workspace_dir):
+    if not os.path.isdir(metric_dir):
         return
 
     op_name = task.get("op_name", "operator")
     ts = time.strftime("%Y%m%d_%H%M%S")
-    short_id = uuid.uuid4().hex[:6]
-    dest = os.path.join(_ARTIFACT_DIR, f"{trace_label}_{op_name}_{ts}_{short_id}")
+    # short_id = uuid.uuid4().hex[:6]
+    dest = os.path.join(_ARTIFACT_DIR, f"{workspace_dir.split('/')[-1]}_{trace_label}_{op_name}_{ts}")
 
     try:
         os.makedirs(dest, exist_ok=True)
 
         candidates = [
-            (os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl.py"),
+            (os.path.join(metric_dir, "conversation.log"), "conversation.log"),
+            (os.path.join(metric_dir, "conversation_result.json"), "conversation_result.json"),
+            (os.path.join(metric_dir, "src", f"{op_name}_triton_ascend_impl.py"),
              f"{op_name}_triton_ascend_impl.py"),
-            (os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl_best.py"),
+            (os.path.join(metric_dir, "src", f"{op_name}_triton_ascend_impl_best.py"),
              f"{op_name}_triton_ascend_impl_best.py"),
-            (os.path.join(workspace_dir, "metrics.json"), "metrics.json"),
-            (os.path.join(workspace_dir, "metrics_best.json"), "metrics_best.json"),
-            (os.path.join(workspace_dir, "INSTRUCTIONS.md"), "INSTRUCTIONS.md"),
+            (os.path.join(metric_dir, "metrics.json"), "metrics.json"),
+            (os.path.join(metric_dir, "metrics_best.json"), "metrics_best.json"),
+            (os.path.join(metric_dir, "INSTRUCTIONS.md"), "INSTRUCTIONS.md"),
         ]
 
         copied = 0
@@ -347,11 +381,12 @@ def _archive_npu_artifacts(
 
 
 def _trace_label_from_routing_metadata(metadata: dict[str, Any]) -> str:
-    uids = metadata.get("session_uids") or []
-    if uids:
-        return str(uids[-1])[:18]
+    # uids = metadata.get("session_uids") or []
+    # if uids:
+    #     return str(uids[-1])[:18]
     name = metadata.get("session_name")
-    return str(name or "none")[:18]
+    trace_label = str(name or "none").split('-')[-1].replace(':', '-')
+    return trace_label
 
 
 def _to_container_url(url: str) -> str:
@@ -401,12 +436,16 @@ def _run_openhands_container(
     # 当前仅挂载 workspace、entrypoint 及注入 ASCEND_RT_VISIBLE_DEVICES（若设置）。
     cmd = [
         "docker", "run",
-        "--rm",
+        #"--rm",  # TODO
         "-d",
         "--name", container_name,
-        "-e", f"LLM_BASE_URL=\"{proxied_url}\"",
+        "--network", "host",
+        "--ipc", "host",
+        "--shm-size", "500g",
+        "--privileged",
+        "-e", f"LLM_BASE_URL={proxied_url}",
         "-e", "LLM_API_KEY=EMPTY",
-        "-e", f"LLM_MODEL=\"openai/{_MODEL_NAME}\"",
+        "-e", f"LLM_MODEL=openai/{_MODEL_NAME}",
         "-e", f"OPERATOR_BACKEND={operator_backend}",
         "-e", f"OPERATOR_ARCH={arch}",
         "-e", f"OPERATOR_NAME={op_name}",
@@ -421,23 +460,35 @@ def _run_openhands_container(
         # 评估专用
         "-e", "EVAL_LOCK_DIR=/shared/device-locks",
         "-e", "EVAL_DEVICE_PREFIX=npu",
-        "-e", "EVAL_DEVICE_COUNT=2",
+        "-e", "EVAL_DEVICE_COUNT=1",
         "-e", "EVAL_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES",
         "-e", "EVAL_RETRY_INTERVAL=1.0",
         "-e", "EVAL_TIMEOUT=None",
         "-e", "EVAL_VERBOSE=true",
         
-        "--device", "/dev/davinci0",
-        "--device", "/dev/davinci1",
-        "--device", "/dev/davinci2",
-        "--device", "/dev/davinci3",
-        "--device", "/dev/davinci4",
-        "--device", "/dev/davinci5",
-        "--device", "/dev/davinci6",
-        "--device", "/dev/davinci7",
-        "--device", "/dev/davinci_manager",
-        "--device", "/dev/hisi_hdc",
-        "--device", "/dev/devmm_svm",
+        # "--device", "/dev/davinci0",
+        # "--device", "/dev/davinci1",
+        # "--device", "/dev/davinci2",
+        # "--device", "/dev/davinci3",
+        # "--device", "/dev/davinci4",
+        # "--device", "/dev/davinci5",
+        # "--device", "/dev/davinci6",
+        # "--device", "/dev/davinci7",
+        # "--device", "/dev/davinci_manager",
+        # "--device", "/dev/hisi_hdc",
+        # "--device", "/dev/devmm_svm",
+        
+        "-v", "/dev:/dev",
+        "-v", "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
+        "-v", "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro",
+        "-v", "/usr/local/dcmi:/usr/local/dcmi:ro",
+        "-v", "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro",
+        "-v", "/etc/ascend_install.info:/etc/ascend_install.info:ro",
+        "-v", "/usr/local/sbin:/usr/local/sbin:ro",
+        "-v", "/etc/localtime:/etc/localtime:ro",
+        "-v", "/etc/timezone:/etc/timezone:ro",
+        "-v", "/mnt/pipeline-data:/mnt/pipeline-data",
+        #"-v", "/opt/DPC:/opt/DPC",
 
         # os.environ["OBSERVER_API_URL"] = "http://127.0.0.1:18858"
         "-v", f"{workspace}:/opt/workspace",
@@ -448,16 +499,18 @@ def _run_openhands_container(
     ]
     cmd.extend([_OPENHANDS_IMAGE,])
     
-    logger.info(
-        "[openhands] Launching container %s (image=%s, proxied_url=%s...)",
-        container_name, _OPENHANDS_IMAGE, proxied_url[:70],
+    dbg(
+        f"[openhands] Launching container {container_name} (proxied_url={proxied_url[:70]}...)"
     )
-    breakpoint()
+    # breakpoint()
+    import shlex
+    print("DEBUG CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
+    dbg(" ".join(shlex.quote(c) for c in cmd))
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=_CONTAINER_TIMEOUT,
+            #timeout=_CONTAINER_TIMEOUT, # TODO
         )
         output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
         if result.returncode != 0:
@@ -465,15 +518,49 @@ def _run_openhands_container(
                 "[openhands] Container %s exited with code %d",
                 container_name, result.returncode,
             )
-        return output
+            return output
+    
+        wait_result = subprocess.run(
+            ["docker", "wait", container_name],
+            capture_output=True,
+            #timeout=_CONTAINER_TIMEOUT, # TODO
+        )
+        
+        dbg(f"wait_result={wait_result}, {wait_result.stdout.decode().strip()}")
+        try:
+            exit_code = int(wait_result.stdout.decode().strip())
+        except Exception as e: # TODO
+            logger.error(f"exit_code error, {e}")
+        
+        # 获取并保存日志
+        logs_result = subprocess.run(
+            ["docker", "logs", container_name],
+            capture_output=True,
+        )
+
+        logs = logs_result.stdout + logs_result.stderr
+        with open(workspace+"/agent_workdir/conversation.log", "wb") as f:
+            f.write(logs)
+
+        with open(workspace+"/agent_workdir/conversation_result.json", "w") as f:
+            json.dump({
+                "container": container_name,
+                "exit_code": exit_code,
+                "timestamp": time.time(),
+            }, f, indent=2)
+
+        return exit_code
+    
     except subprocess.TimeoutExpired:
         logger.error("[openhands] Container %s timed out", container_name)
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-        return ""
+        subprocess.run(["docker", "kill", container_name])
+        return -1
     except Exception:
         logger.exception("[openhands] Failed to run container %s", container_name)
-        return ""
-
+        return -1
+    finally:
+        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL)
+        print(f"[CLEANUP] removed {container_name}")
 
 # ---------------------------------------------------------------------------
 # Rollout entry point
@@ -538,7 +625,8 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     """
     task, config = _rollout_task_and_config(args, kwargs)
     # Raw proxy URL — rllm passes this before any slug is applied
-    proxy_url = config.get("base_url", "http://127.0.0.1:4000/v1")
+    base_url_port = os.getenv("OPENHANDS_BASE_URL_PORT", 4000)
+    proxy_url = config.get("base_url", f"http://127.0.0.1:{base_url_port}/v1")
 
     # Generate a unique session identifier for this rollout.
     # Encoding it in the URL lets the rllm proxy associate every OpenHands
@@ -552,12 +640,11 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     
     metadata = assemble_routing_metadata()
     trace_label = _trace_label_from_routing_metadata(metadata)
-    _uids = metadata.get("session_uids") or []
+
     logger.info(
-        "[openhands] proxy slug: n_uids=%d session_name=%r trace_tail=%s",
-        len(_uids),
+        "[openhands] proxy slug: session_uids=%r session_name=%r",
+        metadata.get("session_uids"),
         metadata.get("session_name"),
-        _uids[-1][-12:] if _uids else "",
     )
 
     # Build the proxied URL with embedded metadata slug.
@@ -569,7 +656,7 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     # reachable from inside the OpenHands Docker container.
     proxied_url = _to_container_url(proxied_url)
 
-    workspace = _setup_npu_operator_workspace(task)
+    workspace = _setup_npu_operator_workspace(task, trace_label)
     instruction = task.get("instruction", "")
     reward = 0.0
 
@@ -577,7 +664,8 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         output = _run_openhands_container(
             workspace, proxied_url, instruction, task=task
         )
-        reward = _npu_operator_reward(task, workspace, output)
+        metrics_dir = workspace + "/agent_workdir"
+        reward = _npu_operator_reward(task, metrics_dir, output)
         logger.info(
             "[openhands] trace_label=%s reward=%.2f instruction=%s",
             trace_label, reward, instruction[:80],
@@ -586,7 +674,6 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         logger.exception("[openhands] Rollout failed (trace_label=%s)", trace_label)
     finally:
         _archive_npu_artifacts(workspace, task, trace_label, reward)
-        shutil.rmtree(workspace, ignore_errors=True)
-
+        # shutil.rmtree(workspace, ignore_errors=True) # TODO
     return reward
 

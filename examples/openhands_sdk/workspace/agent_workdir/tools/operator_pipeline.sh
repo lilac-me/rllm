@@ -62,38 +62,70 @@ write_metrics() {
   local ast_ok="$1" corr_ok="$2" success="$3"
   local fw_lat="$4" impl_lat="$5" speedup="$6" error="$7"
 
-  local perf_json="null"
-  if [[ -n "${fw_lat}" && -n "${impl_lat}" && -n "${speedup}" ]]; then
-    perf_json="{\"framework_latency_ms\":${fw_lat},\"impl_latency_ms\":${impl_lat},\"speedup_vs_torch\":${speedup}}"
-  fi
+  AST_OK="$ast_ok" \
+  CORR_OK="$corr_ok" \
+  SUCCESS="$success" \
+  FW_LAT="$fw_lat" \
+  IMPL_LAT="$impl_lat" \
+  SPEEDUP="$speedup" \
+  ERROR_MSG="$error" \
+  ROOT="$ROOT" \
+  OP_NAME="$OP_NAME" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
 
-  local err_json="null"
-  if [[ -n "${error}" ]]; then
-    err_json="\"$(echo "${error}" | head -c 500 | tr '"' "'" | tr '\n' ' ')\""
-  fi
+root = Path(os.environ["ROOT"])
 
-  cat > "${ROOT}/metrics.json" <<EOJSON
-{
-  "schema_version": 2,
-  "op_name": "${OP_NAME}",
-  "success": ${success},
-  "ast_check_ok": ${ast_ok},
-  "correctness_ok": ${corr_ok},
-  "perf_data": ${perf_json},
-  "error": ${err_json}
+def to_num(x):
+    return None if x == "" else float(x)
+
+def to_bool(x):
+    return str(x).lower() in ("1", "true", "yes")
+
+fw_lat = os.environ.get("FW_LAT", "")
+impl_lat = os.environ.get("IMPL_LAT", "")
+speedup = os.environ.get("SPEEDUP", "")
+err = os.environ.get("ERROR_MSG", "")
+err = err[:500] if err else None
+
+perf_data = None
+if fw_lat and impl_lat and speedup:
+    perf_data = {
+        "framework_latency_ms": float(fw_lat),
+        "impl_latency_ms": float(impl_lat),
+        "speedup_vs_torch": float(speedup),
+    }
+
+metrics = {
+    "schema_version": 2,
+    "op_name": os.environ.get("OP_NAME", ""),
+    "success": to_bool(os.environ["SUCCESS"]),
+    "ast_check_ok": to_bool(os.environ["AST_OK"]),
+    "correctness_ok": to_bool(os.environ["CORR_OK"]),
+    "perf_data": perf_data,
+    "error": err,
 }
-EOJSON
 
-  # 兼容训练侧 reward
-  cat > "${ROOT}/profiling_results.json" <<EOJSON2
-{
-  "success": ${success},
-  "bandwidth_gbps": 0.0,
-  "execution_time_ms": ${impl_lat:-null},
-  "speedup_vs_torch": ${speedup:-null},
-  "error": ${err_json}
+(root / "metrics.json").write_text(
+    json.dumps(metrics, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+
+profiling = {
+    "success": to_bool(os.environ["SUCCESS"]),
+    "bandwidth_gbps": 0.0,
+    "execution_time_ms": to_num(impl_lat),
+    "speedup_vs_torch": to_num(speedup),
+    "error": err,
 }
-EOJSON2
+
+(root / "profiling_results.json").write_text(
+    json.dumps(profiling, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+PY
 }
 
 # ---------------------------------------------------------------------------

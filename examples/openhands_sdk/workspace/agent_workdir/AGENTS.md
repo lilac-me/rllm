@@ -37,7 +37,7 @@ bash tools/operator_pipeline.sh --op_name <op_name>
 
 每次 pipeline 报告 `success: true` 后，比较 `metrics.json` 中的 `speedup_vs_torch` 与已保存的最佳版本：
 
-- **首次成功**或**性能更优**时，保存为最佳版本：
+- 请务必注意，**首次成功**或**性能更优**时，保存为最佳版本：
   ```bash
   cp src/{op_name}_triton_ascend_impl.py src/{op_name}_triton_ascend_impl_best.py
   cp metrics.json metrics_best.json

@@ -17,12 +17,16 @@ v2 (event-driven):
 """
 from __future__ import annotations
 
+import functools
+import inspect
+import itertools
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -60,15 +64,14 @@ def _write_system_prompt() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Workspace skill merging (kept here to avoid monolithic entrypoint)
+# Workspace skill merging
 # ---------------------------------------------------------------------------
 
-def merge_workspace_skills(workspace_base: str, task_scope: Skill=None) -> list:
+def merge_workspace_skills(workspace_base: str, task_scope: Skill = None) -> list:
     """Merge AGENTS.md + .agents/skills/* + inline task_scope."""
     ws = Path(workspace_base)
     skills: list = []
 
-    # if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
     loaded = load_project_skills(work_dir=str(ws))
     if loaded:
         skills.extend(loaded if isinstance(loaded, list) else list(loaded))
@@ -83,7 +86,7 @@ def merge_workspace_skills(workspace_base: str, task_scope: Skill=None) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Env-var snapshot (redact secrets)
+# Env-var snapshot
 # ---------------------------------------------------------------------------
 
 _SECRET_PATTERNS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
@@ -101,16 +104,289 @@ def _safe_env_snapshot() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# LLM latency probe
+# ---------------------------------------------------------------------------
+
+def install_llm_latency_probe(
+    llm,
+    run_state: RunState | None = None,
+    log_path: str | None = None,
+):
+    """
+    Patch OpenHands SDK LLM instance to log latency for each LLM inference call.
+
+    It tries to wrap common LLM call methods:
+      - completion
+      - acompletion
+      - chat_completion
+      - achat_completion
+      - __call__
+
+    The exact method name depends on the OpenHands SDK version.
+    """
+
+    if log_path is None:
+        log_path = f"/home/p00938733/llm_latency_{os.getpid()}.log"
+
+    pid = os.getpid()
+    rank = os.getenv("RANK", "NA")
+    local_rank = os.getenv("LOCAL_RANK", "NA")
+    visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "NA")
+
+    call_counter = itertools.count()
+
+    def _write_latency_log(msg: str) -> None:
+        """
+        Write logs both to logger and to an independent file.
+
+        File logging is important because Ray may deduplicate stdout/stderr logs.
+        """
+
+        logger.info(msg)
+
+        try:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            logger.debug("[llm-latency] failed to write latency log", exc_info=True)
+
+    def _summarize_args(args, kwargs) -> str:
+        """
+        Avoid printing full prompt/messages because they may be huge.
+
+        Only print rough size/shape information.
+        """
+
+        parts = []
+
+        if args:
+            parts.append(f"args_len={len(args)}")
+
+        if kwargs:
+            parts.append(f"kwargs_keys={list(kwargs.keys())}")
+
+            messages = kwargs.get("messages")
+            if isinstance(messages, list):
+                parts.append(f"messages_len={len(messages)}")
+                try:
+                    char_len = 0
+                    for m in messages:
+                        if isinstance(m, dict):
+                            char_len += len(str(m.get("content", "")))
+                        else:
+                            char_len += len(str(m))
+                    parts.append(f"messages_chars={char_len}")
+                except Exception:
+                    pass
+
+            prompt = kwargs.get("prompt")
+            if prompt is not None:
+                parts.append(f"prompt_chars={len(str(prompt))}")
+
+            tools = kwargs.get("tools")
+            if tools is not None:
+                try:
+                    parts.append(f"tools_len={len(tools)}")
+                except Exception:
+                    parts.append("tools_present=True")
+
+        return " ".join(parts)
+
+    def _wrap_sync_method(method_name: str, orig_method):
+        @functools.wraps(orig_method)
+        def wrapper(*args, **kwargs):
+            call_id = next(call_counter)
+            start_wall = time.time()
+            start_perf = time.perf_counter()
+
+            if run_state is not None:
+                try:
+                    run_state.total_llm_calls += 1
+                except Exception:
+                    pass
+
+            arg_summary = _summarize_args(args, kwargs)
+
+            _write_latency_log(
+                f"[LLM_CALL_START] "
+                f"call_id={call_id} method={method_name} "
+                f"wall={start_wall:.6f} "
+                f"pid={pid} rank={rank} local_rank={local_rank} "
+                f"ASCEND_RT_VISIBLE_DEVICES={visible_devices} "
+                f"llm_type={type(llm).__name__} llm_id={id(llm)} "
+                f"{arg_summary}"
+            )
+
+            ok = False
+            try:
+                ret = orig_method(*args, **kwargs)
+                ok = True
+                return ret
+            except Exception as e:
+                elapsed = time.perf_counter() - start_perf
+                _write_latency_log(
+                    f"[LLM_CALL_ERROR] "
+                    f"call_id={call_id} method={method_name} "
+                    f"elapsed_s={elapsed:.6f} "
+                    f"error={repr(e)}\n"
+                    f"{traceback.format_exc()}"
+                )
+                raise
+            finally:
+                elapsed = time.perf_counter() - start_perf
+                end_wall = time.time()
+
+                _write_latency_log(
+                    f"[LLM_CALL_END] "
+                    f"call_id={call_id} method={method_name} ok={ok} "
+                    f"elapsed_s={elapsed:.6f} "
+                    f"start_wall={start_wall:.6f} end_wall={end_wall:.6f} "
+                    f"pid={pid} rank={rank} local_rank={local_rank}"
+                )
+
+        return wrapper
+
+    def _wrap_async_method(method_name: str, orig_method):
+        @functools.wraps(orig_method)
+        async def wrapper(*args, **kwargs):
+            call_id = next(call_counter)
+            start_wall = time.time()
+            start_perf = time.perf_counter()
+
+            if run_state is not None:
+                try:
+                    run_state.total_llm_calls += 1
+                except Exception:
+                    pass
+
+            arg_summary = _summarize_args(args, kwargs)
+
+            _write_latency_log(
+                f"[LLM_CALL_START] "
+                f"call_id={call_id} method={method_name} "
+                f"wall={start_wall:.6f} "
+                f"pid={pid} rank={rank} local_rank={local_rank} "
+                f"ASCEND_RT_VISIBLE_DEVICES={visible_devices} "
+                f"llm_type={type(llm).__name__} llm_id={id(llm)} "
+                f"{arg_summary}"
+            )
+
+            ok = False
+            try:
+                ret = await orig_method(*args, **kwargs)
+                ok = True
+                return ret
+            except Exception as e:
+                elapsed = time.perf_counter() - start_perf
+                _write_latency_log(
+                    f"[LLM_CALL_ERROR] "
+                    f"call_id={call_id} method={method_name} "
+                    f"elapsed_s={elapsed:.6f} "
+                    f"error={repr(e)}\n"
+                    f"{traceback.format_exc()}"
+                )
+                raise
+            finally:
+                elapsed = time.perf_counter() - start_perf
+                end_wall = time.time()
+
+                _write_latency_log(
+                    f"[LLM_CALL_END] "
+                    f"call_id={call_id} method={method_name} ok={ok} "
+                    f"elapsed_s={elapsed:.6f} "
+                    f"start_wall={start_wall:.6f} end_wall={end_wall:.6f} "
+                    f"pid={pid} rank={rank} local_rank={local_rank}"
+                )
+
+        return wrapper
+
+    candidate_methods = [
+        "completion",
+        "acompletion",
+        "chat_completion",
+        "achat_completion",
+        "__call__",
+    ]
+
+    patched = []
+
+    for method_name in candidate_methods:
+        if not hasattr(llm, method_name):
+            continue
+
+        orig_method = getattr(llm, method_name)
+
+        if not callable(orig_method):
+            continue
+
+        if getattr(orig_method, "_llm_latency_probe_patched", False):
+            continue
+
+        if inspect.iscoroutinefunction(orig_method):
+            wrapped = _wrap_async_method(method_name, orig_method)
+        else:
+            wrapped = _wrap_sync_method(method_name, orig_method)
+
+        setattr(wrapped, "_llm_latency_probe_patched", True)
+
+        try:
+            object.__setattr__(llm, method_name, wrapped)
+            patched.append(method_name)
+        except Exception:
+            logger.exception("[llm-latency] failed to patch method: %s", method_name)
+
+    _write_latency_log(
+        f"[LLM_PROBE_INSTALLED] "
+        f"pid={pid} rank={rank} local_rank={local_rank} "
+        f"llm_type={type(llm)} llm_id={id(llm)} "
+        f"patched_methods={patched} log_path={log_path}"
+    )
+
+    if not patched:
+        candidate_attrs = []
+        try:
+            for name in dir(llm):
+                try:
+                    attr = getattr(llm, name)
+                except Exception:
+                    continue
+                if callable(attr) and any(
+                    k in name.lower()
+                    for k in ["completion", "chat", "call", "response", "generate", "invoke"]
+                ):
+                    candidate_attrs.append(name)
+        except Exception:
+            pass
+
+        _write_latency_log(
+            f"[LLM_PROBE_WARNING] no method patched. "
+            f"llm_type={type(llm)} "
+            f"candidate_attrs={candidate_attrs}"
+        )
+
+    return patched
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat timer
 # ---------------------------------------------------------------------------
 
 class _HeartbeatTimer:
-    """Periodically emits a HeartbeatEvent via push_heartbeat_event().
+    """
+    Periodically emits a HeartbeatEvent via push_heartbeat_event().
 
     Uses a daemon thread so it never blocks program exit.
     """
 
-    def __init__(self, client: ObserverClient, run_state: RunState, interval_s: float = 15.0) -> None:
+    def __init__(
+        self,
+        client: ObserverClient,
+        run_state: RunState,
+        interval_s: float = 15.0,
+    ) -> None:
         self._client = client
         self._state = run_state
         self._interval = interval_s
@@ -161,7 +437,6 @@ def build_run_state() -> RunState:
         phase=AgentPhase.INITIALIZING,
         env_vars=_safe_env_snapshot(),
         extra_metadata=_parse_extra_metadata(),
-        
     )
     return state
 
@@ -186,6 +461,7 @@ def run() -> int:
     if not cfg.llm_base_url:
         logger.error("LLM_BASE_URL is not set. Exiting.")
         return 1
+
     if not cfg.task_instruction:
         logger.error("No task instruction provided. Exiting.")
         return 1
@@ -196,6 +472,11 @@ def run() -> int:
     logger.info("MAX_ITER     : %d", cfg.max_iterations)
     logger.info("SESSION_ID   : %s", cfg.session_id)
     logger.info("TASK         : %.120s", cfg.task_instruction)
+    logger.info(
+        "ASCEND_RT_VISIBLE_DEVICES : %s...",
+        os.getenv("ASCEND_RT_VISIBLE_DEVICES", "NA"),
+    )
+
     if cfg.observer_api_url:
         logger.info("OBSERVER_URL : %s", cfg.observer_api_url)
     else:
@@ -220,15 +501,19 @@ def run() -> int:
     heartbeat = _HeartbeatTimer(
         client=client,
         run_state=run_state,
-        interval_s=cfg.upload_interval_s,   # reuse the existing interval config
+        interval_s=cfg.upload_interval_s,
     )
     heartbeat.start()
 
     # ── Start pause controller ────────────────────────────────────────────
-    pause_ctrl = PauseController(run_state, client, poll_interval_s=cfg.pause_poll_interval_s)
+    pause_ctrl = PauseController(
+        run_state,
+        client,
+        poll_interval_s=cfg.pause_poll_interval_s,
+    )
     pause_ctrl.start()
 
-    # ── Build event callback (event-driven push) ──────────────────────────
+    # ── Build event callback ──────────────────────────────────────────────
     _event_cb = make_event_callback(run_state, client)
 
     # ── Build OpenHands SDK objects ───────────────────────────────────────
@@ -240,26 +525,39 @@ def run() -> int:
         max_output_tokens=4096,
     )
 
-#     _task_scope = (
-#     "You are a Triton-Ascend kernel generation agent. "
-#     f"Target architecture: {cfg.operator_backend}. "
-#     "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
-#     f"Implement ModelNew with @triton.jit kernels in src/{cfg.operat0r_name}_triton_ascend_impl.py. "
-#     "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
-#     f"Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name {cfg.operator_name}. "
-#     "Iterate until metrics.json reports success. Summarize results when done."
-# )
+    def debug_llm_identity(llm, agent):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        pid = os.getpid()
+        rank = os.getenv("RANK", "NA")
+        local_rank = os.getenv("LOCAL_RANK", "NA")
 
-    # _task_skill = Skill(
-    #     name="task_scope",
-    #     content=_task_scope,
-    #     trigger=None,
-    # )
+        msg = (
+            f"[{ts}] "
+            f"[pid={pid}] "
+            f"[rank={rank}] "
+            f"[local_rank={local_rank}] "
+            f"[input llm type={type(llm)}] "
+            f"[input llm id={id(llm)}] "
+            f"[agent.llm type={type(agent.llm)}] "
+            f"[agent.llm id={id(agent.llm)}] "
+            f"[same_obj={llm is agent.llm}]"
+        )
+
+        path = f"/home/p00938733/openhands_{os.getpid()}.log"
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{time.time()} {msg}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            logger.debug("[debug_llm_identity] failed to write log", exc_info=True)
+
+        logger.info(msg)
 
     try:
         _merged_skills = merge_workspace_skills(cfg.workspace_base)
     except Exception:
-        logger.exception("merge_workspace_skills failed; falling back to task_scope only")
+        logger.exception("merge_workspace_skills failed; falling back to empty skills")
         _merged_skills = []
 
     agent_context = AgentContext(
@@ -280,6 +578,20 @@ def run() -> int:
         ],
         agent_context=agent_context,
         system_prompt_filename=cfg.system_prompt_path,
+    )
+
+    debug_llm_identity(llm, agent)
+
+    # ── Install LLM latency probe ─────────────────────────────────────────
+    #
+    # Important:
+    #   Patch agent.llm instead of only llm, because Agent may internally keep,
+    #   copy, or wrap the LLM object depending on OpenHands SDK version.
+    #
+    install_llm_latency_probe(
+        agent.llm,
+        run_state=run_state,
+        log_path=f"/home/p00938733/llm_latency_{cfg.session_id}_{os.getpid()}.log",
     )
 
     conversation = Conversation(
@@ -329,23 +641,31 @@ def run() -> int:
             # Paused but no resume pending: wait for resume signal
             if exec_status == "paused":
                 logger.info("[runner] Conversation paused. Waiting for resume signal...")
-                while not pause_ctrl.resume_requested and not pause_ctrl._stop_event.is_set():
+
+                while (
+                    not pause_ctrl.resume_requested
+                    and not pause_ctrl._stop_event.is_set()
+                ):
                     time.sleep(0.5)
                     exec_status = conversation.state.execution_status.value
+
                     if exec_status not in ("paused",):
                         break
+
                 if pause_ctrl.resume_requested:
                     pause_ctrl.resume_requested = False
                     logger.info("[runner] Resuming after pause...")
                     continue
+
                 break
 
-            # All other (idle / waiting_for_confirmation) → done
+            # All other statuses, for example idle / waiting_for_confirmation
             break
 
         # Log LLM cost
         cost = 0.0
         llm_calls = run_state.total_llm_calls
+
         if llm.metrics is not None:
             cost = float(llm.metrics.accumulated_cost or 0.0)
             run_state.update_metrics(cost=cost, llm_calls=llm_calls)
@@ -370,15 +690,17 @@ def run() -> int:
         run_state.set_phase(AgentPhase.ERROR)
         run_state.set_error("KeyboardInterrupt")
         exit_code = 1
+
     except Exception as exc:
         logger.exception("Unhandled exception in runner.")
         run_state.set_phase(AgentPhase.ERROR)
         run_state.set_error(str(exc))
         exit_code = 1
+
     finally:
         run_state.set_running(False)
 
-        # ── Finish event (always) ─────────────────────────────────────────
+        # ── Finish event ─────────────────────────────────────────────────
         try:
             push_finish_event(
                 client,
