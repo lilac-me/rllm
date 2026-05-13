@@ -238,3 +238,5 @@ litellm_proxy_config_autogen.yaml
 !res[0-9].log
 
 kernel_meta
+checkpoints2
+/results
