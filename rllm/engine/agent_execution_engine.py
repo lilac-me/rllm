@@ -425,6 +425,7 @@ class AgentExecutionEngine:
                 "steps": episode_steps,
                 "trajectory_reward": trajectory.reward,
                 "idx": env.idx,
+                "chat_completions": agent.chat_completions,
                 "mc_returns": [step.mc_return for step in trajectory.steps][: len(episode_steps)],
                 "termination_reason": termination_reason,
             }
