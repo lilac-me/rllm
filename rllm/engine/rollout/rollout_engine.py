@@ -56,6 +56,27 @@ class RolloutEngine:
     def __init__(self, *args, **kwargs):
         pass
 
+    def _truncate_completion_after_eos(self, completion_ids: list[int], logprobs: list[float] | None = None) -> tuple[list[int], list[float] | None]:
+        tokenizer = getattr(self, "tokenizer", None)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            return completion_ids, logprobs
+
+        if isinstance(eos_token_id, (list, tuple, set)):
+            eos_token_ids = set(eos_token_id)
+        else:
+            eos_token_ids = {eos_token_id}
+
+        eos_idx = next((idx for idx, token_id in enumerate(completion_ids) if token_id in eos_token_ids), None)
+        if eos_idx is None:
+            return completion_ids, logprobs
+
+        keep_len = eos_idx + 1
+        completion_ids = completion_ids[:keep_len]
+        if logprobs is not None:
+            logprobs = logprobs[:keep_len]
+        return completion_ids, logprobs
+
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         raise NotImplementedError("get_model_response is not implemented")
 

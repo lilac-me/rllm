@@ -171,10 +171,7 @@ class OpenAIEngine(RolloutEngine):
                 except Exception:
                     completion_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-                parsed_output = self.chat_parser.parse_completion(completion_ids)
-
                 prompt_length = response.usage.prompt_tokens
-                completion_length = response.usage.completion_tokens
                 finish_reason = response.choices[0].finish_reason
 
                 try:
@@ -196,6 +193,10 @@ class OpenAIEngine(RolloutEngine):
                         prompt_logprobs = []
                 else:
                     prompt_logprobs = []
+
+                completion_ids, logprobs = self._truncate_completion_after_eos(completion_ids, logprobs)
+                parsed_output = self.chat_parser.parse_completion(completion_ids)
+                completion_length = len(completion_ids)
 
                 return ModelOutput(
                     text=text,
