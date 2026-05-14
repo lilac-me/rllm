@@ -32,7 +32,7 @@ from rllm.data.dataset import DatasetRegistry
 from rllm.trainer.agent_trainer import AgentTrainer
 
 _EX_DIR = os.path.dirname(os.path.abspath(__file__))
-_MOCK_NPU_PARQUET = os.path.join(_EX_DIR, "mock_npu_operator.parquet")
+_MOCK_NPU_PARQUET = os.path.join(_EX_DIR, "rl_single_ops.parquet")
 
 
 class _MockNPUOperatorParquetDataset:
@@ -57,10 +57,13 @@ def main(config):
     dataset_mode = os.environ.get("OPENHANDS_DATASET", "swe").strip().lower()
 
     if dataset_mode in ("mock_npu", "npu_operator", "npu"):
+        """ 
+        此处先注释，先构造parquet，后面直接读取
         from examples.openhands_sdk.create_mock_npu_operator_data import create_parquet
 
         if not os.path.isfile(_MOCK_NPU_PARQUET):
             create_parquet(_MOCK_NPU_PARQUET)
+        """
         train_dataset = _MockNPUOperatorParquetDataset("train")
         val_dataset = _MockNPUOperatorParquetDataset("test")
     else:
