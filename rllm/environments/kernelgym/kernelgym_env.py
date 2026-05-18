@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import os
 import sys
@@ -760,7 +761,11 @@ class KernelGymEnv(MultiTurnEnvironment):
         self._last_error = None
         self._last_result = None
 
-        self.session_uuid = uuid.uuid4().hex[:8]
+        if seed is not None:
+            stable_session_key = f"{self.problem_id}|{seed}"
+            self.session_uuid = hashlib.sha256(stable_session_key.encode("utf-8")).hexdigest()[:8]
+        else:
+            self.session_uuid = uuid.uuid4().hex[:8]
 
         return self.task, {}
 

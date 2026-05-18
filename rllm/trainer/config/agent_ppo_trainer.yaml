@@ -67,6 +67,12 @@ rllm:
     load_path: null
     dir: ${trainer.default_local_dir}/debug_rollouts
     filename: null
+  deterministic_rollout:
+    enable: False
+    seed: 0
+    request_seed: True
+    task_ids: True
+    seed_global_rng_per_trajectory: False
   distill:
     enable: False
     shared_tokenizer: False

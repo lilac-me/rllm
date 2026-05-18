@@ -6,10 +6,29 @@ set -euo pipefail
 set -x
 
 # ── vLLM / PyTorch 环境变量 ───────────────────────────────────────────────────
-export NCCL_ALGO=Ring,Tree
+DETERMINISTIC_SEED=${DETERMINISTIC_SEED:-1234}
+ROLLOUT_DO_SAMPLE=${ROLLOUT_DO_SAMPLE:-false}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.0}
+ROLLOUT_N=${ROLLOUT_N:-1}
+VAL_N=${VAL_N:-1}
+N_PARALLEL_AGENTS=${N_PARALLEL_AGENTS:-1}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
+DEBUG_ROLLOUT_DIR=${DEBUG_ROLLOUT_DIR:-"${PWD}/debug_rollouts_gpu_seed${DETERMINISTIC_SEED}"}
+DEBUG_ROLLOUT_LOAD_PATH=${DEBUG_ROLLOUT_LOAD_PATH:-}
+ENABLE_PROFILING=${ENABLE_PROFILING:-false}
+NUM_PERF_TRIALS=${NUM_PERF_TRIALS:-100}
+INIT_CORRECT_WEIGHT=${INIT_CORRECT_WEIGHT:-0.5}
+INIT_PERFORMANCE_WEIGHT=${INIT_PERFORMANCE_WEIGHT:-0.5}
+
+export PYTHONHASHSEED=${PYTHONHASHSEED:-$DETERMINISTIC_SEED}
+export NCCL_ALGO=${NCCL_ALGO:-Ring}
 export FORCE_BUILD=0
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512"
+export VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT:-1}
+export NVIDIA_TF32_OVERRIDE=${NVIDIA_TF32_OVERRIDE:-0}
+export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-":4096:8"}
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:256"
 
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -19,11 +38,11 @@ export VLLM_LOGGING_LEVEL=WARN
 export RAY_DEBUG_POST_MORTEM=0
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
-export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
+export PYTHONPATH=${PYTHONPATH:-}:$RLLM_DIR
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-export TOKENIZERS_PARALLELISM=true
+export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export HYDRA_FULL_ERROR=1
 
 # export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -53,6 +72,9 @@ ARGS=(
   # =========================
   data.train_batch_size=16
   data.val_batch_size=16
+  data.shuffle=false
+  data.seed=${DETERMINISTIC_SEED}
+  data.dataloader_num_workers=0
   data.max_prompt_length=24576      # 24K
   data.max_response_length=8192    # 18K
 
@@ -71,6 +93,8 @@ ARGS=(
   actor_rollout_ref.actor.optim.lr=1e-6
   actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean
   actor_rollout_ref.actor.ppo_mini_batch_size=8     # 实际 minibatch_size = minibatch_size * n_rollout // dp_size
+  actor_rollout_ref.actor.shuffle=false
+  actor_rollout_ref.actor.data_loader_seed=${DETERMINISTIC_SEED}
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768
   actor_rollout_ref.actor.use_kl_loss=False
@@ -84,6 +108,7 @@ ARGS=(
   # actor.megatron
   # =========================
   actor_rollout_ref.actor.strategy=megatron
+  actor_rollout_ref.actor.megatron.seed=${DETERMINISTIC_SEED}
   actor_rollout_ref.actor.megatron.use_mbridge=True
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
 
@@ -133,26 +158,37 @@ ARGS=(
   actor_rollout_ref.rollout.calculate_log_probs=True        # 记录 训推的 log_prob 确认是否存在diff
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.mode=async
-  actor_rollout_ref.rollout.enforce_eager=False
-  actor_rollout_ref.rollout.temperature=1.0
+  actor_rollout_ref.rollout.enforce_eager=True
+  actor_rollout_ref.rollout.do_sample=${ROLLOUT_DO_SAMPLE}
+  actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.7
   actor_rollout_ref.rollout.max_model_len=32768
-  actor_rollout_ref.rollout.n=16
-  actor_rollout_ref.rollout.val_kwargs.n=4
+  actor_rollout_ref.rollout.n=${ROLLOUT_N}
+  actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}
+  actor_rollout_ref.rollout.val_kwargs.do_sample=false
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0
+  actor_rollout_ref.rollout.enable_chunked_prefill=false
+  actor_rollout_ref.rollout.enable_prefix_caching=false
+  actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS}
+  ++actor_rollout_ref.rollout.seed=${DETERMINISTIC_SEED}
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
-  ++actor_rollout_ref.rollout.engine_kwargs.max_num_seqs=64
   ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
 
   rllm.rejection_sample.enable=True
+  rllm.deterministic_rollout.enable=True
+  rllm.deterministic_rollout.seed=${DETERMINISTIC_SEED}
+  rllm.deterministic_rollout.request_seed=True
+  rllm.deterministic_rollout.task_ids=True
+  rllm.debug_rollout.save=True
+  rllm.debug_rollout.dir=${DEBUG_ROLLOUT_DIR}
 
   # =========================
   # rllm
   # =========================
   rllm.mask_truncated_samples=False
-  +rllm.agent.engine_args.n_parallel_agents=96
+  +rllm.agent.engine_args.n_parallel_agents=${N_PARALLEL_AGENTS}
   rllm.agent.max_steps=3
   rllm.stepwise_advantage.enable=True
   rllm.stepwise_advantage.mode=broadcast #per_step
@@ -171,6 +207,7 @@ ARGS=(
   trainer.save_freq=20
   trainer.test_freq=20
   trainer.default_hdfs_dir=null
+  trainer.balance_batch=false
   trainer.total_epochs=100
 
   # # =========================
@@ -181,8 +218,8 @@ ARGS=(
   reward_model.reference_backend=triton
   reward_model.server_url="http://51.62.5.13:8202"
   reward_model.reward_func_name=calculate_reward_weighted
-  reward_model.init_correct_weight=0.5
-  reward_model.init_performance_weight=0.5
+  reward_model.init_correct_weight=${INIT_CORRECT_WEIGHT}
+  reward_model.init_performance_weight=${INIT_PERFORMANCE_WEIGHT}
 
   reward_model.speedup_reward_upper_bound=3.0
   reward_model.speedup_reward_lower_bound=0.0
@@ -196,9 +233,9 @@ ARGS=(
   reward_model.max_retries=2
   reward_model.task_timeout=600
   reward_model.task_timeout_in_client=150
-  reward_model.num_perf_trials=100
+  reward_model.num_perf_trials=${NUM_PERF_TRIALS}
   reward_model.num_correct_trials=5
-  reward_model.enable_profiling=true
+  reward_model.enable_profiling=${ENABLE_PROFILING}
   reward_model.verbose_errors=true
 
   reward_model.reward_weights.compilation=0.3
@@ -209,6 +246,10 @@ ARGS=(
   reward_model.coverage_reward.enable=false
   reward_model.coverage_reward.weight=0.25
 )
+
+if [[ -n "${DEBUG_ROLLOUT_LOAD_PATH}" ]]; then
+  ARGS+=(rllm.debug_rollout.load_path=${DEBUG_ROLLOUT_LOAD_PATH})
+fi
 
 # python3 -m examples.kernelgym.train_kernelgym "${ARGS[@]}"
 

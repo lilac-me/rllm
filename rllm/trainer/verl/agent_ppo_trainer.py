@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -75,6 +76,34 @@ class AgentPPOTrainer(RayPPOTrainer):
 
     def _get_debug_rollout_config(self):
         return self.config.rllm.get("debug_rollout", {})
+
+    def _get_deterministic_rollout_config(self):
+        return self.config.rllm.get("deterministic_rollout", {})
+
+    def _deterministic_rollout_enabled(self) -> bool:
+        return bool(self._get_deterministic_rollout_config().get("enable", False))
+
+    def _get_deterministic_rollout_seed(self) -> int:
+        deterministic_cfg = self._get_deterministic_rollout_config()
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        return int(deterministic_cfg.get("seed", rollout_cfg.get("seed", 0)))
+
+    def _make_uids(self, batch: DataProto, prefix: str, step: int) -> np.ndarray:
+        if not self._deterministic_rollout_enabled():
+            return np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+
+        extra_infos = batch.non_tensor_batch.get("extra_info", [None] * len(batch.batch))
+        seed = self._get_deterministic_rollout_seed()
+        uids = []
+        for idx in range(len(batch.batch)):
+            raw_extra_info = extra_infos[idx]
+            if isinstance(raw_extra_info, str):
+                stable_extra_info = raw_extra_info
+            else:
+                stable_extra_info = json.dumps(raw_extra_info, sort_keys=True, default=str)
+            digest = hashlib.sha256(f"{prefix}|{seed}|{step}|{idx}|{stable_extra_info}".encode("utf-8")).hexdigest()[:16]
+            uids.append(f"{prefix}-{step}-{idx}-{digest}")
+        return np.array(uids, dtype=object)
 
     def _debug_rollout_enabled(self) -> bool:
         debug_cfg = self._get_debug_rollout_config()
@@ -258,7 +287,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
             for batch_dict in self.train_dataloader:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                batch.non_tensor_batch["uid"] = self._make_uids(batch, prefix="train", step=self.global_steps)
                 batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n,
                     interleave=True,
@@ -567,9 +596,9 @@ class AgentPPOTrainer(RayPPOTrainer):
         rewards_lst = []
         data_source_lst = []
         uid_lst = []
-        for test_data in self.val_dataloader:
+        for val_batch_idx, test_data in enumerate(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
-            test_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
+            test_batch.non_tensor_batch["uid"] = self._make_uids(test_batch, prefix="val", step=val_batch_idx)
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             test_batch.meta_info = {
@@ -874,7 +903,13 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         def runner():
             async def consume():
-                async for item in self.agent_execution_engine.trajectory_generator(timing_raw=timing_raw, mode=mode, meta_info=meta_info, global_steps=global_steps):
+                async for item in self.agent_execution_engine.trajectory_generator(
+                    reset_seed=self._get_deterministic_rollout_seed(),
+                    timing_raw=timing_raw,
+                    mode=mode,
+                    meta_info=meta_info,
+                    global_steps=global_steps,
+                ):
                     queue.put(item)
                 queue.put(None)  # sentinel to signal done
 
