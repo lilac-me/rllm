@@ -22,6 +22,13 @@ MESSAGE_PASSTHROUGH_MARKER = "<|message_passthrough|>"
 LEGACY_MESSAGE_PASSTHROUGH_MARKER = "<|message_passtrhough|>"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
 def _split_message_passthrough(action: str) -> Tuple[str, str]:
     """Return kernel code and optional serialized messages from an action string."""
     for marker in (MESSAGE_PASSTHROUGH_MARKER, LEGACY_MESSAGE_PASSTHROUGH_MARKER):
@@ -227,8 +234,14 @@ class KernelGymEnv(MultiTurnEnvironment):
         self.detect_decoy_kernel = config.detect_decoy_kernel
         self.reference_backend = config.reference_backend
         self.train_id = str(getattr(config, "train_id", "") or "")
-        self.task_namespace = str(getattr(config, "task_namespace", "") or "").strip()
-        self.force_refresh = bool(getattr(config, "force_refresh", False))
+        ns_from_config = str(getattr(config, "task_namespace", "") or "").strip()
+        ns_from_env = (os.environ.get("KERNELGYM_TASK_NAMESPACE") or os.environ.get("TASK_NAMESPACE") or "").strip()
+        self.task_namespace = ns_from_config or ns_from_env
+        force_from_config = getattr(config, "force_refresh", None)
+        if force_from_config is None:
+            self.force_refresh = _env_flag("KERNELGYM_FORCE_REFRESH", default=False)
+        else:
+            self.force_refresh = bool(force_from_config)
         # eval_tag must be task-scoped (rollout vs validate), not config-scoped.
         self.eval_tag = ""
 

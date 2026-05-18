@@ -21,6 +21,8 @@ INIT_CORRECT_WEIGHT=${INIT_CORRECT_WEIGHT:-0.5}
 INIT_PERFORMANCE_WEIGHT=${INIT_PERFORMANCE_WEIGHT:-0.5}
 TASK_NAMESPACE=${TASK_NAMESPACE:-gpu}
 KERNELGYM_FORCE_REFRESH=${KERNELGYM_FORCE_REFRESH:-true}
+export KERNELGYM_TASK_NAMESPACE=${KERNELGYM_TASK_NAMESPACE:-$TASK_NAMESPACE}
+export KERNELGYM_FORCE_REFRESH=${KERNELGYM_FORCE_REFRESH}
 
 export PYTHONHASHSEED=${PYTHONHASHSEED:-$DETERMINISTIC_SEED}
 export NCCL_ALGO=${NCCL_ALGO:-Ring}
@@ -221,9 +223,6 @@ ARGS=(
   reward_model.reference_backend=triton
   reward_model.server_url="http://127.0.0.1:8002"
   reward_model.reward_func_name=calculate_reward_weighted
-  reward_model.train_id=${TASK_NAMESPACE}
-  reward_model.task_namespace=${TASK_NAMESPACE}
-  reward_model.force_refresh=${KERNELGYM_FORCE_REFRESH}
   reward_model.init_correct_weight=${INIT_CORRECT_WEIGHT}
   reward_model.init_performance_weight=${INIT_PERFORMANCE_WEIGHT}
 
