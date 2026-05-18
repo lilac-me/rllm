@@ -55,7 +55,7 @@
   - `NVIDIA_TF32_OVERRIDE=0`
   - `CUBLAS_WORKSPACE_CONFIG=:4096:8`
   - `CUDA_DEVICE_MAX_CONNECTIONS=1`
-  - `++actor_rollout_ref.rollout.seed=${DETERMINISTIC_SEED}`
+  - `++actor_rollout_ref.rollout.engine_kwargs.vllm.seed=${DETERMINISTIC_SEED}`
 - 关闭会改变 batch 排布的训练项：
   - `trainer.balance_batch=false`
 - 默认保存 rollout 调试快照：

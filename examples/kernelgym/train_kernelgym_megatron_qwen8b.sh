@@ -161,7 +161,7 @@ ARGS=(
   actor_rollout_ref.rollout.enable_chunked_prefill=false
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS}
-  ++actor_rollout_ref.rollout.seed=${DETERMINISTIC_SEED}
+  ++actor_rollout_ref.rollout.engine_kwargs.vllm.seed=${DETERMINISTIC_SEED}
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
   ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
 
