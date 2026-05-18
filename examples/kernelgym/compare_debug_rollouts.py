@@ -52,21 +52,45 @@ def _first_float_diff(left: list[float], right: list[float], atol: float, rtol: 
     return None
 
 
+def _trajectory_sort_key(item: dict, fallback_idx: int = 0) -> tuple[int, str, int, int]:
+    trajectory_key = item.get("trajectory_key")
+    if trajectory_key not in (None, ""):
+        return (0, str(trajectory_key), int(item.get("replica_idx", 0) or 0), int(item.get("idx", fallback_idx)))
+    task_id = item.get("task_id") or item.get("problem_id")
+    if task_id not in (None, ""):
+        return (1, str(task_id), int(item.get("replica_idx", 0) or 0), int(item.get("idx", fallback_idx)))
+    return (2, "", 0, int(item.get("idx", fallback_idx)))
+
+
+def _trajectory_label(item: dict, fallback_idx: int = 0) -> str:
+    idx = int(item.get("idx", fallback_idx))
+    trajectory_key = item.get("trajectory_key")
+    task_id = item.get("task_id") or item.get("problem_id")
+    replica_idx = int(item.get("replica_idx", 0) or 0)
+    if trajectory_key not in (None, ""):
+        return f"key={trajectory_key} replica={replica_idx} idx={idx}"
+    if task_id not in (None, ""):
+        return f"task={task_id} replica={replica_idx} idx={idx}"
+    return f"idx={idx}"
+
+
 def _compare_step_trajectories(left: list[dict], right: list[dict], atol: float, rtol: float) -> list[str]:
     errors = []
     if len(left) != len(right):
         return [f"trajectory count differs: {len(left)} vs {len(right)}"]
 
     for traj_pos, (left_traj, right_traj) in enumerate(zip(left, right, strict=False)):
-        left_idx = left_traj.get("idx", traj_pos)
-        right_idx = right_traj.get("idx", traj_pos)
-        if left_idx != right_idx:
-            errors.append(f"trajectory {traj_pos} idx differs: {left_idx} vs {right_idx}")
+        left_label = _trajectory_label(left_traj, traj_pos)
+        right_label = _trajectory_label(right_traj, traj_pos)
+        left_sort = _trajectory_sort_key(left_traj, traj_pos)
+        right_sort = _trajectory_sort_key(right_traj, traj_pos)
+        if left_sort[:3] != right_sort[:3]:
+            errors.append(f"trajectory identity differs: {left_label} vs {right_label}")
             break
 
         if not math.isclose(float(left_traj.get("trajectory_reward", 0.0)), float(right_traj.get("trajectory_reward", 0.0)), abs_tol=atol, rel_tol=rtol):
             errors.append(
-                f"trajectory idx={left_idx} reward differs: "
+                f"trajectory {left_label} reward differs: "
                 f"{left_traj.get('trajectory_reward')} vs {right_traj.get('trajectory_reward')}"
             )
             break
@@ -74,18 +98,18 @@ def _compare_step_trajectories(left: list[dict], right: list[dict], atol: float,
         left_steps = left_traj.get("steps", [])
         right_steps = right_traj.get("steps", [])
         if len(left_steps) != len(right_steps):
-            errors.append(f"trajectory idx={left_idx} step count differs: {len(left_steps)} vs {len(right_steps)}")
+            errors.append(f"trajectory {left_label} step count differs: {len(left_steps)} vs {len(right_steps)}")
             break
 
         for step_idx, (left_step, right_step) in enumerate(zip(left_steps, right_steps, strict=False)):
             for field in ("prompt_ids", "completion_ids"):
                 diff = _first_seq_diff(_as_list(left_step.get(field)), _as_list(right_step.get(field)))
                 if diff:
-                    errors.append(f"trajectory idx={left_idx} step={step_idx} {field} {diff}")
+                    errors.append(f"trajectory {left_label} step={step_idx} {field} {diff}")
                     return errors
             diff = _first_float_diff(_as_list(left_step.get("logprobs")), _as_list(right_step.get("logprobs")), atol, rtol)
             if diff:
-                errors.append(f"trajectory idx={left_idx} step={step_idx} logprobs {diff}")
+                errors.append(f"trajectory {left_label} step={step_idx} logprobs {diff}")
                 return errors
 
     return errors
@@ -97,15 +121,17 @@ def _compare_token_trajectories(left: list[dict], right: list[dict], atol: float
         return [f"trajectory count differs: {len(left)} vs {len(right)}"]
 
     for traj_pos, (left_traj, right_traj) in enumerate(zip(left, right, strict=False)):
-        left_idx = left_traj.get("idx", traj_pos)
-        right_idx = right_traj.get("idx", traj_pos)
-        if left_idx != right_idx:
-            errors.append(f"trajectory {traj_pos} idx differs: {left_idx} vs {right_idx}")
+        left_label = _trajectory_label(left_traj, traj_pos)
+        right_label = _trajectory_label(right_traj, traj_pos)
+        left_sort = _trajectory_sort_key(left_traj, traj_pos)
+        right_sort = _trajectory_sort_key(right_traj, traj_pos)
+        if left_sort[:3] != right_sort[:3]:
+            errors.append(f"trajectory identity differs: {left_label} vs {right_label}")
             break
 
         if not math.isclose(float(left_traj.get("trajectory_reward", 0.0)), float(right_traj.get("trajectory_reward", 0.0)), abs_tol=atol, rel_tol=rtol):
             errors.append(
-                f"trajectory idx={left_idx} reward differs: "
+                f"trajectory {left_label} reward differs: "
                 f"{left_traj.get('trajectory_reward')} vs {right_traj.get('trajectory_reward')}"
             )
             break
@@ -113,7 +139,7 @@ def _compare_token_trajectories(left: list[dict], right: list[dict], atol: float
         for field in ("prompt_tokens", "response_tokens", "response_masks"):
             diff = _first_seq_diff(_as_list(left_traj.get(field)), _as_list(right_traj.get(field)))
             if diff:
-                errors.append(f"trajectory idx={left_idx} {field} {diff}")
+                errors.append(f"trajectory {left_label} {field} {diff}")
                 return errors
 
     return errors
@@ -135,8 +161,12 @@ def main() -> int:
         print(f"mode differs: {left_payload.get('mode')} vs {right_payload.get('mode')}")
         return 1
 
-    left_trajectories = sorted(left_payload["trajectories"], key=lambda item: item.get("idx", 0))
-    right_trajectories = sorted(right_payload["trajectories"], key=lambda item: item.get("idx", 0))
+    left_trajectories = sorted(
+        left_payload["trajectories"], key=lambda item: _trajectory_sort_key(item, item.get("idx", 0))
+    )
+    right_trajectories = sorted(
+        right_payload["trajectories"], key=lambda item: _trajectory_sort_key(item, item.get("idx", 0))
+    )
     mode = left_payload.get("mode")
 
     if mode == "step":

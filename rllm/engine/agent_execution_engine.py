@@ -7,6 +7,7 @@ import random
 import time
 import traceback
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -169,13 +170,26 @@ class AgentExecutionEngine:
             return f"{identity}"
         return f"env_idx:{env_idx}"
 
-    def _trajectory_seed(self, reset_seed: int, global_steps: int, trajectory_key: str) -> int:
-        base_seed = self.deterministic_rollout_seed if self.deterministic_rollout_seed is not None else reset_seed
-        return self._stable_int(("trajectory", base_seed, global_steps, trajectory_key))
+    @staticmethod
+    def _trajectory_instance_key(trajectory_key: str, replica_idx: int) -> str:
+        return f"{trajectory_key}|replica:{replica_idx}"
 
-    def _request_seed(self, trajectory_seed: int, global_steps: int, trajectory_key: str, step_idx: int) -> int:
+    def _trajectory_seed(self, reset_seed: int, global_steps: int, trajectory_key: str, replica_idx: int = 0) -> int:
+        base_seed = self.deterministic_rollout_seed if self.deterministic_rollout_seed is not None else reset_seed
+        trajectory_instance_key = self._trajectory_instance_key(trajectory_key, replica_idx)
+        return self._stable_int(("trajectory", base_seed, global_steps, trajectory_instance_key))
+
+    def _request_seed(
+        self,
+        trajectory_seed: int,
+        global_steps: int,
+        trajectory_key: str,
+        step_idx: int,
+        replica_idx: int = 0,
+    ) -> int:
+        trajectory_instance_key = self._trajectory_instance_key(trajectory_key, replica_idx)
         return self._stable_int(
-            ("request", self.deterministic_rollout_seed, trajectory_seed, global_steps, trajectory_key, step_idx)
+            ("request", self.deterministic_rollout_seed, trajectory_seed, global_steps, trajectory_instance_key, step_idx)
         )
 
     @staticmethod
@@ -247,7 +261,7 @@ class AgentExecutionEngine:
         self.agents = agents
 
     async def run_agent_trajectory_async(
-        self, idx, application_id, seed=0, mode="Text", global_steps=0, trajectory_key=None, **kwargs
+        self, idx, application_id, seed=0, mode="Text", global_steps=0, trajectory_key=None, replica_idx=0, **kwargs
     ):
         """Run a single agent's trajectory asynchronously"""
         agent = self.agents[idx]
@@ -317,7 +331,7 @@ class AgentExecutionEngine:
             request_kwargs = dict(kwargs)
             request_kwargs["max_tokens"] = max_tokens
             if self.deterministic_request_seed:
-                request_kwargs["seed"] = self._request_seed(seed, global_steps, trajectory_key, step_idx)
+                request_kwargs["seed"] = self._request_seed(seed, global_steps, trajectory_key, step_idx, replica_idx)
 
             start_time = time.time()
             model_output = await self.get_model_response(prompt_messages, application_id, **request_kwargs)
@@ -472,12 +486,17 @@ class AgentExecutionEngine:
             return trajectory
         elif mode == "Token":
             prompt_tokens, response_tokens, response_masks, is_valid_trajectory = self.assemble_steps(episode_steps)
+            task = getattr(env, "task", {})
             token_result = {
                 "prompt_tokens": prompt_tokens,
                 "response_tokens": response_tokens,
                 "response_masks": response_masks,
                 "trajectory_reward": trajectory.reward,
                 "idx": env.idx,
+                "trajectory_key": trajectory_key,
+                "replica_idx": replica_idx,
+                "task_id": task.get("task_id") if isinstance(task, dict) else None,
+                "problem_id": task.get("problem_id") if isinstance(task, dict) else None,
                 "chat_completions": agent.chat_completions,
                 "metrics": {
                     # Total number of steps taken in the trajectory
@@ -497,10 +516,15 @@ class AgentExecutionEngine:
         elif mode == "Conversation":
             return agent.chat_completions
         elif mode == "Step":
+            task = getattr(env, "task", {})
             steps_result = {
                 "steps": episode_steps,
                 "trajectory_reward": trajectory.reward,
                 "idx": env.idx,
+                "trajectory_key": trajectory_key,
+                "replica_idx": replica_idx,
+                "task_id": task.get("task_id") if isinstance(task, dict) else None,
+                "problem_id": task.get("problem_id") if isinstance(task, dict) else None,
                 "mc_returns": [step.mc_return for step in trajectory.steps][: len(episode_steps)],
                 "termination_reason": termination_reason,
             }
@@ -572,14 +596,15 @@ class AgentExecutionEngine:
         return prompt_tokens, response_tokens, response_masks, is_valid_trajectory
 
     async def run_agent_trajectory_with_retry(
-        self, idx, seed=0, mode="Text", global_steps=0, trajectory_key=None, **kwargs
+        self, idx, seed=0, mode="Text", global_steps=0, trajectory_key=None, replica_idx=0, **kwargs
     ):
         if trajectory_key is None:
             trajectory_key = f"env_idx:{idx}"
         for retry_idx in range(self.retry_limit):
             try:
                 if self.deterministic_rollout:
-                    trajectory_digest = hashlib.sha256(trajectory_key.encode("utf-8")).hexdigest()[:16]
+                    trajectory_instance_key = self._trajectory_instance_key(trajectory_key, replica_idx)
+                    trajectory_digest = hashlib.sha256(trajectory_instance_key.encode("utf-8")).hexdigest()[:16]
                     application_id = (
                         f"rllm-{self.deterministic_rollout_seed}-{global_steps}-{trajectory_digest}-{retry_idx}"
                     )
@@ -593,6 +618,7 @@ class AgentExecutionEngine:
                         mode=mode,
                         global_steps=global_steps,
                         trajectory_key=trajectory_key,
+                        replica_idx=replica_idx,
                         **kwargs,
                     ),
                     timeout=7200,
@@ -618,12 +644,18 @@ class AgentExecutionEngine:
 
         semaphore = asyncio.Semaphore(self.n_parallel_agents)
 
-        async def launch_one_trajectory_task(env_idx: int):
+        trajectory_keys = [self._trajectory_key(self.envs[env_idx], env_idx) for env_idx in range(len(self.envs))]
+        key_counts: dict[str, int] = defaultdict(int)
+        replica_indices = []
+        for key in trajectory_keys:
+            replica_indices.append(key_counts[key])
+            key_counts[key] += 1
+
+        async def launch_one_trajectory_task(env_idx: int, trajectory_key: str, replica_idx: int):
             async with semaphore:
                 try:
-                    trajectory_key = self._trajectory_key(self.envs[env_idx], env_idx)
                     trajectory_seed = (
-                        self._trajectory_seed(reset_seed, global_steps, trajectory_key)
+                        self._trajectory_seed(reset_seed, global_steps, trajectory_key, replica_idx)
                         if self.deterministic_rollout
                         else reset_seed
                     )
@@ -633,6 +665,7 @@ class AgentExecutionEngine:
                         mode=mode,
                         global_steps=global_steps,
                         trajectory_key=trajectory_key,
+                        replica_idx=replica_idx,
                         **kwargs,
                     )
                 except Exception as e:
@@ -644,7 +677,9 @@ class AgentExecutionEngine:
 
         # Create all N conceptual tasks. Their execution will be throttled by the semaphore
         # and the availability of agent/env indices.
-        tasks_to_run = [launch_one_trajectory_task(i) for i in range(len(self.envs))]
+        tasks_to_run = [
+            launch_one_trajectory_task(i, trajectory_keys[i], replica_indices[i]) for i in range(len(self.envs))
+        ]
 
         tasks_completed = 0
         for coro in asyncio.as_completed(tasks_to_run):

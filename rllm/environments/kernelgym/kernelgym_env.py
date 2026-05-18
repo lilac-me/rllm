@@ -227,6 +227,8 @@ class KernelGymEnv(MultiTurnEnvironment):
         self.detect_decoy_kernel = config.detect_decoy_kernel
         self.reference_backend = config.reference_backend
         self.train_id = str(getattr(config, "train_id", "") or "")
+        self.task_namespace = str(getattr(config, "task_namespace", "") or "").strip()
+        self.force_refresh = bool(getattr(config, "force_refresh", False))
         # eval_tag must be task-scoped (rollout vs validate), not config-scoped.
         self.eval_tag = ""
 
@@ -774,8 +776,22 @@ class KernelGymEnv(MultiTurnEnvironment):
         self.history.append(action)
         source_task = self.task or {}
 
-        #! kernelGYM 要求 task_id 为 problem_session_round 的形式，如果错误匹配，可能不会触发校验，直接走缓存。
-        task_id = f"{source_task.get('problem_id', 'task')}_{self.session_uuid}_{global_steps}|{self.current_turn}"
+        #! kernelGYM 按 task_id 去重缓存；共用服务端时需将 namespace 编进 task_id 以避免串扰。
+        raw_problem_id = str(source_task.get("problem_id", "task"))
+        namespace = (self.task_namespace or self.train_id or "").strip()
+        if namespace:
+            namespace_token = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:8]
+            tail = f"_{namespace_token}_{self.session_uuid}_{global_steps}|{self.current_turn}"
+        else:
+            tail = f"_{self.session_uuid}_{global_steps}|{self.current_turn}"
+        max_problem_len = max(1, 100 - len(tail))
+        if len(raw_problem_id) > max_problem_len:
+            digest = hashlib.sha256(raw_problem_id.encode("utf-8")).hexdigest()[:8]
+            keep = max(1, max_problem_len - 9)  # reserve "_{digest}"
+            problem_id = f"{raw_problem_id[:keep]}_{digest}"
+        else:
+            problem_id = raw_problem_id
+        task_id = f"{problem_id}{tail}"
 
         action, llm_messages = _split_message_passthrough(action)
 
@@ -802,7 +818,8 @@ class KernelGymEnv(MultiTurnEnvironment):
             "verbose_errors": self.verbose_errors,
             "detect_decoy_kernel": self.detect_decoy_kernel,
             "reference_backend": self.reference_backend,
-            "llm_messages": llm_messages
+            "llm_messages": llm_messages,
+            "force_refresh": bool(source_task.get("force_refresh", self.force_refresh)),
         }
 
         reward, meta_info = self.get_reward_and_next_obs(task, action=action)
