@@ -29,11 +29,17 @@ def _as_list(value: Any) -> list:
 
 
 def _first_seq_diff(left: list, right: list) -> str | None:
-    if len(left) != len(right):
-        return f"length differs: {len(left)} vs {len(right)}"
     for idx, (left_value, right_value) in enumerate(zip(left, right, strict=False)):
         if left_value != right_value:
             return f"position {idx}: {left_value} vs {right_value}"
+    if len(left) != len(right):
+        common_len = min(len(left), len(right))
+        left_next = left[common_len : common_len + 5]
+        right_next = right[common_len : common_len + 5]
+        return (
+            f"length differs: {len(left)} vs {len(right)}; "
+            f"common_prefix={common_len}; left_next={left_next}; right_next={right_next}"
+        )
     return None
 
 
