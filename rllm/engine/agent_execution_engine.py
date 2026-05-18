@@ -1,11 +1,16 @@
 import asyncio
+import hashlib
 import logging
+import os
+import random
 import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 try:
+    import numpy as np
     import torch
 except ImportError as err:
     raise ImportError("AgentExecutionEngine requires extra dependencies. Install with: pip install rllm[train]") from err
@@ -97,6 +102,13 @@ class AgentExecutionEngine:
 
         self.rollout_engine_args = rollout_engine_args
         self.sampling_params = kwargs.get("sampling_params", {})  # for openai api requests
+        deterministic_cfg = self.config.get("rllm", {}).get("deterministic_rollout", {}) if self.config is not None else {}
+        rollout_cfg = self.config.get("actor_rollout_ref", {}).get("rollout", {}) if self.config is not None else {}
+        self.deterministic_rollout = bool(deterministic_cfg.get("enable", False))
+        self.deterministic_rollout_seed = int(deterministic_cfg.get("seed", rollout_cfg.get("seed", 0)))
+        self.deterministic_request_seed = bool(deterministic_cfg.get("request_seed", self.deterministic_rollout))
+        self.deterministic_task_ids = bool(deterministic_cfg.get("task_ids", self.deterministic_rollout))
+        self.seed_global_rng_per_trajectory = bool(deterministic_cfg.get("seed_global_rng_per_trajectory", False))
 
         assert self.engine_name in ["openai", "verl", "tinker"], "Currently only openai, verl and tinker are supported as rollout engine"
         if self.engine_name == "openai":
@@ -129,6 +141,36 @@ class AgentExecutionEngine:
 
         # Create a thread pool executor for environment interactions (i.e. step, reset, close)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    @staticmethod
+    def _stable_int(parts, modulo: int = 2**31 - 1) -> int:
+        payload = "|".join(str(part) for part in parts)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return int(digest[:16], 16) % modulo
+
+    def _trajectory_seed(self, reset_seed: int, global_steps: int, env_idx: int) -> int:
+        base_seed = self.deterministic_rollout_seed if self.deterministic_rollout_seed is not None else reset_seed
+        return self._stable_int(("trajectory", base_seed, global_steps, env_idx))
+
+    def _request_seed(self, trajectory_seed: int, global_steps: int, env_idx: int, step_idx: int) -> int:
+        return self._stable_int(("request", self.deterministic_rollout_seed, trajectory_seed, global_steps, env_idx, step_idx))
+
+    @staticmethod
+    def _seed_global_rng(seed: int):
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed % (2**32))
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    @staticmethod
+    def _reset_env_with_optional_seed(env: BaseEnv, seed: int):
+        try:
+            return env.reset(seed=seed)
+        except TypeError:
+            logger.warning("Environment reset() does not accept seed; falling back to unseeded reset.")
+            return env.reset()
 
     async def get_model_response(self, prompt, application_id, **kwargs) -> str:
         """
@@ -204,7 +246,11 @@ class AgentExecutionEngine:
 
         # Reset environment with the task using the executor
         loop = asyncio.get_event_loop()
-        observation, info = await loop.run_in_executor(self.executor, env.reset)
+        if self.deterministic_rollout and self.seed_global_rng_per_trajectory:
+            # Disabled by default because concurrent trajectories share process-global RNG state.
+            self._seed_global_rng(seed)
+        reset_fn = partial(self._reset_env_with_optional_seed, env, seed) if self.deterministic_task_ids else env.reset
+        observation, info = await loop.run_in_executor(self.executor, reset_fn)
         info["max_steps"] = self.max_steps
 
         # Reset agent
@@ -241,10 +287,13 @@ class AgentExecutionEngine:
                     termination_reason = "PROMPT_TRUNCATION"
                     break
 
-            kwargs["max_tokens"] = max_tokens
+            request_kwargs = dict(kwargs)
+            request_kwargs["max_tokens"] = max_tokens
+            if self.deterministic_request_seed:
+                request_kwargs["seed"] = self._request_seed(seed, global_steps, idx, step_idx)
 
             start_time = time.time()
-            model_output = await self.get_model_response(prompt_messages, application_id, **kwargs)
+            model_output = await self.get_model_response(prompt_messages, application_id, **request_kwargs)
             response = model_output.text
             delta_time = time.time() - start_time
             llm_time += delta_time
@@ -496,9 +545,12 @@ class AgentExecutionEngine:
         return prompt_tokens, response_tokens, response_masks, is_valid_trajectory
 
     async def run_agent_trajectory_with_retry(self, idx, seed=0, mode="Text", global_steps=0, **kwargs):
-        for _ in range(self.retry_limit):
+        for retry_idx in range(self.retry_limit):
             try:
-                application_id = str(uuid.uuid4())
+                if self.deterministic_rollout:
+                    application_id = f"rllm-{self.deterministic_rollout_seed}-{global_steps}-{idx}-{retry_idx}"
+                else:
+                    application_id = str(uuid.uuid4())
                 return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, global_steps=global_steps, **kwargs), timeout=7200)
             except Exception:
                 traceback.print_exc()
@@ -524,9 +576,10 @@ class AgentExecutionEngine:
         async def launch_one_trajectory_task(env_idx: int):
             async with semaphore:
                 try:
+                    trajectory_seed = self._trajectory_seed(reset_seed, global_steps, env_idx) if self.deterministic_rollout else reset_seed
                     result = await self.run_agent_trajectory_with_retry(
                         idx=env_idx,
-                        seed=reset_seed,
+                        seed=trajectory_seed,
                         mode=mode,
                         global_steps=global_steps,
                         **kwargs,
