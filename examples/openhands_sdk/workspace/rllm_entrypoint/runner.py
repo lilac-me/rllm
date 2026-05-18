@@ -126,7 +126,7 @@ def install_llm_latency_probe(
     """
 
     if log_path is None:
-        log_path = f"/home/p00938733/llm_latency_{os.getpid()}.log"
+        log_path = f"/home/t00893162/llm_latency_{os.getpid()}.log"
 
     pid = os.getpid()
     rank = os.getenv("RANK", "NA")
@@ -522,7 +522,7 @@ def run() -> int:
         model=cfg.llm_model,
         api_key=SecretStr(cfg.llm_api_key),
         base_url=cfg.llm_base_url or None,
-        max_output_tokens=4096,
+        max_output_tokens=2048,
     )
 
     def debug_llm_identity(llm, agent):
@@ -543,7 +543,7 @@ def run() -> int:
             f"[same_obj={llm is agent.llm}]"
         )
 
-        path = f"/home/p00938733/openhands_{os.getpid()}.log"
+        path = f"/home/t00893162/openhands_{os.getpid()}.log"
         try:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"{time.time()} {msg}\n")
@@ -591,7 +591,7 @@ def run() -> int:
     install_llm_latency_probe(
         agent.llm,
         run_state=run_state,
-        log_path=f"/home/p00938733/llm_latency_{cfg.session_id}_{os.getpid()}.log",
+        log_path=f"/home/t00893162/llm_latency_{cfg.session_id}_{os.getpid()}.log",
     )
 
     conversation = Conversation(

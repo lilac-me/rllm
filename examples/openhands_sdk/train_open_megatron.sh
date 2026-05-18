@@ -20,22 +20,22 @@
 #   OPENHANDS_IMAGE     — OpenHands Docker image to run per rollout
 #   OPENHANDS_DATASET   — swe (default) | mock_npu  (算子 bring-up：mock parquet + profiling mock)
 # ==============================================================================
-pkill -9 python
-pkill -9 torchrun
+# pkill -9 python
+# pkill -9 torchrun
 set -euo pipefail
 set -x
 
 # First time
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
-export MODEL_PATH=/home/p00938733/Qwen3-8B
-# export MODEL_PATH=/home/p00938733/Qwen3-Coder-30B-A3B-Instruct
+# export MODEL_PATH=/home/t00893162/models/Qwen3-8B
+export MODEL_PATH=/home/t00893162/models/Qwen3.6-35B-A3B
 export PROXY_PORT=5000
 
 export ASCEND_LAUNCH_BLOCKING=1 # TODO
 
 nic_name="ens1f3"
-export HCCL_IF_IP=80.48.5.63
+export HCCL_IF_IP=80.48.5.88
 export GLOO_SOCKET_IFNAME=$nic_name
 export TP_SOCKET_IFNAME=$nic_name
 export HCCL_SOCKET_IFNAME=$nic_name
@@ -48,6 +48,10 @@ export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 export RAY_DEBUG_POST_MORTEM=0
 export RAY_DEDUP_LOGS=0
 export VLLM_ASCEND_ENABLE_NZ=0
+
+# vLLM timeout settings — NPU inference can be slow, especially with enforce_eager=True
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=86400  # 24 hours
+export VLLM_RPC_TIMEOUT=86400000                # 24 hours (ms)
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
@@ -67,8 +71,8 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-# export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
@@ -82,24 +86,27 @@ export HYDRA_FULL_ERROR=1
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
-# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/p00938733/Qwen3-8B}"
-export OPENHANDS_MODEL_NAME=$MODEL_PATH
+# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/t00893162/Qwen3-8B}"
+# export OPENHANDS_MODEL_NAME=$MODEL_PATH
+# LiteLLM proxy 上注册的模型名（必须与 proxy config 中的 model_name 一致）
+# proxy 里用的是 actor_rollout_ref.model.path，即完整路径
+export OPENHANDS_MODEL_NAME="${MODEL_PATH}"
 export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
-export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-14}"
+export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
-export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/p00938733/openhands_results}"
+export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/t00893162/openhands_results}"
 
 # ------------------------------------------------------------------------------
 # Training parameters
 # ------------------------------------------------------------------------------
-N_GPUS="${N_GPUS:-16}"
+N_GPUS="${N_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-ROLLOUT_N="${ROLLOUT_N:-2}"
+ROLLOUT_N="${ROLLOUT_N:-1}"
 PROXY_PORT="${PROXY_PORT:-4000}"
-TRACE_DB_PATH="${TRACE_DB_PATH:-/home/p00938733/rllm-openhands-traces.db}"
+TRACE_DB_PATH="${TRACE_DB_PATH:-/home/t00893162/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-rllm-openhands}"
-logs=/home/p00938733/verl-rllm.log
+logs=/home/t00893162/verl-rllm.log
 
 # profiling configuration
 PROFILE_STEPS="[1]"
@@ -109,16 +116,16 @@ DISCRETE=False
 # PROFILE_CONTINUOUS_STEPS=True
 
 # profiling NPU options
-SAVE_PATH="/home/p00938733/profile_data/all"
+SAVE_PATH="/home/t00893162/profile_data/all"
 LEVEL="level1"
 CONTENTS=['npu','cpu','memory']
 #CONTENTS=['npu','cpu','memory','module','stack']
 ANALYSIS=True
 
 export OOM_SNAPSHOT_ENABLE=1
-export OOM_SNAPSHOT_PATH="/home/p00938733/profile_data"
+export OOM_SNAPSHOT_PATH="/home/t00893162/profile_data"
 
-if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]]; then
+if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]] || [[ "$MODEL_PATH" == *"Qwen3.6"* ]]; then
     TOOL_PARSER=qwen3_coder
 else
     TOOL_PARSER=hermes
@@ -157,7 +164,7 @@ ray start --head \
     --dashboard-port 8265 \
     --disable-usage-stats \
     --node-ip-address ${MASTER_ADDR} \
-    --object-store-memory=$((80 * 1024 * 1024 * 1024))
+    --object-store-memory=$((4 * 1024 * 1024 * 1024))
 
 # ------------------------------------------------------------------------------
 # Launch training
@@ -178,8 +185,8 @@ ARGS=(
   # =========================
   data.train_batch_size=${BATCH_SIZE}
   data.val_batch_size=16
-  data.max_prompt_length=16384      # 24K
-  data.max_response_length=8192     # 18K
+  data.max_prompt_length=8192       # 8K
+  data.max_response_length=4096     # 4K
 
   # =========================
   # actor_rollout_ref - common
@@ -199,7 +206,7 @@ ARGS=(
   actor_rollout_ref.actor.ppo_mini_batch_size=4
   # actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
   actor_rollout_ref.actor.use_dynamic_bsz=True
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 #32768
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=131072 #32768
   actor_rollout_ref.actor.use_kl_loss=False
   actor_rollout_ref.actor.kl_loss_coef=0.001
   actor_rollout_ref.actor.kl_loss_type=low_var_kl
@@ -219,12 +226,12 @@ ARGS=(
   actor_rollout_ref.actor.megatron.grad_offload=True
   actor_rollout_ref.actor.megatron.optimizer_offload=False
 
-  actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2
+  actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.actor.megatron.context_parallel_size=8
+  actor_rollout_ref.actor.megatron.context_parallel_size=2
   # actor_rollout_ref.actor.megatron.expert_model_parallel_size=8
   # actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
-  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=8
+  +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=2
   +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
@@ -244,10 +251,10 @@ ARGS=(
   # =========================
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
-  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384
-  actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=131072
+  actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4
   actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1
-  actor_rollout_ref.ref.megatron.context_parallel_size=8
+  actor_rollout_ref.ref.megatron.context_parallel_size=2
   # actor_rollout_ref.ref.megatron.expert_model_parallel_size=8
   # actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1
   actor_rollout_ref.ref.megatron.param_offload=True
@@ -257,17 +264,17 @@ ARGS=(
   # =========================
   # rollout
   # =========================
-  actor_rollout_ref.rollout.tensor_model_parallel_size=2
+  actor_rollout_ref.rollout.tensor_model_parallel_size=4
   actor_rollout_ref.rollout.calculate_log_probs=False        # 记录 训推的 log_prob 确认是否存在diff
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.mode=async
   actor_rollout_ref.rollout.enforce_eager=True # TODO
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.7
-  actor_rollout_ref.rollout.max_model_len=28672
-  actor_rollout_ref.rollout.max_num_seqs=8
-  actor_rollout_ref.rollout.max_num_batched_tokens=16384
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+  actor_rollout_ref.rollout.max_model_len=131072
+  actor_rollout_ref.rollout.max_num_seqs=4
+  actor_rollout_ref.rollout.max_num_batched_tokens=8192
   actor_rollout_ref.rollout.n=${ROLLOUT_N}
   actor_rollout_ref.rollout.val_kwargs.n=2
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
@@ -310,7 +317,7 @@ ARGS=(
   trainer.project_name=${PROJECT_NAME}
   trainer.experiment_name=${EXPERIMENT_NAME}
   trainer.val_before_train=False
-  trainer.n_gpus_per_node=${N_GPUS}
+  trainer.n_gpus_per_node=8
   trainer.nnodes=1
   trainer.device=npu
   trainer.save_freq=20

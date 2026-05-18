@@ -70,12 +70,12 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
-# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/p00938733/Qwen3-8B}"
+# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/t00893162/Qwen3-8B}"
 export OPENHANDS_MODEL_NAME=$MODEL_PATH
 export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-20}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-900}"
-export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/p00938733/openhands_results}"
+export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/t00893162/openhands_results}"
 
 # ------------------------------------------------------------------------------
 # Training parameters
@@ -87,7 +87,7 @@ PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-openhands-ppo}"
-logs=/home/p00938733/verl-rllm.log
+logs=/home/t00893162/verl-rllm.log
 
 if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]]; then
     TOOL_PARSER=qwen3_coder
@@ -136,7 +136,7 @@ ray start --head \
 # No rllm sandbox (worker_server.py) wrapper is used.
 # ------------------------------------------------------------------------------
 
-python3 /home/p00938733/rllm-071/examples/openhands_sdk/train_openhands.py \
+python3 /home/t00893162/rllm-071/examples/openhands_sdk/train_openhands.py \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=${BATCH_SIZE} \
     data.val_batch_size=16 \
@@ -152,7 +152,9 @@ python3 /home/p00938733/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=${BATCH_SIZE} \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=65536 \
+    actor_rollout_ref.rollout.max_model_len=65536 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \

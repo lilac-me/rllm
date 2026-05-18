@@ -68,7 +68,7 @@ def dbg(msg: str):
     rank = os.getenv("RANK", "NA")
     local_rank = os.getenv("LOCAL_RANK", "NA")
     msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
-    path = f"/home/p00938733/rllm_{socket.gethostname()}_{os.getpid()}.log"
+    path = f"/home/t00893162/rllm_{socket.gethostname()}_{os.getpid()}.log"
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{time.time()} {msg}\n")
         f.flush()
@@ -124,9 +124,8 @@ _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
 # ---------------------------------------------------------------------------
 
 _MOCK_PIPELINE_SCRIPT = r"""#!/bin/bash
-# Mock operator pipeline — drop-in replacement for operator_pipeline.sh.
-# Performs Python syntax + ModelNew class check; outputs metrics.json
-# with randomised speedup. No NPU or torch_npu required.
+# Mock operator pipeline for AGENTS.md flow
+# Checks model_new_ascendc.py existence and ModelNew class
 set -euo pipefail
 
 OP_NAME="operator"
@@ -137,7 +136,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMPL="src/${OP_NAME}_triton_ascend_impl.py"
+OUTPUT_DIR="output/${OP_NAME}"
+IMPL="${OUTPUT_DIR}/model_new_ascendc.py"
+TRACE="${OUTPUT_DIR}/trace.md"
 M="metrics.json"
 
 if [ ! -f "$IMPL" ]; then
@@ -163,16 +164,46 @@ fi
 
 # Mock success with random speedup
 SP=$(python3 -c "import random; print(f'{random.uniform(0.8, 2.0):.2f}')")
-TL=$(python3 -c "print(f'{1.0/float(${SP}):.4f}')")
 cat > "$M" <<EOFM
 {
   "success": true,
   "ast_check_ok": true,
   "correctness_ok": true,
-  "perf_data": {"speedup_vs_torch": ${SP}, "torch_latency_ms": 1.0, "triton_latency_ms": ${TL}},
+  "perf_data": {"speedup_vs_torch": ${SP}},
   "error": null
 }
 EOFM
+
+# Create mock trace.md
+mkdir -p "$OUTPUT_DIR"
+cat > "$TRACE" <<EOFTRACE
+# Trace for ${OP_NAME}
+
+## Phase 0: 参数确认
+- 成功
+
+## Phase 1: 环境准备
+- 成功
+
+## Phase 2: 测试用例精简
+- 成功
+
+## Phase 3: TileLang 设计表达
+- 成功
+
+## Phase 4: AscendC 转译与验证
+- 成功
+
+## Phase 5: 性能分析
+- speedup_vs_torch: ${SP}
+
+## Phase 6: 全量用例验证
+- 成功
+
+## Phase 7: Trace 记录
+- 成功
+EOFTRACE
+
 echo "[mock] OK: speedup=${SP}x"
 """
 
@@ -181,33 +212,16 @@ echo "[mock] OK: speedup=${SP}x"
 # Instruction template
 # ---------------------------------------------------------------------------
 
-_NPU_INSTRUCTION_TEMPLATE = """# 当前任务
-
-- 算子名称: **{op_name}**
-- 目标架构: **{arch}**
-
-{instruction}
-
-## 任务格式（KernelBench）
-
-任务文件: `src/{op_name}.py`（包含 `Model`、`get_inputs()`、`get_init_inputs()`）。
-
-## 要求
-
-1. 阅读 `AGENTS.md` 了解全局约定和工作流。
-2. 在 `src/{op_name}_triton_ascend_impl.py` 中实现 `ModelNew` 类。
-3. 运行验证流水线：
-   ```bash
-   bash tools/operator_pipeline.sh --op_name {op_name}
-   ```
-4. 读取 `metrics.json`，根据 `error` 字段修复并重试，直至 `"success": true`。
+_NPU_INSTRUCTION_TEMPLATE = """生成ascendC算子，npu=0，算子描述文件为 src/{op_name}.py，输出到 ./output/{op_name}/
 """
 
 
 def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str:
     pwd = Path(__file__).parent
     _WORKSPACE_PKG = pwd / "workspace"
-    workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=pwd/"workspace_temp")
+    workspace_temp = pwd / "workspace_temp"
+    workspace_temp.mkdir(parents=True, exist_ok=True)
+    workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=workspace_temp)
     op_name = task.get("op_name", "operator")
     arch = task.get("arch", "ascend910b1")
     instruction = task.get("instruction", "Implement a simple vector_add-style operator.")
@@ -235,14 +249,30 @@ def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str
         os.chmod(mock_path, 0o755)
 
     with open(os.path.join(workspace, "agent_workdir", "INSTRUCTIONS.md"), "w") as f:
-        f.write(_NPU_INSTRUCTION_TEMPLATE.format(op_name=op_name, arch=arch, instruction=instruction))
+        f.write(_NPU_INSTRUCTION_TEMPLATE.format(op_name=op_name))
 
     if task_code:
         src_dir = os.path.join(workspace, "agent_workdir", "src")
         os.makedirs(src_dir, exist_ok=True)
         with open(os.path.join(src_dir, f"{op_name}.py"), "w") as f:
             f.write(task_code)
-    # breakpoint()
+
+        # 从 NPUKernelBench 查找并复制 .json 测试用例文件
+        benchmark_dir = os.path.join(workspace, "agent_workdir", "src", "NPUKernelBench")
+        json_found = False
+        for level in ["level0", "level1", "level2", "level3", "level4"]:
+            level_dir = os.path.join(benchmark_dir, level)
+            if os.path.exists(level_dir):
+                candidate_json = os.path.join(level_dir, f"{op_name}.json")
+                if os.path.exists(candidate_json):
+                    shutil.copy2(candidate_json, os.path.join(src_dir, f"{op_name}.json"))
+                    json_found = True
+                    break
+
+        # 如果找不到，创建空的 .json 文件（AGENTS.md Phase 2 需要）
+        if not json_found:
+            with open(os.path.join(src_dir, f"{op_name}.json"), "w") as f:
+                f.write("")
     return workspace
 
 
@@ -279,39 +309,55 @@ def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) 
     del output
     op_name = task.get("op_name", "operator")
 
-    impl_file = os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl.py")
+    # AGENTS.md 流程的输出文件: output/{op_name}/model_new_ascendc.py
+    output_dir = os.path.join(workspace_dir, "output", op_name)
+    impl_file = os.path.join(output_dir, "model_new_ascendc.py")
     if not os.path.exists(impl_file):
         logger.info("[openhands-npu] no impl file %s -> reward=0.0", impl_file)
         return 0.0
-    # TODO: consider rejecting empty/stub-only impl files (os.path.getsize check)
 
+    # 检查 trace.md 判断各阶段成功/失败
+    trace_file = os.path.join(output_dir, "trace.md")
+    reward = 0.2  # 默认: 有实现但不确定成功
 
-    basic_path = os.path.join(workspace_dir, "metrics.json")
-    perf = _has_metrics(basic_path)
-    if not perf:
-        logger.info("[openhands-npu] impl present but no metrics -> reward=0.2")
-        return 0.2
-
-    reward = _reward_from_metrics(perf)
-    dbg(f'KKKKKK, {perf}, {reward}')
-
-    best_path = os.path.join(workspace_dir, "metrics_best.json")
-    if os.path.exists(best_path):
+    if os.path.exists(trace_file):
         try:
-            with open(best_path) as f:
-                best = json.load(f)
-            best_reward = _reward_from_metrics(best)
-            if best_reward > reward:
-                logger.info(
-                    "[openhands-npu] best version has higher reward: "
-                    "current=%.3f best=%.3f -> using best",
-                    reward, best_reward,
-                )
-                reward = best_reward
-        except (json.JSONDecodeError, OSError):
+            with open(trace_file, "r", encoding="utf-8") as f:
+                trace_content = f.read()
+
+            # 根据 trace.md 内容判断 reward
+            if "Phase 4: 成功" in trace_content or "AscendC 验证通过" in trace_content:
+                reward = 0.8
+                logger.info("[openhands-npu] AscendC implementation verified -> reward=0.8")
+            elif "Phase 3: 成功" in trace_content or "TileLang 验证通过" in trace_content:
+                reward = 0.5
+                logger.info("[openhands-npu] TileLang implementation verified -> reward=0.5")
+            elif "Phase 4: 失败" in trace_content or "AscendC 验证失败" in trace_content:
+                reward = 0.3
+                logger.info("[openhands-npu] AscendC verification failed -> reward=0.3")
+            elif "Phase 3: 失败" in trace_content or "TileLang 验证失败" in trace_content:
+                reward = 0.2
+                logger.info("[openhands-npu] TileLang verification failed -> reward=0.2")
+            else:
+                logger.info("[openhands-npu] trace exists but no clear status -> reward=0.2")
+        except Exception as e:
+            logger.warning("[openhands-npu] failed to read trace.md: %s", e)
+    else:
+        logger.info("[openhands-npu] no trace.md found -> reward=0.2")
+
+    # 检查 preformance.json 获取性能数据（可选）
+    perf_file = os.path.join(output_dir, "preformance.json")
+    if os.path.exists(perf_file) and reward >= 0.5:
+        try:
+            with open(perf_file, "r") as f:
+                perf_data = json.load(f)
+            # 如果有性能数据，可以微调 reward
+            speedup = perf_data.get("speedup_vs_torch", 1.0)
+            if speedup > 1.0:
+                reward = min(reward + 0.1 * (speedup - 1.0), 1.0)
+                logger.info("[openhands-npu] speedup=%.2f -> reward=%.3f", speedup, reward)
+        except Exception:
             pass
-    
-    dbg(f'MMMMMMM, {os.path.exists(impl_file)}, {os.path.exists(best_path)}, {reward}')
 
     logger.info("[openhands-npu] final reward=%.3f", reward)
     return reward
@@ -342,15 +388,21 @@ def _archive_npu_artifacts(
     try:
         os.makedirs(dest, exist_ok=True)
 
+        # AGENTS.md 流程的产物在 output/{op_name}/ 目录下
+        output_dir = os.path.join(metric_dir, "output", op_name)
         candidates = [
             (os.path.join(metric_dir, "conversation.log"), "conversation.log"),
             (os.path.join(metric_dir, "conversation_result.json"), "conversation_result.json"),
-            (os.path.join(metric_dir, "src", f"{op_name}_triton_ascend_impl.py"),
-             f"{op_name}_triton_ascend_impl.py"),
-            (os.path.join(metric_dir, "src", f"{op_name}_triton_ascend_impl_best.py"),
-             f"{op_name}_triton_ascend_impl_best.py"),
-            (os.path.join(metric_dir, "metrics.json"), "metrics.json"),
-            (os.path.join(metric_dir, "metrics_best.json"), "metrics_best.json"),
+            # AGENTS.md 流程的核心产物
+            (os.path.join(output_dir, "model_new_ascendc.py"), "model_new_ascendc.py"),
+            (os.path.join(output_dir, "model_new_tilelang.py"), "model_new_tilelang.py"),
+            (os.path.join(output_dir, "trace.md"), "trace.md"),
+            (os.path.join(output_dir, "preformance.json"), "preformance.json"),
+            # 设计文件
+            (os.path.join(output_dir, "design", "block_level", "design.md"), "design_block_level.md"),
+            (os.path.join(output_dir, "design", "tile_level", "design.md"), "design_tile_level.md"),
+            # kernel 文件
+            (os.path.join(output_dir, "kernel", "kernel.cpp"), "kernel.cpp"),
             (os.path.join(metric_dir, "INSTRUCTIONS.md"), "INSTRUCTIONS.md"),
         ]
 
@@ -426,7 +478,7 @@ def _run_openhands_container(
     container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
     op_name = task.get("op_name", "operator")
     arch = task.get("arch", "ascend910b1")
-    operator_backend = str(task.get("operator_backend", "triton"))
+    operator_backend = str(task.get("operator_backend", "ascendc"))
 
     path = Path("/tmp/shared_npu_lock")
     path.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -502,7 +554,6 @@ def _run_openhands_container(
     dbg(
         f"[openhands] Launching container {container_name} (proxied_url={proxied_url[:70]}...)"
     )
-    # breakpoint()
     import shlex
     print("DEBUG CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
     dbg(" ".join(shlex.quote(c) for c in cmd))
@@ -559,8 +610,9 @@ def _run_openhands_container(
         logger.exception("[openhands] Failed to run container %s", container_name)
         return -1
     finally:
-        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL)
-        print(f"[CLEANUP] removed {container_name}")
+        # DEBUG: keep container for inspection
+        # subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL)
+        print(f"[DEBUG] kept container {container_name} for inspection")
 
 # ---------------------------------------------------------------------------
 # Rollout entry point
