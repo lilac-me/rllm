@@ -5,6 +5,22 @@ pkill -9 torchrun
 set -euo pipefail
 set -x
 
+DETERMINISTIC_SEED=${DETERMINISTIC_SEED:-1234}
+ROLLOUT_DO_SAMPLE=${ROLLOUT_DO_SAMPLE:-false}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.0}
+ROLLOUT_N=${ROLLOUT_N:-1}
+VAL_N=${VAL_N:-1}
+N_PARALLEL_AGENTS=${N_PARALLEL_AGENTS:-1}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
+DEBUG_ROLLOUT_DIR=${DEBUG_ROLLOUT_DIR:-"${PWD}/debug_rollouts_npu_seed${DETERMINISTIC_SEED}"}
+DEBUG_ROLLOUT_LOAD_PATH=${DEBUG_ROLLOUT_LOAD_PATH:-}
+ENABLE_PROFILING=${ENABLE_PROFILING:-false}
+NUM_PERF_TRIALS=${NUM_PERF_TRIALS:-100}
+INIT_CORRECT_WEIGHT=${INIT_CORRECT_WEIGHT:-0.5}
+INIT_PERFORMANCE_WEIGHT=${INIT_PERFORMANCE_WEIGHT:-0.5}
+TASK_NAMESPACE=${TASK_NAMESPACE:-npu}
+KERNELGYM_FORCE_REFRESH=${KERNELGYM_FORCE_REFRESH:-true}
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source $ROOT_DIR/common_env.sh
 
@@ -169,8 +185,11 @@ ARGS=(
   reward_model.reference_backend=triton
   reward_model.server_url="http://127.0.0.1:8002"
   reward_model.reward_func_name=calculate_reward_weighted
-  reward_model.init_correct_weight=0.5
-  reward_model.init_performance_weight=0.5
+  reward_model.train_id=${TASK_NAMESPACE}
+  reward_model.task_namespace=${TASK_NAMESPACE}
+  reward_model.force_refresh=${KERNELGYM_FORCE_REFRESH}
+  reward_model.init_correct_weight=${INIT_CORRECT_WEIGHT}
+  reward_model.init_performance_weight=${INIT_PERFORMANCE_WEIGHT}
 
   reward_model.speedup_reward_upper_bound=3.0
   reward_model.speedup_reward_lower_bound=0.0
