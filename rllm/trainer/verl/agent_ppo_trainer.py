@@ -33,6 +33,7 @@ from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 import torch
 # import torch_npu
 
+from pathlib import Path
 
 class AgentPPOTrainer(RayPPOTrainer):
     def __init__(
@@ -917,6 +918,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         all_steps_masked_out = []  # whether this step should be masked out due to overlong filter
         training_rewards = []
         all_mc_returns = []  # Monte Carlo returns for each episode
+        chat_completions = []
         # the last step will have reward assigned and be used for advantage calculation
 
         for episode in steps:
@@ -966,6 +968,18 @@ class AgentPPOTrainer(RayPPOTrainer):
             step_numbers.append(len(episode_steps) - 1)
             training_rewards.append(training_reward)
             all_mc_returns.extend(mc_returns)
+            chat_completion = episode.get("chat_completions")
+            if chat_completion is None:
+                chat_completion = next(
+                    (
+                        step.get("chat_completions")
+                        for step in reversed(episode_steps)
+                        if step.get("chat_completions")
+                    ),
+                    None,
+                )
+            if chat_completion is not None:
+                chat_completions.append(chat_completion)
 
             all_steps_idx_list.extend([idx for _ in range(len(episode_steps))])
             all_steps_is_last_step_list.extend([False for _ in range(len(episode_steps))])
@@ -974,6 +988,13 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_steps_step_num.extend([len(episode_steps) for _ in range(len(episode_steps))])
             all_steps_step_ids.extend([f"{uids[idx]}_step{i}" for i in range(len(episode_steps))])
             all_steps_masked_out.extend([masked_out for _ in range(len(episode_steps))])
+
+        if chat_completions:
+            save_dir = os.path.join(self.config.trainer.default_local_dir, "chat_completions")
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir, f"{self.global_steps}.jsonl"), "w") as f:
+                for chat_completion in chat_completions:
+                    f.write(json.dumps(chat_completion) + "\n")
 
         if raw_completion_lens:
             print(

@@ -84,6 +84,7 @@ class VerlEngine(RolloutEngine):
         token_output: TokenOutput = await self.server_manager.generate(request_id=application_id, prompt_ids=request_prompt_ids, image_data=image_data, sampling_params=sampling_params)  # type: ignore
         completion_ids: list[int] = token_output.token_ids
         logprobs: list[float] = token_output.log_probs
+        completion_ids, logprobs = self._truncate_completion_after_eos(completion_ids, logprobs)
 
         finish_reason = token_output.stop_reason
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
