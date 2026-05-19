@@ -211,11 +211,23 @@ def plot_metric_grid(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.4 * n_cols, 3.4 * n_rows), squeeze=False)
     for index, metric in enumerate(metrics):
         ax = axes[index // n_cols][index % n_cols]
+        min_step: int | None = None
+        max_step: int | None = None
+        min_y: float | None = None
+        max_y: float | None = None
+        has_series = False
         for run_index, run_name in enumerate(run_names):
             steps = data[run_name]
             x_values = [step for step in sorted(steps) if metric in steps[step]]
             y_values = [steps[step][metric] for step in x_values]
             if x_values:
+                has_series = True
+                min_step = min(x_values) if min_step is None else min(min_step, min(x_values))
+                max_step = max(x_values) if max_step is None else max(max_step, max(x_values))
+                y_lo = min(y_values)
+                y_hi = max(y_values)
+                min_y = y_lo if min_y is None else min(min_y, y_lo)
+                max_y = y_hi if max_y is None else max(max_y, y_hi)
                 style = styles[run_name]
                 x_offset = display_offsets[run_name]
                 transform = (
@@ -238,9 +250,24 @@ def plot_metric_grid(
                     linestyle=style["linestyle"],
                     color=style["color"],
                 )
-        ax.set_title(metric)
-        ax.set_xlabel("step")
-        ax.grid(True, alpha=0.3)
+        if has_series:
+            ax.set_title(metric)
+            ax.set_xlabel("step")
+            if min_step is not None and max_step is not None:
+                pad = 0.35
+                ax.set_xlim(min_step - pad, max_step + pad)
+            if min_y is not None and max_y is not None:
+                if min_y == max_y:
+                    y_pad = max(abs(min_y) * 0.02, 1e-6)
+                else:
+                    y_pad = max((max_y - min_y) * 0.08, 1e-6)
+                ax.set_ylim(min_y - y_pad, max_y + y_pad)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.set_title(f"{metric} (no data)")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.grid(False)
 
     for index in range(len(metrics), n_rows * n_cols):
         axes[index // n_cols][index % n_cols].axis("off")
@@ -277,6 +304,11 @@ def plot_delta_grid(
 
     for index, metric in enumerate(metrics):
         ax = axes[index // n_cols][index % n_cols]
+        min_step: int | None = None
+        max_step: int | None = None
+        min_y: float | None = None
+        max_y: float | None = None
+        has_series = False
         for run_index, run_name in enumerate(compare_runs):
             common_steps = sorted(set(baseline) & set(data[run_name]))
             x_values = [
@@ -286,6 +318,13 @@ def plot_delta_grid(
             ]
             y_values = [abs(baseline[step][metric] - data[run_name][step][metric]) for step in x_values]
             if x_values:
+                has_series = True
+                min_step = min(x_values) if min_step is None else min(min_step, min(x_values))
+                max_step = max(x_values) if max_step is None else max(max_step, max(x_values))
+                y_lo = min(y_values)
+                y_hi = max(y_values)
+                min_y = y_lo if min_y is None else min(min_y, y_lo)
+                max_y = y_hi if max_y is None else max(max_y, y_hi)
                 style = styles[run_name]
                 x_offset = display_offsets[run_name]
                 transform = (
@@ -308,9 +347,24 @@ def plot_delta_grid(
                     linestyle=style["linestyle"],
                     color=style["color"],
                 )
-        ax.set_title(f"abs delta vs {baseline_name}: {metric}")
-        ax.set_xlabel("step")
-        ax.grid(True, alpha=0.3)
+        if has_series:
+            ax.set_title(f"abs delta vs {baseline_name}: {metric}")
+            ax.set_xlabel("step")
+            if min_step is not None and max_step is not None:
+                pad = 0.35
+                ax.set_xlim(min_step - pad, max_step + pad)
+            if min_y is not None and max_y is not None:
+                if min_y == max_y:
+                    y_pad = max(abs(min_y) * 0.02, 1e-9)
+                else:
+                    y_pad = max((max_y - min_y) * 0.08, 1e-9)
+                ax.set_ylim(min_y - y_pad, max_y + y_pad)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.set_title(f"{metric} (no common data)")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.grid(False)
 
     for index in range(len(metrics), n_rows * n_cols):
         axes[index // n_cols][index % n_cols].axis("off")
