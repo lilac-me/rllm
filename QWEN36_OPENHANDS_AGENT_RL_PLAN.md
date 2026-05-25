@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.2 — 基线切到 `openhands_ascend`；软化 GDN 约束；高风险 cherry-pick 标注；明确算子 reward / 编译工具链不在本 plan 范围)
+> 修订时间：2026-05-25 (v2.3 — W1 cherry-pick 落地；修正 R2/R3 在 stage1 AgentPPOTrainer 路径上的真实生效情况；新增 §13 W1 实施记录)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -206,17 +206,17 @@ git -C rllm checkout -b qwen36-openhands-stage1 origin/openhands_ascend
 
 #### P0 — Qwen / MoE 支持
 
-| Commit | 说明 | NPU 适配注意 |
+| Commit | 说明 | 实施后注释 |
 |---|---|---|
-| `e5ba77ea` | fix(parser): Qwen3.5 chat template support | 通用，**Qwen3.6 复用 Qwen3.5 路径，必拿** |
-| **`19983fe4` 🔴 P0★** | feat(verl): support R2 and R3 MoE router replay | **高风险 cherry-pick**：当前 rllm 仓库**没有 `rllm/algorithm/` namespace**，本 commit 实质是新增一整套子系统而非小补丁。冲突面大，单独排期 0.5–1 天，cherry-pick 前先在 verl fork 端 grep 是否已有 router replay hook，避免重复实现。Qwen3.6-A3B 训练在 W2/W3 上是否真用 R3 由实测决定，但 cherry-pick 动作本身仍在 W1 内完成。 |
+| `e5ba77ea` | fix(parser): Qwen3.5 chat template support | 已 cherry-pick；Qwen3.6 复用 Qwen3.5 chat template，必拿 |
+| **`19983fe4` 🔴 P0★** | feat(verl): support R2 and R3 MoE router replay | 已 cherry-pick，但**实际只在 `VerlBackend` / `UnifiedTrainer` 路径上生效**。stage1 走 `AgentPPOTrainer`（`examples/openhands_sdk/train_open_megatron.py` → `AgentTrainer` → `train_agent_ppo.TaskRunner` → `AgentPPOTrainer`），19983fe4 改动**完全没碰** `rllm/trainer/verl/agent_ppo_trainer.py`。详见 §13.3 "R2/R3 在 stage1 路径上的真实生效情况"。R2 actor 端 50 行也因依赖未引入的 abstraction (`tu`/`batch_td`/`no_padding_2_padding`) 被跳过。 |
 
 #### P1 — 稳定性
 
-| Commit | 说明 | NPU 适配注意 |
+| Commit | 说明 | 实施后注释 |
 |---|---|---|
-| `d314745e` | fix(verl): release GPU memory on Verl backend interrupts | **要看代码是否 NPU 兼容**（可能 hardcode `torch.cuda.empty_cache`） |
-| **`e66fc2e4` 🔴 P0★** | fix(verl): route rllm.algorithm.lr_schedule to active backend | **高风险 cherry-pick**：同样依赖 `rllm/algorithm/` namespace。若 `19983fe4` 已经把 namespace 引入，本 commit 是小改；若先于 `19983fe4` 单独拿则会断链。**必须排在 `19983fe4` 之后**。 |
+| `d314745e` | fix(verl): release GPU memory on Verl backend interrupts | 已 cherry-pick；改动在 launcher 的 try/finally + Ray actor 命名，NPU 兼容性 OK（不依赖 torch.cuda） |
+| **`e66fc2e4` 🔴 P0★** | fix(verl): route rllm.algorithm.lr_schedule to active backend | 已 cherry-pick；实际改动是 `_SHARED_KEYS` 表加两行 lr_warmup_steps 映射，规模远小于预想 |
 
 #### 不要拿
 
@@ -861,3 +861,127 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-23 | v2.0 | **重大修订**：基于生产环境实证（Ascend NPU + verl BryanChen408 fork + Megatron-Bridge + vllm-ascend 已就位且 Qwen3.6 已验证）重写。删除栈对齐、Megatron 转换验证等已完成项；W1 从 5–7 天压缩到 2–3 天；P0 交付从 3 周压缩到 ~2.5 周；明确 swe 配方仅作参考、不照搬；增加 Ascend 特定适配章节 §3.7。 |
 | 2026-05-23 | v2.1 | 把 `verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh` 提升为**训练参数权威**。新增 §0.1 关键架构约束（GDN 不支持 THD、`use_remove_padding=False`、CUDA_DEVICE_MAX_CONNECTIONS=1 等）+ §0.2 verl 脚本固化参数清单。§3.2 重写权威顺序（verl 脚本 > obs NPU 脚本 > swe）。§3.4 标注训练参数已固化。§6 风险加 GDN/THD 与显存交互、ray runtime env 环境变量传播。§11.3 加 verl 脚本对齐的 env，§11.4 加参数提取命令。明确"rllm 顶端 agent 适配"是真正的工作量，verl 后端已稳定。 |
 | 2026-05-25 | v2.2 | **基线切到 `origin/openhands_ascend`**（已带 ascendc 数据准备 + SDK runner 更新），新分支名 `qwen36-openhands-stage1`；§2.1 补 obs 4 个独有 commit 的 cherry-pick 评估表，`c6e36b0a` 强烈建议拿。新增**范围声明**：算子 reward / 评测协议、ascendC 工具链、数据集来源、依赖版本管理均**不在本 plan 范围**（reward 在 OpenHands 容器内自洽，rllm 只拿标量；依赖以"当前 commit 即锁定版本"为准）。§0.1 把 GDN/`use_remove_padding=False` 从硬约束**软化为可调**，W2 实测决定。§3.1 把 `19983fe4`（router replay，新增 `rllm/algorithm` 子系统）与 `e66fc2e4`（lr_schedule，依赖前者）标 **P0★ 高风险 cherry-pick**，明确顺序约束。§4.2 W1 任务相应重排。§11.1 cherry-pick 脚本拆分 SAFE / HIGH_RISK 两段。§9 新增"下一阶段 TODO"清单，把 P1/P2 候选项（真实数据集、reasoning schema、checkpoint 后端、dashboard、端口预算、bypass rollout 归位、legacy example deprecate、GDN bshd 可视化）统一下放。|
+| 2026-05-25 | v2.3 | **W1 cherry-pick 全部落地** (12 commits, 见 §13.1)；本地全仓 syntax 通过；NPU 真实 import + vllm-ascend smoke 移交。**修正 R2/R3 在 stage1 路径上的真实生效情况**（§13.3）：stage1 走 `AgentPPOTrainer`（不是 `VerlBackend`），而 `19983fe4` 改动文件清单**完全不含** `rllm/trainer/verl/agent_ppo_trainer.py`——意味着 stage1 路径上 R2/R3 入口都不生效，无论是走 rllm 入口还是 verl native CLI（rllm 的 batch 组装路径绕开了 verl 原生 dataloader，rollout 端 routing 数据没法流到训练端）。stage1 建议**关 router_replay**，靠 KL coef / PPO clip 控制 off-policy；W2/W3 reward 不稳时按需 backport。§3.1 P0★ 表加"实施后注释"列。§3.3 swe 4 个 rllm 层 patch 全部 stage1 跳过（§13.2）。|
+
+---
+
+## 13. W1 实施记录（2026-05-25）
+
+### 13.1 cherry-pick 实际清单（12 commits）
+
+执行顺序与 §4.2 / §11.1 一致。所有 commit 都在 `qwen36-openhands-stage1` 分支上，全部 `python -c "import rllm"` OK，全仓 `py_compile` 通过（rllm/ 308 文件 + rllm-model-gateway/ 33 文件 = 0 错误）。
+
+**obs 独有（2 / 4 拿）：**
+
+| Commit | 决策 | 实际冲突 |
+|---|---|---|
+| `c6e36b0a` 修复stepwise下打印不全 + completionids 长度 | ✅ 拿 | 1 处冲突，与 HEAD `90a150fc add response length debug` 并列保留 |
+| `17430f3a` fix time (eval_pass_at_k.py) | ✅ 拿 | 无 |
+| `4268ffdd` "tmd" (KernelGym 脚本重命名 + memory_compact.txt) | ❌ 跳 | 重命名易破坏下游 + commit message 含糊 + KernelGym stage1 不重点 |
+| `095dd639` add gitignore | ❌ 跳 | 仅 +3 行 gitignore，意义不大 |
+
+**upstream SAFE 批次（7 / 7 拿）：**
+
+| Commit | 冲突情况 |
+|---|---|
+| `68e9107e` pad multi-turn batch to lcm(dp_size, ppo mini-batch) | DU agentcore_math/train_verl.sh (git rm，legacy)；verl_backend.py 2 段冲突手术合并（取 upstream 重构 `_get_dp_size`/`_get_aggregate_dp_size`） |
+| `45c99f1c` zero response_mask on padded rows | auto-merge |
+| `d09f6155` rollout_probs_diff masking respect response_mask | verl_backend.py + agent_sdk_trainer.py 2 段冲突，全取 upstream `calculate_debug_metrics_compat` |
+| `326445bd` Collapse multi-turn steps + unified merge metrics | DU 2 个 legacy 文件 (git rm)；transform.py 4 段 + tinker/transform.py 2 段全取 upstream（`--theirs`）；pyproject.toml 加 harbor extras + tool.uv.sources rllm-model-gateway editable |
+| `44fb9a3c` raise on aborted rollouts + normalize stop_reason | auto-merge |
+| `e8539db5` don't truncate merged multi-turn responses | auto-merge |
+| `e5ba77ea` Qwen3.5 chat template support + simple_math example | 新增 example 文件，无冲突 |
+
+**upstream HIGH_RISK 批次（3 / 3 拿，但 19983fe4 部分跳过）：**
+
+| Commit | 冲突情况 |
+|---|---|
+| `19983fe4` R2/R3 router replay | **6 个文件冲突**（modify/delete utils.py + verl_backend.py + verl_launcher.py + common/config.py + base.yaml + rollout/verl_engine.py + dataclass.py）。决策：sync_config 框架完整保留；R3 入口完整保留（verl_engine.py + transform.py + dataclass.py）；**R2 actor 端 50 行跳过**——upstream 那段引用 `tu`/`batch_td`/`no_padding_2_padding`/`bypass_mode`/`rc`，是上游另一波重构（未在 cherry-pick 范围内）引入的符号，硬合会让 import 直接挂；common/config.py from_config 保留 HEAD 调用约定 + 补 router_replay 新字段；base.yaml 取 upstream 并集但 use_rllm 保留 HEAD `false`；verl_launcher.py 自动补 `hydra_overrides = kwargs.get(...)` 和 `logger = logging.getLogger(...)` |
+| `d314745e` release GPU memory on Verl backend interrupts | verl_launcher.py 1 段冲突，HEAD 旧 `WorkflowTaskRunner.remote()` 直调 vs upstream 加 HydraConfig 捕获 + try/finally + Ray actor 重命名。手动合并：保留 HEAD class 名 `WorkflowTaskRunner`，吸收 upstream 的 try/finally + hydra_overrides 转发 |
+| `e66fc2e4` route lr_schedule to active backend's optim key | 1 段小冲突，接受 upstream（`_SHARED_KEYS` 表加 2 行 lr_warmup_steps 映射）；实际改动比 plan §3.1 预想小很多 |
+
+### 13.2 swe 的 4 个 rllm 层 patch — 全部 stage1 跳过
+
+| Patch | swe vs main 规模 | stage1 跳过原因 |
+|---|---|---|
+| `rllm/experimental/verl/patch.py` | +156 / -0 | 主要是 `RLLM_VLLM_PORT_BASE` 多节点端口分配；plan §9 "节点端口预算总表"已下放；HEAD 上 patch.py 已被 19983fe4 大改 (HEAD vs swe = +449/-59)，盲合风险高 |
+| `rllm/experimental/verl/utils.py` | +162 / -4 | 主要是 HDFS checkpoint 逻辑；plan §5.4 "checkpoint 后端拍板"已下放 |
+| `rllm/trainer/verl/ray_runtime_env.py` | +37 / -1 | HEAD 已有 +82 行 NPU env 透传（obs 自加），swe 37 行重合度高，W2 实测前不动 |
+| `rllm-model-gateway/*` | +102 / -29 | 主要是 token 透出；stage1 第一版用 vllm-ascend 原生 OpenAI API 不强依赖；plan §9 "reasoning schema" 已下放 |
+
+verl-BryanChen408 fork 已有完整 NPU 端口/HCCL 处理（`HCCL_HOST_SOCKET_PORT_RANGE` 等），与 rllm 层 swe patch 不重叠也不冲突。
+
+### 13.3 R2 / R3 在 stage1 路径上的真实生效情况（v2.3 修正）
+
+**stage1 训练入口实际调用链：**
+
+```
+examples/openhands_sdk/train_open_megatron.py
+  → from rllm.trainer.agent_trainer import AgentTrainer
+  → AgentTrainer.train()
+  → from rllm.trainer.verl.train_agent_ppo import TaskRunner
+  → AgentPPOTrainer  (rllm/trainer/verl/agent_ppo_trainer.py)
+```
+
+**stage1 不走的路径：**
+
+- `rllm/experimental/verl/verl_backend.py` (`VerlBackend`)
+- `rllm/experimental/verl/verl_launcher.py` (`WorkflowTaskRunner`)
+- `rllm/experimental/unified_trainer.py` (`UnifiedTrainer`)
+
+**19983fe4 改动的全部文件清单（`git diff-tree --name-only`）：**
+
+```
+rllm/experimental/common/config.py
+rllm/experimental/config/rllm/base.yaml
+rllm/experimental/rollout/verl_engine.py     ← R3 rollout-side 编码
+rllm/experimental/verl/dataclass.py           ← R3 字段
+rllm/experimental/verl/transform.py           ← R3 解码 + 填充
+rllm/experimental/verl/utils.py               ← sync_config (R2/R3 共用)
+rllm/experimental/verl/verl_backend.py        ← R2 actor-side propagate（被跳过那 50 行）
+rllm/experimental/verl/verl_launcher.py
+rllm/trainer/tinker/tinker_backend.py
+rllm/trainer/tinker/transform.py
+```
+
+**关键事实**：19983fe4 **完全没碰** `rllm/trainer/verl/agent_ppo_trainer.py`（也没碰 `agent_sdk_trainer.py`、`agent_workflow_trainer.py`）。也就是说，19983fe4 加的 router_replay 入口**只在 `VerlBackend` / `UnifiedTrainer` 路径上生效**。
+
+**关于"走 verl native CLI 应该能用 R2/R3" 的修正**：
+
+之前 §13.0 / 对外解释里说过 R2 备选可以走 verl native CLI。这个结论**只在 stage1 不走 `AgentPPOTrainer` 的情况下成立**。实际情况是：
+
+- verl-BryanChen408 fork 端确实有完整 R2/R3 **后端能力**（PR #5219、#5185 等 megatron worker 层面），这部分独立于 rllm
+- **R2** (training-side record)：verl megatron worker 在 proximal forward 时记 routing → 返回 output tensordict → **rllm AgentPPOTrainer 不会主动把 routed_experts 从 output 抽出来塞进 batch** → actor update 拿不到 → R2 失效
+- **R3** (rollout-side record)：verl rollout worker 记 routing → 但 rllm 的 `AgentExecutionEngine` / `AgentPPOTrainer` 自己组装 batch（不走 verl 原生 dataloader），**rollout 端 routing 数据没法流到训练 batch** → verl training forward 收到的 batch 里没 `routed_experts` → R3 失效
+
+**所以 stage1 路径上**：
+
+| | rllm CLI 入口 (`rllm.algorithm.router_replay=R3`) | verl native CLI (`actor.router_replay.mode=R3 rollout.enable_rollout_routing_replay=true`) |
+|---|---|---|
+| `VerlBackend` 路径 | ✅ R3 完整可用，R2 缺 actor-side propagation | ✅ 与左相同 |
+| **`AgentPPOTrainer` 路径（stage1 实际走）** | ❌ rllm 19983fe4 入口在这个 trainer 上完全不触发 | ❌ rllm 自己组装 batch 时不传 routing；verl worker 即使能记录也用不上 |
+
+**stage1 的建议处理**：
+
+1. **第一选择**：不开 router_replay（`rllm.algorithm.router_replay=disabled` + 不传 verl native router_replay）。靠 `actor.use_kl_loss=True` + `kl_loss_coef=0.01` + PPO clip 控制 off-policy 漂移
+2. **W2/W3 监控指标**：`rollout_probs_diff_max/mean/std`（来自 `calculate_debug_metrics_compat`，d09f6155 已 cherry-pick 生效）—— 如果 diff < 0.1 量级，router_replay 不是必须项
+3. **如果 W3 reward 不稳且 rollout_probs_diff 大**：才考虑把 R3 数据流 backport 到 `AgentPPOTrainer`（把 `transform.py` R3 解码逻辑接到 agent_ppo_trainer.py 的 batch 组装路径），这是独立的小工作（预计 1–2 天），不在 stage1 范围
+
+**plan §0.2 verl 脚本里的 `R3 default` 是 `VerlBackend` 路径的默认；stage1 走 `AgentPPOTrainer`，这个默认对我们不适用。**
+
+### 13.4 本地 import smoke 结果
+
+20 个关键模块：5 OK / 15 缺重依赖 (`torch_npu` / `verl` / `vllm` / `omegaconf` / `openai`)，**0 个 SyntaxError/NameError/AttributeError**。本地 Mac 不装 NPU 训练栈是预期；NPU 节点上跑 `git checkout qwen36-openhands-stage1` 后应该 20/20 OK。
+
+全仓 `py_compile`：rllm/ 308 文件 + rllm-model-gateway/ 33 文件 = 0 错误。
+
+### 13.5 W2 进入条件（NPU 节点验证清单）
+
+NPU 节点执行清单（命令见交付物 `RUNBOOK_W2_PREFLIGHT.md` —— 如未创建，可参考会话记录里的"W2 进入条件验证清单"）：
+
+- [ ] **NPU 节点拉到** `qwen36-openhands-stage1` 分支（需先 `git push -u origin qwen36-openhands-stage1`）
+- [ ] **真实 import smoke**：20/20 模块在装齐 `torch_npu` + verl@BryanChen408 + Megatron-Bridge + vllm-ascend 后全部 OK
+- [ ] **`npu-smi info`** 与 plan §0.2 `n_devices_per_node=16` 一致
+- [ ] **vllm-ascend Qwen3.6 4 项 smoke**（W1.7）：关 thinking 单请求 / qwen3_coder tool call / 多轮 tool call / 32k context
+
+**5.2 tool call 是关键失败点**——若 vllm-ascend 不支持 `qwen3_coder` parser，要么 fallback 到 generic tool parser，要么在 OpenHands 侧加 A3B tool 格式 post-processor（plan §3.5 第一版 task 之一）。
