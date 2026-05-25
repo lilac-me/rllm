@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.3 — W1 cherry-pick 落地；修正 R2/R3 在 stage1 AgentPPOTrainer 路径上的真实生效情况；新增 §13 W1 实施记录)
+> 修订时间：2026-05-25 (v2.4 — NPU smoke 第一轮跑出 verl API 漂移 + RolloutCorrectionConfig 缺失；fork 端 rllm-compat shim 落地 + 缺失 class 补回；新增 §13.6–§13.8)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -862,6 +862,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-23 | v2.1 | 把 `verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh` 提升为**训练参数权威**。新增 §0.1 关键架构约束（GDN 不支持 THD、`use_remove_padding=False`、CUDA_DEVICE_MAX_CONNECTIONS=1 等）+ §0.2 verl 脚本固化参数清单。§3.2 重写权威顺序（verl 脚本 > obs NPU 脚本 > swe）。§3.4 标注训练参数已固化。§6 风险加 GDN/THD 与显存交互、ray runtime env 环境变量传播。§11.3 加 verl 脚本对齐的 env，§11.4 加参数提取命令。明确"rllm 顶端 agent 适配"是真正的工作量，verl 后端已稳定。 |
 | 2026-05-25 | v2.2 | **基线切到 `origin/openhands_ascend`**（已带 ascendc 数据准备 + SDK runner 更新），新分支名 `qwen36-openhands-stage1`；§2.1 补 obs 4 个独有 commit 的 cherry-pick 评估表，`c6e36b0a` 强烈建议拿。新增**范围声明**：算子 reward / 评测协议、ascendC 工具链、数据集来源、依赖版本管理均**不在本 plan 范围**（reward 在 OpenHands 容器内自洽，rllm 只拿标量；依赖以"当前 commit 即锁定版本"为准）。§0.1 把 GDN/`use_remove_padding=False` 从硬约束**软化为可调**，W2 实测决定。§3.1 把 `19983fe4`（router replay，新增 `rllm/algorithm` 子系统）与 `e66fc2e4`（lr_schedule，依赖前者）标 **P0★ 高风险 cherry-pick**，明确顺序约束。§4.2 W1 任务相应重排。§11.1 cherry-pick 脚本拆分 SAFE / HIGH_RISK 两段。§9 新增"下一阶段 TODO"清单，把 P1/P2 候选项（真实数据集、reasoning schema、checkpoint 后端、dashboard、端口预算、bypass rollout 归位、legacy example deprecate、GDN bshd 可视化）统一下放。|
 | 2026-05-25 | v2.3 | **W1 cherry-pick 全部落地** (12 commits, 见 §13.1)；本地全仓 syntax 通过；NPU 真实 import + vllm-ascend smoke 移交。**修正 R2/R3 在 stage1 路径上的真实生效情况**（§13.3）：stage1 走 `AgentPPOTrainer`（不是 `VerlBackend`），而 `19983fe4` 改动文件清单**完全不含** `rllm/trainer/verl/agent_ppo_trainer.py`——意味着 stage1 路径上 R2/R3 入口都不生效，无论是走 rllm 入口还是 verl native CLI（rllm 的 batch 组装路径绕开了 verl 原生 dataloader，rollout 端 routing 数据没法流到训练端）。stage1 建议**关 router_replay**，靠 KL coef / PPO clip 控制 off-policy；W2/W3 reward 不稳时按需 backport。§3.1 P0★ 表加"实施后注释"列。§3.3 swe 4 个 rllm 层 patch 全部 stage1 跳过（§13.2）。|
+| 2026-05-25 | v2.4 | **NPU smoke 第一轮跑出两类失败：(A) verl-BryanChen408 fork 已把 rollout 抽象重写**（`AsyncLLMServerManager` 重命名为 `LLMServerClient` 搬到 `verl/workers/rollout/llm_server.py`；`AgentLoopManager.{server_addresses,server_handles,global_load_balancer}` 三属性搬到 `LLMServerManager`；构造签名都变了）—— **不是我们 cherry-pick 引入的，upstream/main 也 broken，只是 W1 NPU smoke 第一次实际验证暴露**。**决策**：在 verl-BryanChen408 fork 加薄兼容层（路线 B），rllm 一行不改。**(B) 19983fe4 合并漏带 `RolloutCorrectionConfig` 类定义**，已从 upstream/main 补回（commit `c1ff82e3`）。verl shim 实施：分支 `qwen36-rllm-compat`，commit `881a98d7`，2 文件 +89 行：(1) `agent_loop.py` 给 `AgentLoopManager` 加可选 `_server_manager` kwarg + 3 shim property + 末尾 `AsyncLLMServerManager(LLMServerClient)` 兼容类；(2) `ray_trainer.py:902` 把 `_server_manager=self.llm_server_manager` wire 进 `AgentLoopManager.create(...)`。新增 §13.6（verl shim）、§13.7（stage1 safe config: 关 router_replay + 关 KL loss + 监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）、§13.8（NPU smoke 第二轮重写）。|
 
 ---
 
@@ -985,3 +986,148 @@ NPU 节点执行清单（命令见交付物 `RUNBOOK_W2_PREFLIGHT.md` —— 如
 - [ ] **vllm-ascend Qwen3.6 4 项 smoke**（W1.7）：关 thinking 单请求 / qwen3_coder tool call / 多轮 tool call / 32k context
 
 **5.2 tool call 是关键失败点**——若 vllm-ascend 不支持 `qwen3_coder` parser，要么 fallback 到 generic tool parser，要么在 OpenHands 侧加 A3B tool 格式 post-processor（plan §3.5 第一版 task 之一）。
+
+### 13.6 verl-BryanChen408 fork rllm-compat shim（W1.8 新增）
+
+**问题**：NPU 第一轮 smoke 暴露 11/20 模块 import 失败，根因是 verl-BryanChen408 fork 已经把 rollout 抽象重写（基于 verl main 的最新形态），与 rllm 当前仍引用的 verl 0.7.x API 不兼容：
+
+| | rllm（含 upstream/main）当前期待 | verl-BryanChen408 fork 实际 |
+|---|---|---|
+| 符号 `AsyncLLMServerManager` | `verl.experimental.agent_loop.agent_loop` | **重命名为 `LLMServerClient`，搬到 `verl/workers/rollout/llm_server.py`** |
+| 构造签名 | `(config, servers=..., load_balancer_handle=...)` | `LLMServerClient(config, load_balancer_handle=...)` |
+| `AgentLoopManager` 属性 | `.server_addresses` / `.server_handles` / `.global_load_balancer` | **三属性全部搬到 `LLMServerManager`**（`llm_server.py:326-337`） |
+
+**注意：rllm 上游 main 也有这个问题** —— 不是 W1 cherry-pick 引入的，只是 W1 NPU smoke 第一次实际验证暴露。
+
+**决策（用户已同意）**：路线 B —— 在 verl-BryanChen408 fork 加一层薄兼容层，rllm 一行不改。
+
+**实施**：分支 `qwen36-rllm-compat` (verl-BryanChen408)，commit `881a98d7`，改动 2 个文件、+89 行：
+
+1. **`verl/experimental/agent_loop/agent_loop.py`**：
+   - 给 `AgentLoopManager.__init__` 加可选 kwarg `_server_manager=None`
+   - 加 3 个 shim property（`server_addresses` / `server_handles` / `global_load_balancer`）forward 到 `self._server_manager`
+   - 末尾新增 `class AsyncLLMServerManager(LLMServerClient)` 继承类，接受 legacy `servers=` / `load_balancer_handle=` kwargs，转发到新 `LLMServerClient` 构造
+
+2. **`verl/trainer/ppo/ray_trainer.py:902-904`**：
+   - 在 `AgentLoopManager.create(...)` 调用处加 `_server_manager=self.llm_server_manager`
+   - rllm 子类继承 `RayPPOTrainer` 后，`self.async_rollout_manager.server_addresses` 等自动可用
+
+**没 wire 的路径**（stage1 不走，留作未来）：
+- `verl/trainer/main_ppo_sync.py`（用的是 `AgentLoopManagerTQ` 子类，rllm 不依赖）
+- `verl/experimental/fully_async_policy/fully_async_rollouter.py`（fully-async 路径）
+- `verl/experimental/one_step_off_policy/ray_trainer.py`（one-step-off-policy 路径）
+
+**NPU 节点上拉取 shim**：
+
+```bash
+# 在 NPU 节点上的 verl 工作目录（实际路径替换）
+cd /workspace/verl
+git fetch <bryan-remote>     # 或 git remote add bryan git@github.com:BryanChen408/verl.git && git fetch bryan
+git checkout qwen36-rllm-compat     # 注意：可能需要先 push 到 origin
+# 如果分支只在本地 Mac 上：
+#   (本地)  git -C /Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408 push -u origin qwen36-rllm-compat
+#   (NPU)   git fetch origin && git checkout -b qwen36-rllm-compat origin/qwen36-rllm-compat
+```
+
+**Stage2 退出 shim 的条件**：等上游 rllm 跟进 `LLMServerClient`-based API 后，删除这两段改动即可。
+
+### 13.7 Stage1 安全训练配置（关 router_replay + 关 KL loss + 监控指标）
+
+基于 §13.3 结论（router_replay 在 `AgentPPOTrainer` 路径上不生效），stage1 训练脚本采用以下配置：
+
+```bash
+# === router_replay 关闭（在 AgentPPOTrainer 上即便开了也无效，明确关掉避免误解）===
+# 不传 rllm.algorithm.router_replay 即默认 disabled
+# 不传 actor.router_replay.mode 也不传 rollout.enable_rollout_routing_replay
+
+# === KL loss 关闭（业界惯例，包括 verl 脚本 NPU 分支自身 kl_loss_coef 较小）===
+actor_rollout_ref.actor.use_kl_loss=False
+actor_rollout_ref.actor.kl_loss_coef=0.0
+
+# === PPO clip 保持开启（verl 默认即可）===
+actor_rollout_ref.actor.clip_ratio=0.2
+actor_rollout_ref.actor.clip_ratio_low=0.2
+actor_rollout_ref.actor.clip_ratio_high=0.28
+actor_rollout_ref.actor.entropy_coeff=0      # NPU 分支默认
+
+# === learning rate 保守起步（与 verl 脚本 NPU 分支一致）===
+actor_rollout_ref.actor.optim.lr=1e-6
+```
+
+**W2/W3 必看的 4 个 off-policy 健康指标**（前 2 个由 cherry-pick `d09f6155` 自动上报，后 2 个 verl 原生自带）：
+
+| 指标 | 含义 | 健康 | 报警 |
+|---|---|---|---|
+| `rollout_probs_diff_mean` | rollout-engine vs train-engine logprob 一致性 | < 0.05 | > 0.1 → 考虑 router_replay backport |
+| `rollout_probs_diff_max` | 最坏单 token 偏差 | < 0.5 | > 1.0 |
+| `actor/pg_clipfrac` | 每步 PPO clip 触发比例 | < 0.1 | > 0.2 → 降 lr 或减小 ppo_mini_batch_size |
+| `actor/approx_kl` | actor 当前 vs 上一 ppo iter 的 KL | < 0.02 | > 0.05 → 临时开 kl_loss_coef=0.001 救场 |
+
+**判定规则（W3 长跑 100 步后）**：
+
+1. 4 个指标全 healthy → 配置 OK，继续
+2. reward 在涨但 `rollout_probs_diff_mean > 0.1` → 不阻塞，记录
+3. `actor/pg_clipfrac > 0.3` → **降 lr 或 ppo_mini_batch_size**，不是开 KL loss 的事
+4. `actor/approx_kl` 在 5–10 步内从 0.01 跳到 > 0.1 → **临时开 `kl_loss_coef=0.001`** 救场，并 dump batch 看是不是 reward 异常
+5. reward 长期不涨且 `rollout_probs_diff` 大 → 才考虑 R3 backport 到 `AgentPPOTrainer`（plan §13.3 列的 1–2 天工作）
+
+### 13.8 NPU smoke 第二轮（W1.7 重做）
+
+第一轮 smoke 暴露的两个问题都已修复（§13.6 verl shim + §13.5 RolloutCorrectionConfig）。第二轮 smoke 步骤：
+
+```bash
+# === 0. 同步 fix ===
+# 在 NPU 节点上
+cd /workspace/rllm      # 或你的 rllm 路径
+git fetch origin
+git checkout qwen36-openhands-stage1
+git pull                # 应拉到 commit c1ff82e3 (RolloutCorrectionConfig fix)
+
+cd /workspace/verl      # 或你的 verl 路径
+git fetch <bryan-remote>
+git checkout qwen36-rllm-compat
+git pull                # 应拉到 commit 881a98d7 (rllm-compat shim)
+
+# === 1. 重跑结构性 import smoke（应 20/20 OK）===
+python3 - <<'EOF'
+import importlib, traceback
+mods = [
+    "rllm", "rllm.sdk", "rllm.engine",
+    "rllm.engine.agent_execution_engine",
+    "rllm.engine.rollout.openai_engine",
+    "rllm.engine.rollout.verl_engine",
+    "rllm.engine.rollout.rollout_engine",
+    "rllm.trainer.verl.agent_ppo_trainer",
+    "rllm.trainer.verl.agent_sdk_trainer",
+    "rllm.trainer.verl.agent_workflow_trainer",
+    "rllm.trainer.verl.ray_runtime_env",
+    "rllm.experimental.verl.verl_backend",
+    "rllm.experimental.verl.verl_launcher",
+    "rllm.experimental.verl.transform",
+    "rllm.experimental.verl.utils",
+    "rllm.experimental.verl.metrics",
+    "rllm.experimental.verl.dataclass",
+    "rllm.experimental.common.config",
+    "rllm.experimental.rollout.verl_engine",
+    "rllm.parser.chat_template_parser",
+]
+fail = 0
+for m in mods:
+    try:
+        importlib.import_module(m); print(f"  OK   {m}")
+    except Exception as e:
+        fail += 1; print(f"  FAIL {m}: {type(e).__name__}: {e}")
+print(f"--- {len(mods)-fail}/{len(mods)} OK ---")
+import sys; sys.exit(1 if fail else 0)
+EOF
+
+# === 2. 再跑 vllm-ascend Qwen3.6 4 项推理 smoke（W1.7 原文）===
+#    关 thinking 单请求 / qwen3_coder tool call / 多轮 tool call / 32k context
+```
+
+**W2 准入硬性 checklist**（重写）：
+
+- [ ] §13.8 步骤 1：20/20 OK，无 `AsyncLLMServerManager` ImportError、无 `RolloutCorrectionConfig` NameError
+- [ ] §13.8 步骤 2：4 项 vllm-ascend Qwen3.6 smoke 全通
+
+通过即可进 W2。
