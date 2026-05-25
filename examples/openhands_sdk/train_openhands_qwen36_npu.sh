@@ -159,17 +159,34 @@ echo "  max_model_len   : 32768 (stage1 baseline; raise after W3 if needed)"
 echo "  router_replay   : disabled (see plan §13.3)"
 echo "  use_kl_loss     : False (rely on PPO clip; see plan §13.7)"
 
-echo "正在重启 Ray 集群清理 NPU 状态..."
-ray stop --force || true
-rm -rf /tmp/ray/*
-sleep 2
-ray start --head \
-    --port 6379 \
-    --dashboard-host 0.0.0.0 \
-    --dashboard-port 8265 \
-    --disable-usage-stats \
-    --node-ip-address ${MASTER_ADDR} \
-    --object-store-memory=$((4 * 1024 * 1024 * 1024))
+# ------------------------------------------------------------------------------
+# Layered testing hatches (see plan §13.10):
+#   PREFLIGHT_ONLY=1     → skip Ray + ray job submit; run preflight only and exit
+#   STAGE1_DRY_STEPS=N   → cap training at N global steps (verl total_training_steps)
+#   STAGE1_MOCK_ROLLOUT=1 → swap rollout() with mock_rollout (no docker/LLM)
+# ------------------------------------------------------------------------------
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+STAGE1_DRY_STEPS="${STAGE1_DRY_STEPS:-0}"
+export STAGE1_MOCK_ROLLOUT="${STAGE1_MOCK_ROLLOUT:-0}"   # read by train_openhands_qwen36_npu.py
+if [[ "${STAGE1_MOCK_ROLLOUT}" != "0" ]]; then
+    echo "[stage1] STAGE1_MOCK_ROLLOUT=${STAGE1_MOCK_ROLLOUT} → mock rollout (no docker/LLM)"
+fi
+
+if [[ "${PREFLIGHT_ONLY}" != "0" ]]; then
+    echo "[stage1] PREFLIGHT_ONLY=${PREFLIGHT_ONLY} → running preflight, skipping Ray + training"
+else
+    echo "正在重启 Ray 集群清理 NPU 状态..."
+    ray stop --force || true
+    rm -rf /tmp/ray/*
+    sleep 2
+    ray start --head \
+        --port 6379 \
+        --dashboard-host 0.0.0.0 \
+        --dashboard-port 8265 \
+        --disable-usage-stats \
+        --node-ip-address ${MASTER_ADDR} \
+        --object-store-memory=$((4 * 1024 * 1024 * 1024))
+fi
 
 # ------------------------------------------------------------------------------
 # Launch training
@@ -362,6 +379,20 @@ ARGS=(
   # global_profiler.steps=$PROFILE_STEPS
   # global_profiler.save_path=$SAVE_PATH
 )
+
+# STAGE1_DRY_STEPS=N → cap training at N global steps for layered smoke
+if [[ "${STAGE1_DRY_STEPS}" != "0" ]]; then
+    ARGS+=(
+      "+trainer.total_training_steps=${STAGE1_DRY_STEPS}"
+    )
+    echo "[stage1] STAGE1_DRY_STEPS=${STAGE1_DRY_STEPS} → capping global_steps via trainer.total_training_steps"
+fi
+
+if [[ "${PREFLIGHT_ONLY}" != "0" ]]; then
+    # Layer 1 isolation: no Ray, no NPU, no docker — just the cheap config/import checks.
+    python3 -m examples.openhands_sdk.preflight_qwen36_npu "${ARGS[@]}" 2>&1 | tee -i "${logs}.preflight"
+    exit ${PIPESTATUS[0]}
+fi
 
 ray job submit --address="http://${MASTER_ADDR}:8265" \
     -- \

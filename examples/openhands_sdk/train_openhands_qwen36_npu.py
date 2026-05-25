@@ -44,7 +44,16 @@ import warnings
 
 import hydra
 
-from examples.openhands_sdk.openhands_agent import rollout
+# Layered testing hatch: STAGE1_MOCK_ROLLOUT=1 swaps in mock_rollout.rollout
+# (deterministic fake trajectory, no docker/LLM) so Layer 5 (training step)
+# can be exercised in isolation from Layer 4 (real rollout infra).
+if os.environ.get("STAGE1_MOCK_ROLLOUT", "0") not in ("", "0", "false", "False"):
+    from examples.openhands_sdk.mock_rollout import rollout
+
+    print("[stage1] STAGE1_MOCK_ROLLOUT=1 set; using mock_rollout.rollout (no docker/LLM)")
+else:
+    from examples.openhands_sdk.openhands_agent import rollout
+
 from rllm.data.dataset import DatasetRegistry
 from rllm.trainer.agent_trainer import AgentTrainer
 
@@ -96,6 +105,15 @@ def main(config):
         train_dataset=train_dataset,
         val_dataset=val_dataset,
     )
+
+    # Layered testing hatch: skip .train() when running preflight-only.
+    # The companion .sh wrapper sets PREFLIGHT_ONLY=1 to exercise Layer 1
+    # (config + dataset + AgentTrainer construct) without spinning up Ray /
+    # Megatron / docker / vllm.
+    if os.environ.get("PREFLIGHT_ONLY", "0") not in ("", "0", "false", "False"):
+        print("[stage1] PREFLIGHT_ONLY=1 set; skipping trainer.train() and exiting OK")
+        return
+
     trainer.train()
 
 

@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.5 — W1 全部完成进入 W2；stage1 训练脚本交付，新增 §13.9)
+> 修订时间：2026-05-25 (v2.6 — W2.0 stage1 分段测试基础设施落地：preflight + mock_rollout + mock_llm_server + orchestrator + 3 个 env hatch；新增 §13.10)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -864,6 +864,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.3 | **W1 cherry-pick 全部落地** (12 commits, 见 §13.1)；本地全仓 syntax 通过；NPU 真实 import + vllm-ascend smoke 移交。**修正 R2/R3 在 stage1 路径上的真实生效情况**（§13.3）：stage1 走 `AgentPPOTrainer`（不是 `VerlBackend`），而 `19983fe4` 改动文件清单**完全不含** `rllm/trainer/verl/agent_ppo_trainer.py`——意味着 stage1 路径上 R2/R3 入口都不生效，无论是走 rllm 入口还是 verl native CLI（rllm 的 batch 组装路径绕开了 verl 原生 dataloader，rollout 端 routing 数据没法流到训练端）。stage1 建议**关 router_replay**，靠 KL coef / PPO clip 控制 off-policy；W2/W3 reward 不稳时按需 backport。§3.1 P0★ 表加"实施后注释"列。§3.3 swe 4 个 rllm 层 patch 全部 stage1 跳过（§13.2）。|
 | 2026-05-25 | v2.4 | **NPU smoke 第一轮跑出两类失败：(A) verl-BryanChen408 fork 已把 rollout 抽象重写**（`AsyncLLMServerManager` 重命名为 `LLMServerClient` 搬到 `verl/workers/rollout/llm_server.py`；`AgentLoopManager.{server_addresses,server_handles,global_load_balancer}` 三属性搬到 `LLMServerManager`；构造签名都变了）—— **不是我们 cherry-pick 引入的，upstream/main 也 broken，只是 W1 NPU smoke 第一次实际验证暴露**。**决策**：在 verl-BryanChen408 fork 加薄兼容层（路线 B），rllm 一行不改。**(B) 19983fe4 合并漏带 `RolloutCorrectionConfig` 类定义**，已从 upstream/main 补回（commit `c1ff82e3`）。verl shim 实施：分支 `qwen36-rllm-compat`，commit `881a98d7`，2 文件 +89 行：(1) `agent_loop.py` 给 `AgentLoopManager` 加可选 `_server_manager` kwarg + 3 shim property + 末尾 `AsyncLLMServerManager(LLMServerClient)` 兼容类；(2) `ray_trainer.py:902` 把 `_server_manager=self.llm_server_manager` wire 进 `AgentLoopManager.create(...)`。新增 §13.6（verl shim）、§13.7（stage1 safe config: 关 router_replay + 关 KL loss + 监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）、§13.8（NPU smoke 第二轮重写）。|
 | 2026-05-25 | v2.5 | **W1 全部完成进入 W2**。NPU smoke 第二轮 20/20 import OK + vllm-ascend Qwen3.6 4 项推理 smoke 全过（含 qwen3_coder tool call 单轮/多轮、关 thinking、32k context）。**W2.2 stage1 训练脚本交付**：新增 `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}`（py 100 行/sh 290 行），融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置。Surgical changes vs `train_open_megatron.sh`：env 补 `CUDA_DEVICE_MAX_CONNECTIONS=1` / `VLLM_ALLREDUCE_USE_SYMM_MEM=0`；ARGS 补 §0.2 MoE 4 项 + `vanilla_mbridge=True`；改 `calculate_log_probs=True` / `kl_loss_coef=0.0`；新增 `+rllm.algorithm.router_replay=disabled`；并行改成单节点 TP=2 EP=4 ETP=1（用户决策）；`max_model_len` 改 32k；rollout TP=8。Legacy `train_open_megatron.{py,sh}` 保留作参考。新增 §13.9（脚本交付清单 + W2.3 起 NPU 验证入口）。|
+| 2026-05-25 | v2.6 | **W2.0 stage1 分段测试基础设施落地（B 档）**。设计 6 层逻辑模型 + L1..L4 fail-fast orchestrator，把端到端跑挂时的定位时间从小时级压到秒级。新文件：(1) `preflight_qwen36_npu.py` Layer 1 隔离（imports / dataset / rollout signature / hydra compose / AgentTrainer ctor 5 个子检查）；(2) `mock_rollout.py` Layer 4 drop-in 假 rollout（确定性 trajectory，无 docker/LLM）；(3) `mock_llm_server.py` Layer 2 FastAPI mock OpenAI-compatible server（已本地 curl 验通，schema 与真 vllm-ascend 一致）；(4) `stage1_test_layered.sh` orchestrator（L1/L2a/L2b/L3/L4 任选子集、bash 3.2 兼容、独立 log、summary 表）。train 脚本新增三个互相正交的 env hatch：`PREFLIGHT_ONLY=1` / `STAGE1_DRY_STEPS=N` / `STAGE1_MOCK_ROLLOUT=1`。新增 §13.10。|
 
 ---
 
@@ -1202,3 +1203,76 @@ bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 6. checkpoint save 到 `default_local_dir`
 
 任何步骤失败的 traceback 告诉我。
+
+### 13.10 Stage1 分段测试基础设施（W2.0，B 档）
+
+**动机**：W2 端到端跑挂时定位成本太高（Ray + LiteLLM proxy + vllm-ascend + Megatron + OpenHands docker + rllm trainer 6 个子系统都可能挂在某一层）。增加分层 hatch + mock + orchestrator，做到"挂在哪一层"在秒级隔离。
+
+**6 层逻辑模型**：
+
+```
+L1  preflight              hydra config + import + dataset + AgentTrainer ctor (no Ray/NPU/docker/LLM)
+L2a mock_llm_server smoke  curl mock OpenAI server, 验 tool_calls schema
+L2b mock_rollout dry-step  STAGE1_MOCK_ROLLOUT=1 + STAGE1_DRY_STEPS=1 → 全 rllm trainer 链路 + Megatron + 1 ppo iter，但 rollout 是 deterministic fake
+L3  real-rollout dry-step  STAGE1_DRY_STEPS=1 → 真 OpenHands docker + LiteLLM proxy + vllm-ascend + 1 ppo iter
+L4  full training          无 hatch
+```
+
+**新增文件**：
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `examples/openhands_sdk/preflight_qwen36_npu.py` | 230 | Layer 1 隔离：5 子检查（imports / dataset / rollout signature / hydra compose / AgentTrainer construct），fail-fast，pass-through CLI overrides |
+| `examples/openhands_sdk/mock_rollout.py` | 110 | Layer 4 隔离：drop-in replacement for `openhands_agent.rollout`，返回 deterministic fake trajectory，无 docker/LLM |
+| `examples/openhands_sdk/mock_llm_server.py` | 160 | Layer 2 隔离：FastAPI mock OpenAI-compatible server，返回 schema 与真 vllm-ascend 完全一致的 tool_calls / logprobs / token_ids |
+| `examples/openhands_sdk/stage1_test_layered.sh` | 165 | Orchestrator：跨 L1..L4 fail-fast 跑，每层独立 log + summary 表 |
+
+**train 脚本新增 hatch**：
+
+```bash
+PREFLIGHT_ONLY=1     # skip Ray + ray job submit，只跑 preflight 后退出
+STAGE1_DRY_STEPS=N   # 注入 +trainer.total_training_steps=N，跑 N 步后退出
+STAGE1_MOCK_ROLLOUT=1 # train_openhands_qwen36_npu.py 自动 import mock_rollout.rollout
+```
+
+三个 hatch 互相正交可组合。orchestrator 内部就是几条 hatch 组合的 wrapper：
+
+| 层 | hatch 组合 |
+|---|---|
+| L1 | `PREFLIGHT_ONLY=1 bash train_openhands_qwen36_npu.sh` |
+| L2a | `python3 -m examples.openhands_sdk.mock_llm_server --port 18000` + 2 个 curl 验 schema |
+| L2b | `STAGE1_MOCK_ROLLOUT=1 STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh` |
+| L3 | `STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh` |
+| L4 | `bash train_openhands_qwen36_npu.sh` |
+
+**NPU 节点使用**：
+
+```bash
+# 全跑
+bash examples/openhands_sdk/stage1_test_layered.sh
+
+# 只跑 L1+L2a（不需要装 verl/Megatron 的轻量验证）
+bash examples/openhands_sdk/stage1_test_layered.sh L1 L2a
+
+# 跑到 L2b 即停（验证 rllm trainer + Megatron 不依赖 OpenHands docker）
+bash examples/openhands_sdk/stage1_test_layered.sh L1 L2b
+
+# 跳过 L1（已知通过）直接 L3 dry-step
+bash examples/openhands_sdk/stage1_test_layered.sh L3
+```
+
+**fail-fast 行为**（用户决策）：每层 fail 立即停，summary 表里其余层标 `(skipped)`。覆盖：`STAGE1_HALT_ON_FAIL=0 bash stage1_test_layered.sh`。
+
+**logs**：`/tmp/stage1-layered/L{1,2a,2b,3,4}.log` + mock server log。orchestrator 退出前打 summary 表。
+
+**第一次 W2 推荐路径**：
+
+1. `bash stage1_test_layered.sh L1 L2a` —— 4 秒内验：rllm 链路 import 健康 + mock LLM 链路 OK
+2. `bash stage1_test_layered.sh L2b` —— ~10–30 分钟（要起 Megatron + 1 ppo iter），验：rllm trainer 全链路 + Megatron-Bridge 加载 Qwen3.6 + 一步训练 + checkpoint save（mock rollout 跳过 docker/LLM）
+3. `bash stage1_test_layered.sh L3` —— 验：OpenHands docker + LiteLLM proxy + vllm-ascend 真实联调
+4. `bash stage1_test_layered.sh L4` —— 进入正式训练
+
+L1/L2a 通过 L2b 挂 → 100% 是 rllm trainer / Megatron / NPU 问题（与 OpenHands 无关）。  
+L2b 通过 L3 挂 → 100% 是 OpenHands / LiteLLM proxy / vllm 链路问题（与 trainer / Megatron 无关）。
+
+**stage2 退出 hatch**：mock 文件保留，只是 orchestrator 默认配置改成 L4 only。三个 env var 永久保留作 debug tool。
