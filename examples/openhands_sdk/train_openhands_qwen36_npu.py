@@ -59,7 +59,7 @@ from rllm.trainer.agent_trainer import AgentTrainer
 
 _EX_DIR = os.path.dirname(os.path.abspath(__file__))
 _MOCK_NPU_PARQUET = os.path.join(_EX_DIR, "rl_single_ops.parquet")
-_MOCK_NPU_PARQUET = "/workspace/rllm-071/examples/openhands_sdk/mock_npu_operator.parquet"
+# _MOCK_NPU_PARQUET = "/workspace/rllm-071/examples/openhands_sdk/mock_npu_operator.parquet"
 
 
 class _MockNPUOperatorParquetDataset:
