@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.6 — W2.0 stage1 分段测试基础设施落地：preflight + mock_rollout + mock_llm_server + orchestrator + 3 个 env hatch；新增 §13.10)
+> 修订时间：2026-05-25 (v2.7 — verl fork shim 第二轮：megatron_workers/fsdp_workers re-export engine_workers；新增 §13.11)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -865,6 +865,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.4 | **NPU smoke 第一轮跑出两类失败：(A) verl-BryanChen408 fork 已把 rollout 抽象重写**（`AsyncLLMServerManager` 重命名为 `LLMServerClient` 搬到 `verl/workers/rollout/llm_server.py`；`AgentLoopManager.{server_addresses,server_handles,global_load_balancer}` 三属性搬到 `LLMServerManager`；构造签名都变了）—— **不是我们 cherry-pick 引入的，upstream/main 也 broken，只是 W1 NPU smoke 第一次实际验证暴露**。**决策**：在 verl-BryanChen408 fork 加薄兼容层（路线 B），rllm 一行不改。**(B) 19983fe4 合并漏带 `RolloutCorrectionConfig` 类定义**，已从 upstream/main 补回（commit `c1ff82e3`）。verl shim 实施：分支 `qwen36-rllm-compat`，commit `881a98d7`，2 文件 +89 行：(1) `agent_loop.py` 给 `AgentLoopManager` 加可选 `_server_manager` kwarg + 3 shim property + 末尾 `AsyncLLMServerManager(LLMServerClient)` 兼容类；(2) `ray_trainer.py:902` 把 `_server_manager=self.llm_server_manager` wire 进 `AgentLoopManager.create(...)`。新增 §13.6（verl shim）、§13.7（stage1 safe config: 关 router_replay + 关 KL loss + 监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）、§13.8（NPU smoke 第二轮重写）。|
 | 2026-05-25 | v2.5 | **W1 全部完成进入 W2**。NPU smoke 第二轮 20/20 import OK + vllm-ascend Qwen3.6 4 项推理 smoke 全过（含 qwen3_coder tool call 单轮/多轮、关 thinking、32k context）。**W2.2 stage1 训练脚本交付**：新增 `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}`（py 100 行/sh 290 行），融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置。Surgical changes vs `train_open_megatron.sh`：env 补 `CUDA_DEVICE_MAX_CONNECTIONS=1` / `VLLM_ALLREDUCE_USE_SYMM_MEM=0`；ARGS 补 §0.2 MoE 4 项 + `vanilla_mbridge=True`；改 `calculate_log_probs=True` / `kl_loss_coef=0.0`；新增 `+rllm.algorithm.router_replay=disabled`；并行改成单节点 TP=2 EP=4 ETP=1（用户决策）；`max_model_len` 改 32k；rollout TP=8。Legacy `train_open_megatron.{py,sh}` 保留作参考。新增 §13.9（脚本交付清单 + W2.3 起 NPU 验证入口）。|
 | 2026-05-25 | v2.6 | **W2.0 stage1 分段测试基础设施落地（B 档）**。设计 6 层逻辑模型 + L1..L4 fail-fast orchestrator，把端到端跑挂时的定位时间从小时级压到秒级。新文件：(1) `preflight_qwen36_npu.py` Layer 1 隔离（imports / dataset / rollout signature / hydra compose / AgentTrainer ctor 5 个子检查）；(2) `mock_rollout.py` Layer 4 drop-in 假 rollout（确定性 trajectory，无 docker/LLM）；(3) `mock_llm_server.py` Layer 2 FastAPI mock OpenAI-compatible server（已本地 curl 验通，schema 与真 vllm-ascend 一致）；(4) `stage1_test_layered.sh` orchestrator（L1/L2a/L2b/L3/L4 任选子集、bash 3.2 兼容、独立 log、summary 表）。train 脚本新增三个互相正交的 env hatch：`PREFLIGHT_ONLY=1` / `STAGE1_DRY_STEPS=N` / `STAGE1_MOCK_ROLLOUT=1`。新增 §13.10。|
+| 2026-05-25 | v2.7 | **L2b 跑挂暴露 verl fork 第二轮 API 漂移**：`verl/workers/megatron_workers.py` / `fsdp_workers.py` 已合并成 backend-agnostic `engine_workers.py`（只有 `ActorRolloutRefWorker` + `TrainingWorker`）。rllm 三处 import 仍是旧路径。verl-BryanChen408 分支 `qwen36-rllm-compat` commit `85159408` 加 2 个 shim 文件（+139 行）re-export `engine_workers`，并 alias `AsyncActorRolloutRefWorker=ActorRolloutRefWorker`（async 改 config 驱动）、`CriticWorker=TrainingWorker`（stage1 GRPO 不实例化 critic）。累计 verl fork compat 文件清单详见 §13.11。NPU 节点重 pull verl fork 后重跑 L2b。|
 
 ---
 
@@ -1276,3 +1277,65 @@ L1/L2a 通过 L2b 挂 → 100% 是 rllm trainer / Megatron / NPU 问题（与 Op
 L2b 通过 L3 挂 → 100% 是 OpenHands / LiteLLM proxy / vllm 链路问题（与 trainer / Megatron 无关）。
 
 **stage2 退出 hatch**：mock 文件保留，只是 orchestrator 默认配置改成 L4 only。三个 env var 永久保留作 debug tool。
+
+### 13.11 verl fork shim 第二轮：megatron_workers / fsdp_workers（W2.8）
+
+**触发**：L2b 跑 `mock_rollout + dry-step` 时挂在
+`ModuleNotFoundError: No module named 'verl.workers.megatron_workers'`，定位到 verl fork 的第二轮 API 漂移。
+
+**漂移内容**：fork 把 backend-specific worker 模块（`megatron_workers.py` / `fsdp_workers.py`）**合并到一个 backend-agnostic `engine_workers.py`**，只暴露两个类：
+
+| 旧符号 | 新位置 / 行为 |
+|---|---|
+| `verl.workers.megatron_workers.ActorRolloutRefWorker` | `verl.workers.engine_workers.ActorRolloutRefWorker`（async/sync 改 config 驱动：`actor_rollout_ref.rollout.mode=async`） |
+| `verl.workers.megatron_workers.AsyncActorRolloutRefWorker` | 同上（统一类） |
+| `verl.workers.megatron_workers.CriticWorker` | `verl.workers.engine_workers.TrainingWorker`（generic 训练 worker；critic 也用它） |
+| `verl.workers.fsdp_workers.*` | 同上（fork 也搬走了） |
+
+**rllm 侧的滞后 import**（与之前一样不是我们 cherry-pick 引入）：
+
+```
+rllm/trainer/verl/train_agent_ppo.py:99    AsyncActorRolloutRefWorker (fsdp 分支)
+rllm/trainer/verl/train_agent_ppo.py:105   AsyncActorRolloutRefWorker (megatron) ← stage1 触发
+rllm/trainer/verl/train_agent_ppo.py:134   CriticWorker (megatron, GRPO 不用但 import 必须通过)
+rllm/trainer/verl/train_workflow_pipeline.py:120-123 同（stage1 不走但保险）
+```
+
+**实施**（verl-BryanChen408 分支 `qwen36-rllm-compat`，commit `85159408`，新增 2 个文件 +139 行）：
+
+| 文件 | 角色 |
+|---|---|
+| `verl/workers/megatron_workers.py` | shim：from engine_workers 重导 + alias `AsyncActorRolloutRefWorker = ActorRolloutRefWorker` + `CriticWorker = TrainingWorker` |
+| `verl/workers/fsdp_workers.py` | 同样的 shim（stage1 不走 fsdp，但 import safety net） |
+
+shim 在 `engine_workers` 模块缺失时 raise 明确错误（不是模糊的 ImportError），方便未来诊断。
+
+**stage1 影响**：
+- GRPO actor-only，不实例化 critic → CriticWorker=TrainingWorker 的运行时签名差异（TrainingWorker 要 `TrainingWorkerConfig`）不被触发
+- 真正实例化的是 `AsyncActorRolloutRefWorker → ActorRolloutRefWorker`，async 行为由 `rollout.mode=async` 触发（stage1 训练脚本里已经是 `actor_rollout_ref.rollout.mode=async`）
+
+**累计 verl fork compat 文件清单**（`qwen36-rllm-compat` 分支）：
+
+| commit | 文件 | 解决问题 |
+|---|---|---|
+| `881a98d7` | `verl/experimental/agent_loop/agent_loop.py` | `AgentLoopManager` 三 property + `AsyncLLMServerManager` shim class |
+| `881a98d7` | `verl/trainer/ppo/ray_trainer.py` | wire `_server_manager` 到 `AgentLoopManager.create()` |
+| `85159408` | `verl/workers/megatron_workers.py` | shim：re-export engine_workers |
+| `85159408` | `verl/workers/fsdp_workers.py` | shim：同上 |
+
+**stage2 退出条件**：等上游 rllm 跟进 verl 8.x worker API 后整体删除。
+
+**NPU 节点拉新 commit**：
+
+```bash
+cd /workspace/verl
+git fetch origin
+git pull origin qwen36-rllm-compat   # 应拉到 85159408
+```
+
+然后重跑：
+
+```bash
+cd /workspace/rllm-071
+bash examples/openhands_sdk/stage1_test_layered.sh L2b
+```
