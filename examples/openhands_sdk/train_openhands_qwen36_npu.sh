@@ -43,7 +43,7 @@ set -x
 # First time
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
-export MODEL_PATH=/home/t00893162/models/Qwen3.6-35B-A3B
+export MODEL_PATH=/home/docker/Qwen3.6-35B-A3B
 export PROXY_PORT=5000
 
 export ASCEND_LAUNCH_BLOCKING=1 # TODO
@@ -158,7 +158,7 @@ export OPENHANDS_MODEL_NAME="${MODEL_PATH}"
 export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
-export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/t00893162/openhands_results}"
+export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
 
 # ------------------------------------------------------------------------------
 # Training parameters
@@ -193,10 +193,10 @@ fi
 echo "[stage1] batch sanity OK: BATCH_SIZE=$BATCH_SIZE ROLLOUT_N=$ROLLOUT_N" \
      "PPO_MINI_BATCH_SIZE=$PPO_MINI_BATCH_SIZE total_samples=${_total_samples} DP=$DP_SIZE"
 PROXY_PORT="${PROXY_PORT:-4000}"
-TRACE_DB_PATH="${TRACE_DB_PATH:-/home/t00893162/rllm-openhands-traces.db}"
+TRACE_DB_PATH="${TRACE_DB_PATH:-/workspace/results/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands-qwen36}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-stage1-qwen36-npu}"
-logs=/home/t00893162/verl-rllm-qwen36-npu.log
+logs=/workspace/results/verl-rllm-qwen36-npu.log
 
 # profiling configuration
 PROFILE_STEPS="[1]"
@@ -205,13 +205,13 @@ RANKS="[0]"
 DISCRETE=False
 
 # profiling NPU options
-SAVE_PATH="/home/t00893162/profile_data/all"
+SAVE_PATH="/workspace/results/profile_data/all"
 LEVEL="level1"
 CONTENTS=['npu','cpu','memory']
 ANALYSIS=True
 
 export OOM_SNAPSHOT_ENABLE=1
-export OOM_SNAPSHOT_PATH="/home/t00893162/profile_data"
+export OOM_SNAPSHOT_PATH="/workspace/results/profile_data"
 
 if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]] || [[ "$MODEL_PATH" == *"Qwen3.6"* ]]; then
     TOOL_PARSER=qwen3_coder
