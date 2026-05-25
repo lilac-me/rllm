@@ -76,6 +76,8 @@ export VLLM_RPC_TIMEOUT=86400000                # 24 hours (ms)
 # ------------------------------------------------------------------------------
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+# plan §0.2 NPU case: verl 脚本 :191 设的 NPU 必须
+export CPU_AFFINITY_CONF=1
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
@@ -202,6 +204,8 @@ ARGS=(
   algorithm.adv_estimator=grpo
   # plan §13.7: stage1 关 KL，全部归零避免歧义
   algorithm.kl_ctrl.kl_coef=0.0
+  # plan §0.2 verl ALGORITHM 段权威：显式设 False（默认应该也是 False，但 stage1 显式更稳）
+  algorithm.use_kl_in_reward=False
 
   # =========================
   # data
@@ -210,24 +214,31 @@ ARGS=(
   data.val_batch_size=16
   data.max_prompt_length=8192       # 8K
   data.max_response_length=4096     # 4K (8K + 4K = 12K ≤ max_model_len 32K)
+  data.truncation='error'                                # plan §0.2 verl 权威：超长 prompt 直接报错
+  data.filter_overlong_prompts=True                      # plan §0.2 verl 权威：dataloader 阶段过滤超长
 
   # =========================
   # actor_rollout_ref - common
   # =========================
   actor_rollout_ref.hybrid_engine=True
   actor_rollout_ref.model.path=${MODEL_PATH}
+  actor_rollout_ref.model.trust_remote_code=True   # plan §0.2 verl MODEL 权威：Qwen3.6 自定义 arch 需要
   # plan §0.1 软约束：use_remove_padding 视实测决定。stage1 起步沿用 True
   # （现有 NPU 训练脚本验证过可跑），W2 若挂或 OOM 再切 False
   actor_rollout_ref.model.use_remove_padding=True
 
   # =========================
-  # actor - optimization / PPO (plan §13.7)
+  # actor - optimization / PPO (plan §13.7 + verl NPU 套：use_dynamic_bsz=False)
   # =========================
+  # 用户决策 (2026-05-25)：use_dynamic_bsz 走 verl 套 (False + micro_batch=1 + max_token cap)。
+  # max_token cap 不直接照搬 verl 的 4096——verl 数据 prompt=1024+resp=2048 = 3072 < 4096；
+  # 我们 prompt=8192+resp=4096 = 12288，cap 必须 >= 12288。放大到 16384 留 ~33% headroom。
   actor_rollout_ref.actor.optim.lr=1e-6
   actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean
   actor_rollout_ref.actor.ppo_mini_batch_size=4
-  actor_rollout_ref.actor.use_dynamic_bsz=True
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1   # plan §0.2 verl 套必需
+  actor_rollout_ref.actor.use_dynamic_bsz=False            # plan §0.2 verl 套
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384  # cap >= data.max_prompt+max_response
   # plan §13.7: 关 KL loss，靠 PPO clip 控制 off-policy
   actor_rollout_ref.actor.use_kl_loss=False
   actor_rollout_ref.actor.kl_loss_coef=0.0
@@ -247,6 +258,9 @@ ARGS=(
   # 与 verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh NPU case override 一致。
   actor_rollout_ref.actor.megatron.vanilla_mbridge=False
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
+  actor_rollout_ref.actor.megatron.use_remove_padding=True   # 与 model.use_remove_padding 同步；plan §0.1 软约束
+  actor_rollout_ref.actor.megatron.dtype=bfloat16            # plan §0.2 verl ACTOR 权威：显式 bf16
+  actor_rollout_ref.actor.checkpoint.strict=False            # plan §0.2 verl NPU case：ckpt key 不严格匹配
 
   actor_rollout_ref.actor.megatron.param_offload=True
   actor_rollout_ref.actor.megatron.grad_offload=True
@@ -261,6 +275,7 @@ ARGS=(
   actor_rollout_ref.actor.megatron.expert_model_parallel_size=4
   actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
 
+  ++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto   # plan §0.2 verl 权威
   +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=1
   +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
@@ -273,13 +288,18 @@ ARGS=(
   +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
 
+  # plan §0.2 NPU case override 必需（verl 脚本 :198-200）
+  +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=alltoall
+  +actor_rollout_ref.actor.megatron.override_transformer_config.use_naive_l2norm=True
+
   +actor_rollout_ref.actor.checkpoint.save_contents="['model']"
 
   # =========================
   # actor optimizer override (与 verl 脚本 NPU 分支一致)
   # =========================
   +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
-  # +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
+  # plan §0.2 verl 权威启用（之前误注释）：D2H/H2D 与 optimizer step 重叠，影响吞吐
+  +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
   +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
   +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
 
@@ -287,8 +307,8 @@ ARGS=(
   # ref (与 actor 并行配置一致)
   # =========================
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
-  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
-  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=32768
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=False         # plan §0.2 与 actor 套一致
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384   # cap >= prompt+response（同 actor）
   actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2
   actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1
   actor_rollout_ref.ref.megatron.context_parallel_size=1
@@ -307,6 +327,7 @@ ARGS=(
   actor_rollout_ref.rollout.calculate_log_probs=True
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.mode=async
+  actor_rollout_ref.rollout.dtype=bfloat16                            # plan §0.2 verl ROLLOUT 权威：显式 bf16
   actor_rollout_ref.rollout.enforce_eager=True # TODO
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
@@ -320,6 +341,8 @@ ARGS=(
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
+  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False            # plan §0.2 与 actor 套一致
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=16384      # cap >= prompt+response（同 actor）
   ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
   +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True
   +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=${TOOL_PARSER}

@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.8 — 修 vanilla_mbridge NPU 必须 False 的 audit 错误；新增 §13.12)
+> 修订时间：2026-05-25 (v2.9 — 训练脚本完整校对，补 18 项遗漏 + 修 dynamic_bsz 耦合套；新增 §13.13)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -879,6 +879,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.6 | **W2.0 stage1 分段测试基础设施落地（B 档）**。设计 6 层逻辑模型 + L1..L4 fail-fast orchestrator，把端到端跑挂时的定位时间从小时级压到秒级。新文件：(1) `preflight_qwen36_npu.py` Layer 1 隔离（imports / dataset / rollout signature / hydra compose / AgentTrainer ctor 5 个子检查）；(2) `mock_rollout.py` Layer 4 drop-in 假 rollout（确定性 trajectory，无 docker/LLM）；(3) `mock_llm_server.py` Layer 2 FastAPI mock OpenAI-compatible server（已本地 curl 验通，schema 与真 vllm-ascend 一致）；(4) `stage1_test_layered.sh` orchestrator（L1/L2a/L2b/L3/L4 任选子集、bash 3.2 兼容、独立 log、summary 表）。train 脚本新增三个互相正交的 env hatch：`PREFLIGHT_ONLY=1` / `STAGE1_DRY_STEPS=N` / `STAGE1_MOCK_ROLLOUT=1`。新增 §13.10。|
 | 2026-05-25 | v2.7 | **L2b 跑挂暴露 verl fork 第二轮 API 漂移**：`verl/workers/megatron_workers.py` / `fsdp_workers.py` 已合并成 backend-agnostic `engine_workers.py`（只有 `ActorRolloutRefWorker` + `TrainingWorker`）。rllm 三处 import 仍是旧路径。verl-BryanChen408 分支 `qwen36-rllm-compat` commit `85159408` 加 2 个 shim 文件（+139 行）re-export `engine_workers`，并 alias `AsyncActorRolloutRefWorker=ActorRolloutRefWorker`（async 改 config 驱动）、`CriticWorker=TrainingWorker`（stage1 GRPO 不实例化 critic）。累计 verl fork compat 文件清单详见 §13.11。NPU 节点重 pull verl fork 后重跑 L2b。|
 | 2026-05-25 | v2.8 | **L2b 第二次重跑（带 W2.8 worker shim）走到 `engine.initialize()` 挂在 `mbridge.AutoBridge.from_config` "Unregistered model type: qwen3_5_moe"**。**根因 audit 错误**：plan §0.2 v2.1~v2.7 抄 verl 脚本 ACTOR 主行 `vanilla_mbridge=True`，**漏读 NPU case override 块**（verl 脚本 :196 明确 NPU 用 `vanilla_mbridge=False`）。两个独立 bridge 库澄清：`mbridge`（pypi 0.15.1，不支持 qwen3_5_moe）vs `Megatron-Bridge`（NVIDIA-NeMo，含 Qwen3.5 recipe，你环境已装）；`vanilla_mbridge` 是两者的开关，NPU 必须 False。修正：plan §0.2 + §13.9 改 False + 长注释解释；`train_openhands_qwen36_npu.sh` actor + ref 两处改 False + 详细注释；新增 §13.12 documenting 根因 + audit 教训（抄上游脚本要扫 case/if/elif override）。不需要升级 mbridge pypi 包。|
+| 2026-05-25 | v2.9 | **训练脚本完整校对（W2.10）**：W2.9 修 vanilla_mbridge 后做完整 verl NPU 分支 vs stage1 脚本 diff，发现 17 项遗漏 + 4 项 dynamic_bsz 耦合不一致。用户决策：use_dynamic_bsz 走 verl 套（False + micro_batch=1 + max_token cap）。补 18 项：`CPU_AFFINITY_CONF=1` / `trust_remote_code=True` / `algorithm.use_kl_in_reward=False` / `data.truncation='error'` / `data.filter_overlong_prompts=True` / `megatron.dtype=bfloat16` / `actor.megatron.use_remove_padding=True` / `actor.checkpoint.strict=False` / `attention_backend=auto` / `moe_token_dispatcher_type=alltoall` / `use_naive_l2norm=True` / `overlap_cpu_optimizer_d2h_h2d=True` / `rollout.dtype=bfloat16` + 4 项耦合切换（actor/ref/rollout 三处 `use_dynamic_bsz=False` 同步，`max_token=16384`——按数据规模等比放大 verl 4096，因 OpenHands prompt+response=12288）。不补 `model_engine=megatron`（hydra defaults 链已带入）。34 项 stage1 必需 key 全部就位。新增 §13.13 + audit 教训 4 条（case/if 扫描、耦合识别、cap 等比放大、hydra defaults 追到底）。|
 
 ---
 
@@ -1407,3 +1408,77 @@ case "${DEVICE}" in
 抄上游脚本主行参数时要扫一下 case/if/elif 块的 override —— 主行表的"权威值"可能被 device/strategy/mode 分支 case override，audit 时容易漏。Plan §0.2 接下来对照 `run_qwen3_5_35b_megatron.sh` 应该重做一次 case-aware 抄录。
 
 **下一步**：NPU 节点上 `git pull` rllm 拉到这个修正后重跑 L2b。
+
+### 13.13 训练脚本完整校对（W2.10）
+
+**触发**：W2.9 vanilla_mbridge 修复时意识到 plan §0.2 只抄了 verl 脚本 ACTOR 主行，遗漏 NPU case override。
+做完整 verl NPU 分支 vs stage1 脚本 diff，发现还有 **17 项遗漏**（分高/中风险，外加 4 项配置耦合不一致）。
+
+**用户决策（2026-05-25）**：`use_dynamic_bsz` 整组耦合 config 走 verl 套（False + micro_batch=1 + max_token cap）。
+
+**所有补全（18 项）**：
+
+| 类别 | key | 值 | 来源 |
+|---|---|---|---|
+| env | `CPU_AFFINITY_CONF=1` | yes | verl 脚本 :191 NPU case |
+| model | `trust_remote_code=True` | yes | verl MODEL 段 |
+| algorithm | `use_kl_in_reward=False` | yes | verl ALGORITHM 段 |
+| data | `truncation='error'` | yes | verl DATA 段 |
+| data | `filter_overlong_prompts=True` | yes | verl DATA 段 |
+| actor | `megatron.dtype=bfloat16` | yes | verl ACTOR 段 |
+| actor | `megatron.use_remove_padding=True` | 与 model 层同步 | plan §0.1 软约束 |
+| actor | `checkpoint.strict=False` | yes | verl NPU case :194 |
+| actor.megatron.tf_cfg | `attention_backend=auto` | yes | verl ACTOR 段 |
+| actor.megatron.tf_cfg | `moe_token_dispatcher_type=alltoall` | yes | verl NPU case :199 |
+| actor.megatron.tf_cfg | `use_naive_l2norm=True` | yes | verl NPU case :200 |
+| actor.optim.override | `overlap_cpu_optimizer_d2h_h2d=True` | yes | verl 段（之前误注释） |
+| rollout | `dtype=bfloat16` | yes | verl ROLLOUT 段 |
+| 耦合切换 | `actor.use_dynamic_bsz` | True→**False** | 用户决策（verl 套） |
+| 耦合切换 | `actor.ppo_micro_batch_size_per_gpu` | (缺)→**1** | verl 套必需 |
+| 耦合切换 | `actor.ppo_max_token_len_per_gpu` | 32768→**16384** | 按数据规模放大（max_prompt+max_response=12288 + 33% headroom；verl 主行 4096 在我们数据下放不下） |
+| 耦合切换 | `ref.log_prob_use_dynamic_bsz` | True→False；`ref.log_prob_max_token_len_per_gpu` 32768→16384 | 与 actor 套一致 |
+| 耦合切换 | `rollout.log_prob_use_dynamic_bsz` | (缺)→False；`rollout.log_prob_max_token_len_per_gpu` (缺)→16384 | 与 actor 套一致 |
+
+**没补的**（确认不需要）：
+
+| key | 不补理由 |
+|---|---|
+| `EXTRA=(model_engine=megatron)` | rllm `agent_ppo_trainer_megatron.yaml` → `ppo_megatron_trainer.yaml` → `override model_engine: megatron`，hydra defaults 链已自动带入 |
+| `pip install -U git+https://github.com/ISEEKYAN/mbridge.git` | NPU 走 `vanilla_mbridge=False`（NVIDIA Megatron-Bridge），不依赖 pypi mbridge |
+
+**保留的差异**（plan 已记录原因）：
+
+- 并行 TP=2 PP=1 EP=4（用户决策单节点 8 卡）vs verl TP=2 PP=2 EP=8（16 卡）
+- `data.max_prompt_length=8192` / `max_response_length=4096`（OpenHands 长 episode）vs verl 1024/2048（geo3k 短题）
+- `kl_loss_coef=0.0` / `use_kl_loss=False` / `+rllm.algorithm.router_replay=disabled` / `clip_ratio_low/high=0.2/0.28`（§13.7 安全配置）
+- `max_model_len=32768`（plan §5.2）
+- `rollout.n=${ROLLOUT_N}`（默认 1，bring-up 阶段）
+- `trainer.test_freq=20 / total_epochs=100`（长 episode 调小 eval 频率 + 长跑）
+
+**对照执行**：
+
+```bash
+# 34 项必需 key 自动校验
+for key in CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 CPU_AFFINITY_CONF=1 \
+           trust_remote_code=True kl_loss_coef=0.0 router_replay=disabled vanilla_mbridge=False \
+           megatron.dtype=bfloat16 rollout.dtype=bfloat16 \
+           moe_aux_loss_coeff moe_z_loss_coeff moe_permute_fusion moe_grouped_gemm \
+           moe_token_dispatcher_type=alltoall use_naive_l2norm=True \
+           use_flash_attn=True attention_backend=auto use_kl_in_reward=False \
+           checkpoint.strict=False calculate_log_probs=True \
+           max_model_len=32768 use_dynamic_bsz=False \
+           ppo_micro_batch_size_per_gpu=1 ppo_max_token_len_per_gpu=16384 \
+           log_prob_use_dynamic_bsz=False log_prob_max_token_len_per_gpu=16384 \
+           expert_model_parallel_size=4 tensor_model_parallel_size=2 expert_tensor_parallel_size=1 \
+           overlap_cpu_optimizer_d2h_h2d=True data.truncation data.filter_overlong_prompts; do
+    grep -q "$key" examples/openhands_sdk/train_openhands_qwen36_npu.sh && echo "  ✓ $key" || echo "  ✗ MISSING $key"
+done
+# 已全 ✓
+```
+
+**audit 教训整理**（plan §13.12 续写）：
+
+1. **抄上游 array 时务必扫 case/if/elif override**（W2.9）
+2. **耦合 config（use_dynamic_bsz / use_remove_padding 等）要识别为"套装"**，不能单改一项（W2.10）
+3. **数据规模差异 → cap 类参数等比放大**（W2.10：verl 4096 → 我们 16384）
+4. **hydra defaults 链要追到底**（W2.10：rllm 引用的 ppo_megatron_trainer.yaml 已经是 verl 8.x stub）
