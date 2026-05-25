@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.4 — NPU smoke 第一轮跑出 verl API 漂移 + RolloutCorrectionConfig 缺失；fork 端 rllm-compat shim 落地 + 缺失 class 补回；新增 §13.6–§13.8)
+> 修订时间：2026-05-25 (v2.5 — W1 全部完成进入 W2；stage1 训练脚本交付，新增 §13.9)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -863,6 +863,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.2 | **基线切到 `origin/openhands_ascend`**（已带 ascendc 数据准备 + SDK runner 更新），新分支名 `qwen36-openhands-stage1`；§2.1 补 obs 4 个独有 commit 的 cherry-pick 评估表，`c6e36b0a` 强烈建议拿。新增**范围声明**：算子 reward / 评测协议、ascendC 工具链、数据集来源、依赖版本管理均**不在本 plan 范围**（reward 在 OpenHands 容器内自洽，rllm 只拿标量；依赖以"当前 commit 即锁定版本"为准）。§0.1 把 GDN/`use_remove_padding=False` 从硬约束**软化为可调**，W2 实测决定。§3.1 把 `19983fe4`（router replay，新增 `rllm/algorithm` 子系统）与 `e66fc2e4`（lr_schedule，依赖前者）标 **P0★ 高风险 cherry-pick**，明确顺序约束。§4.2 W1 任务相应重排。§11.1 cherry-pick 脚本拆分 SAFE / HIGH_RISK 两段。§9 新增"下一阶段 TODO"清单，把 P1/P2 候选项（真实数据集、reasoning schema、checkpoint 后端、dashboard、端口预算、bypass rollout 归位、legacy example deprecate、GDN bshd 可视化）统一下放。|
 | 2026-05-25 | v2.3 | **W1 cherry-pick 全部落地** (12 commits, 见 §13.1)；本地全仓 syntax 通过；NPU 真实 import + vllm-ascend smoke 移交。**修正 R2/R3 在 stage1 路径上的真实生效情况**（§13.3）：stage1 走 `AgentPPOTrainer`（不是 `VerlBackend`），而 `19983fe4` 改动文件清单**完全不含** `rllm/trainer/verl/agent_ppo_trainer.py`——意味着 stage1 路径上 R2/R3 入口都不生效，无论是走 rllm 入口还是 verl native CLI（rllm 的 batch 组装路径绕开了 verl 原生 dataloader，rollout 端 routing 数据没法流到训练端）。stage1 建议**关 router_replay**，靠 KL coef / PPO clip 控制 off-policy；W2/W3 reward 不稳时按需 backport。§3.1 P0★ 表加"实施后注释"列。§3.3 swe 4 个 rllm 层 patch 全部 stage1 跳过（§13.2）。|
 | 2026-05-25 | v2.4 | **NPU smoke 第一轮跑出两类失败：(A) verl-BryanChen408 fork 已把 rollout 抽象重写**（`AsyncLLMServerManager` 重命名为 `LLMServerClient` 搬到 `verl/workers/rollout/llm_server.py`；`AgentLoopManager.{server_addresses,server_handles,global_load_balancer}` 三属性搬到 `LLMServerManager`；构造签名都变了）—— **不是我们 cherry-pick 引入的，upstream/main 也 broken，只是 W1 NPU smoke 第一次实际验证暴露**。**决策**：在 verl-BryanChen408 fork 加薄兼容层（路线 B），rllm 一行不改。**(B) 19983fe4 合并漏带 `RolloutCorrectionConfig` 类定义**，已从 upstream/main 补回（commit `c1ff82e3`）。verl shim 实施：分支 `qwen36-rllm-compat`，commit `881a98d7`，2 文件 +89 行：(1) `agent_loop.py` 给 `AgentLoopManager` 加可选 `_server_manager` kwarg + 3 shim property + 末尾 `AsyncLLMServerManager(LLMServerClient)` 兼容类；(2) `ray_trainer.py:902` 把 `_server_manager=self.llm_server_manager` wire 进 `AgentLoopManager.create(...)`。新增 §13.6（verl shim）、§13.7（stage1 safe config: 关 router_replay + 关 KL loss + 监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）、§13.8（NPU smoke 第二轮重写）。|
+| 2026-05-25 | v2.5 | **W1 全部完成进入 W2**。NPU smoke 第二轮 20/20 import OK + vllm-ascend Qwen3.6 4 项推理 smoke 全过（含 qwen3_coder tool call 单轮/多轮、关 thinking、32k context）。**W2.2 stage1 训练脚本交付**：新增 `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}`（py 100 行/sh 290 行），融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置。Surgical changes vs `train_open_megatron.sh`：env 补 `CUDA_DEVICE_MAX_CONNECTIONS=1` / `VLLM_ALLREDUCE_USE_SYMM_MEM=0`；ARGS 补 §0.2 MoE 4 项 + `vanilla_mbridge=True`；改 `calculate_log_probs=True` / `kl_loss_coef=0.0`；新增 `+rllm.algorithm.router_replay=disabled`；并行改成单节点 TP=2 EP=4 ETP=1（用户决策）；`max_model_len` 改 32k；rollout TP=8。Legacy `train_open_megatron.{py,sh}` 保留作参考。新增 §13.9（脚本交付清单 + W2.3 起 NPU 验证入口）。|
 
 ---
 
@@ -1131,3 +1132,73 @@ EOF
 - [ ] §13.8 步骤 2：4 项 vllm-ascend Qwen3.6 smoke 全通
 
 通过即可进 W2。
+
+### 13.9 Stage1 训练脚本已交付（W2.2 完成）
+
+**新增文件**（plan §7.1 列出，本次 landed）：
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `examples/openhands_sdk/train_openhands_qwen36_npu.py` | 100 | hydra entry point（与 `train_open_megatron.py` 等价，独立文件防 stage1 改动污染 legacy） |
+| `examples/openhands_sdk/train_openhands_qwen36_npu.sh` | 290 | shell wrapper，融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置 |
+
+**关键配置（diff 自 `train_open_megatron.sh` 的 surgical changes）**：
+
+```bash
+# env (plan §0.1 必须，原脚本缺)
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
+# §13.7 stage1 safe config
+algorithm.kl_ctrl.kl_coef=0.0                                # 原 0.001
+actor_rollout_ref.actor.kl_loss_coef=0.0                     # 原 0.001
+actor_rollout_ref.rollout.calculate_log_probs=True           # 原 False
++rllm.algorithm.router_replay=disabled                       # 新增防御性显式
+
+# §0.2 verl 脚本权威 MoE 配置（原全缺）
+actor_rollout_ref.actor.megatron.vanilla_mbridge=True
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=0.01
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=0.001
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
+
+# 并行（用户决策 2026-05-25：TP=2 EP=4 单节点 8 NPU）
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2          # 原 4
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
+actor_rollout_ref.actor.megatron.context_parallel_size=1               # 原 2
+actor_rollout_ref.actor.megatron.expert_model_parallel_size=4          # 原注释
+actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1         # 新增
+# ref.megatron 同步上述并行配置
+
+# rollout（plan §5.2 stage1 起步 32k）
+actor_rollout_ref.rollout.tensor_model_parallel_size=8                 # 原 4，单节点全 TP
+actor_rollout_ref.rollout.max_model_len=32768                          # 原 131072
+```
+
+**保持不变的部分**：HCCL/GLOO 网络 env、OpenHands docker config、LiteLLM proxy (PROXY_PORT=5000)、Ray cluster 重启逻辑、profiler 注释段、AgentTrainer + rollout 入口。
+
+**legacy 脚本归位**：`train_open_megatron.sh` / `train_open_megatron.py` 保留不动，作为 stage1 之前的参考实现 + 任何要回退测试的对照。
+
+**W2.3 起的 NPU 节点验证**：
+
+```bash
+# NPU 节点上
+cd /workspace/rllm-071
+git fetch origin
+git checkout qwen36-openhands-stage1
+git pull   # 拉最新
+
+# 跑 stage1
+bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
+```
+
+期待第一次跑：
+
+1. Ray cluster 起来
+2. LiteLLM proxy 启动监听 :5000
+3. Megatron-Bridge 加载 Qwen3.6（已验证可行）
+4. 单 episode rollout 启动 OpenHands docker，container 内调 proxy → vllm-ascend → 返回 trajectory
+5. 一步 ppo iter 跑完，metrics 显示 `rollout_probs_diff_mean` / `pg_clipfrac` / `approx_kl`（前者来自 §13.7 监控，后两者 verl 原生）
+6. checkpoint save 到 `default_local_dir`
+
+任何步骤失败的 traceback 告诉我。
