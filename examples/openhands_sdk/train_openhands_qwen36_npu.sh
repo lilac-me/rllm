@@ -120,8 +120,34 @@ export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/t00893162/openhan
 # Training parameters
 # ------------------------------------------------------------------------------
 N_GPUS="${N_GPUS:-8}"
+# stage1 batch sizing (must satisfy two constraints):
+#   1. train_batch_size * rollout.n >= DP_size   (every DP rank gets >= 1 sample)
+#   2. train_batch_size >= ppo_mini_batch_size   (verl actor.py:224 hard check)
+#
+# DP_size on our parallelism layout = N_GPUS / (TP × PP × CP) = 8 / (2×1×1) = 4
+# So defaults below satisfy: BATCH_SIZE=1 × ROLLOUT_N=4 = 4 = DP, and
+# PPO_MINI_BATCH_SIZE coupled to BATCH_SIZE keeps train_batch_size >= mini_batch.
+# Override any of these on the command line for W3 scaling experiments.
 BATCH_SIZE="${BATCH_SIZE:-1}"
-ROLLOUT_N="${ROLLOUT_N:-1}"
+ROLLOUT_N="${ROLLOUT_N:-4}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${BATCH_SIZE}}"
+
+# Sanity assertions (fail fast with a clear message, not deep in verl validate())
+DP_SIZE=$(( N_GPUS / 2 ))   # TP=2, PP=1, CP=1 ⇒ DP = N_GPUS / TP
+_total_samples=$(( BATCH_SIZE * ROLLOUT_N ))
+if [[ ${_total_samples} -lt ${DP_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH_SIZE($BATCH_SIZE) * ROLLOUT_N($ROLLOUT_N) = ${_total_samples}" \
+         "< DP_SIZE($DP_SIZE). Some DP ranks would receive 0 samples." >&2
+    echo "[stage1] Either raise BATCH_SIZE or ROLLOUT_N so the product is >= ${DP_SIZE}." >&2
+    exit 2
+fi
+if [[ ${BATCH_SIZE} -lt ${PPO_MINI_BATCH_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH_SIZE($BATCH_SIZE) < PPO_MINI_BATCH_SIZE($PPO_MINI_BATCH_SIZE)." \
+         "verl actor.py:224 will reject this." >&2
+    exit 2
+fi
+echo "[stage1] batch sanity OK: BATCH_SIZE=$BATCH_SIZE ROLLOUT_N=$ROLLOUT_N" \
+     "PPO_MINI_BATCH_SIZE=$PPO_MINI_BATCH_SIZE total_samples=${_total_samples} DP=$DP_SIZE"
 PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-/home/t00893162/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands-qwen36}"
@@ -235,7 +261,8 @@ ARGS=(
   # 我们 prompt=8192+resp=4096 = 12288，cap 必须 >= 12288。放大到 16384 留 ~33% headroom。
   actor_rollout_ref.actor.optim.lr=1e-6
   actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean
-  actor_rollout_ref.actor.ppo_mini_batch_size=4
+  # PPO_MINI_BATCH_SIZE coupled to BATCH_SIZE by default (see header sanity check)
+  actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1   # plan §0.2 verl 套必需
   actor_rollout_ref.actor.use_dynamic_bsz=False            # plan §0.2 verl 套
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384  # cap >= data.max_prompt+max_response

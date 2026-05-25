@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.9 — 训练脚本完整校对，补 18 项遗漏 + 修 dynamic_bsz 耦合套；新增 §13.13)
+> 修订时间：2026-05-25 (v2.10 — batch sanity 联立约束：train_batch_size/ppo_mini_batch_size/rollout.n/DP 联动检查 + fail-fast；新增 §13.14)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -880,6 +880,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.7 | **L2b 跑挂暴露 verl fork 第二轮 API 漂移**：`verl/workers/megatron_workers.py` / `fsdp_workers.py` 已合并成 backend-agnostic `engine_workers.py`（只有 `ActorRolloutRefWorker` + `TrainingWorker`）。rllm 三处 import 仍是旧路径。verl-BryanChen408 分支 `qwen36-rllm-compat` commit `85159408` 加 2 个 shim 文件（+139 行）re-export `engine_workers`，并 alias `AsyncActorRolloutRefWorker=ActorRolloutRefWorker`（async 改 config 驱动）、`CriticWorker=TrainingWorker`（stage1 GRPO 不实例化 critic）。累计 verl fork compat 文件清单详见 §13.11。NPU 节点重 pull verl fork 后重跑 L2b。|
 | 2026-05-25 | v2.8 | **L2b 第二次重跑（带 W2.8 worker shim）走到 `engine.initialize()` 挂在 `mbridge.AutoBridge.from_config` "Unregistered model type: qwen3_5_moe"**。**根因 audit 错误**：plan §0.2 v2.1~v2.7 抄 verl 脚本 ACTOR 主行 `vanilla_mbridge=True`，**漏读 NPU case override 块**（verl 脚本 :196 明确 NPU 用 `vanilla_mbridge=False`）。两个独立 bridge 库澄清：`mbridge`（pypi 0.15.1，不支持 qwen3_5_moe）vs `Megatron-Bridge`（NVIDIA-NeMo，含 Qwen3.5 recipe，你环境已装）；`vanilla_mbridge` 是两者的开关，NPU 必须 False。修正：plan §0.2 + §13.9 改 False + 长注释解释；`train_openhands_qwen36_npu.sh` actor + ref 两处改 False + 详细注释；新增 §13.12 documenting 根因 + audit 教训（抄上游脚本要扫 case/if/elif override）。不需要升级 mbridge pypi 包。|
 | 2026-05-25 | v2.9 | **训练脚本完整校对（W2.10）**：W2.9 修 vanilla_mbridge 后做完整 verl NPU 分支 vs stage1 脚本 diff，发现 17 项遗漏 + 4 项 dynamic_bsz 耦合不一致。用户决策：use_dynamic_bsz 走 verl 套（False + micro_batch=1 + max_token cap）。补 18 项：`CPU_AFFINITY_CONF=1` / `trust_remote_code=True` / `algorithm.use_kl_in_reward=False` / `data.truncation='error'` / `data.filter_overlong_prompts=True` / `megatron.dtype=bfloat16` / `actor.megatron.use_remove_padding=True` / `actor.checkpoint.strict=False` / `attention_backend=auto` / `moe_token_dispatcher_type=alltoall` / `use_naive_l2norm=True` / `overlap_cpu_optimizer_d2h_h2d=True` / `rollout.dtype=bfloat16` + 4 项耦合切换（actor/ref/rollout 三处 `use_dynamic_bsz=False` 同步，`max_token=16384`——按数据规模等比放大 verl 4096，因 OpenHands prompt+response=12288）。不补 `model_engine=megatron`（hydra defaults 链已带入）。34 项 stage1 必需 key 全部就位。新增 §13.13 + audit 教训 4 条（case/if 扫描、耦合识别、cap 等比放大、hydra defaults 追到底）。|
+| 2026-05-25 | v2.10 | **batch sanity 联立约束（用户指出）**：`BATCH_SIZE=1` < `ppo_mini_batch_size=4` 违反 verl actor.py:224。深挖发现还有 DP 维度约束：`total_trajectories (BATCH×ROLLOUT) >= DP_size` 不然 DP rank 分不到 sample。stage1 默认改为 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`（耦合）；脚本顶部加 fail-fast sanity check（两个约束秒级 reject，不进 Ray）；plan §13.14 写联立约束矩阵 + W3 scaling 例子 + 为什么 ROLLOUT_N=4（GRPO group baseline + 覆盖 DP=4）。|
 
 ---
 
@@ -1482,3 +1483,73 @@ done
 2. **耦合 config（use_dynamic_bsz / use_remove_padding 等）要识别为"套装"**，不能单改一项（W2.10）
 3. **数据规模差异 → cap 类参数等比放大**（W2.10：verl 4096 → 我们 16384）
 4. **hydra defaults 链要追到底**（W2.10：rllm 引用的 ppo_megatron_trainer.yaml 已经是 verl 8.x stub）
+
+### 13.14 batch sanity：`train_batch_size`/`ppo_mini_batch_size`/`rollout.n`/`DP` 联立约束（W2.10 续）
+
+**触发**：用户指出 `BATCH_SIZE=1` 默认值 < `actor.ppo_mini_batch_size=4`，verl actor.py:224 会直接 reject。
+
+进一步发现这不只是整除问题，而是**联立约束**——还有 DP 维度。
+
+**verl 实际约束**（from `verl/workers/config/actor.py:222` + `verl/trainer/ppo/ray_trainer.py:1267`）：
+
+```
+DP_size = N_GPUS / (TP × PP × CP)                         = 8 / 2 = 4  (stage1 single-node)
+total_trajectories = train_batch_size × rollout.n
+effective_mini_batch = ppo_mini_batch_size × rollout.n
+
+约束 1 (硬 check, actor.py:224):  train_batch_size >= ppo_mini_batch_size
+约束 2 (DP 切分, implicit):       total_trajectories >= DP_size
+约束 3 (PPO 完整 iter):           total_trajectories % effective_mini_batch == 0
+```
+
+**stage1 默认 (修正后)**：
+
+```bash
+BATCH_SIZE=1           # 每 step 1 prompt → 1 个 OpenHands docker 容器（bring-up 稳）
+ROLLOUT_N=4            # 每 prompt 4 rollouts（GRPO group baseline；同时 1×4=4=DP，所有 rank 都有活）
+PPO_MINI_BATCH_SIZE=1  # = BATCH_SIZE，保证 train_batch_size >= ppo_mini_batch_size
+```
+
+验证：
+
+| 约束 | 计算 | 结果 |
+|---|---|---|
+| 1 | 1 >= 1 | ✓ |
+| 2 | 1×4=4 >= 4 | ✓ |
+| 3 | 4 % (1×4=4) == 0 | ✓ |
+
+**W3 scaling 例子**（用户改 env 即可）：
+
+| Env | total | mini_eff | DP | 合法? |
+|---|---|---|---|---|
+| `BATCH_SIZE=4 ROLLOUT_N=4` | 16 | 16 | 4 | ✓ 1 PPO iter |
+| `BATCH_SIZE=4 ROLLOUT_N=8 PPO_MINI_BATCH_SIZE=2` | 32 | 16 | 4 | ✓ 2 PPO iter |
+| `BATCH_SIZE=2 ROLLOUT_N=2` | 4 | 4 | 4 | ✓ 最小 |
+| `BATCH_SIZE=1 ROLLOUT_N=1` | 1 | 1 | 4 | ❌ DP 切不下去 |
+| `BATCH_SIZE=2 PPO_MINI_BATCH_SIZE=4` | (n/a) | (n/a) | (n/a) | ❌ batch < mini |
+
+**fail-fast sanity check 已加在脚本顶部**：
+
+```bash
+DP_SIZE=$(( N_GPUS / 2 ))   # TP=2, PP=1, CP=1
+_total_samples=$(( BATCH_SIZE * ROLLOUT_N ))
+if [[ ${_total_samples} -lt ${DP_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH × ROLLOUT < DP ($DP_SIZE)" >&2; exit 2
+fi
+if [[ ${BATCH_SIZE} -lt ${PPO_MINI_BATCH_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH < MINI" >&2; exit 2
+fi
+```
+
+挂在脚本顶部秒级 reject 配置错误，不浪费 30s 启动 Ray 才挂在 verl validate()。
+
+**为什么默认 `ROLLOUT_N=4` 而不是 1**：
+- DP=4 必须 >=4 个 samples
+- GRPO 需要 group baseline（n>=2 才有意义）
+- 4 是平衡 OpenHands docker 串行执行时间（每 prompt 4 rollouts ≈ 8-15 分钟单 step）与 statistical signal 的最小可用值
+
+**为什么 `PPO_MINI_BATCH_SIZE` 默认耦合 `BATCH_SIZE` 而不是固定值**：
+- BATCH_SIZE=1 时 mini=1（1 个 mini-batch）
+- BATCH_SIZE=4 时 mini=4（仍 1 个 mini-batch）
+- 用户 W3 scale up 时改 BATCH_SIZE，mini 自动跟随，**避免再踩 1 vs 4 这种坑**
+- 想分多个 mini-batch (e.g. 4 prompts × 2 mini-batches) 时显式传 `PPO_MINI_BATCH_SIZE=2`
