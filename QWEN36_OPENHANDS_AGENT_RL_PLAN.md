@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.13 — Megatron-Bridge 源码 clone PYTHONPATH 自动注入；新增 §13.17)
+> 修订时间：2026-05-25 (v2.14 — 删 HCCL_IF_IP 硬编码对齐 verl 默认环境；新增 §13.18)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -884,6 +884,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.11 | **prepare 脚本加 `--source mock` 模式（W2.12）**：用户希望 32 条 mock 跑 layered smoke 不依赖外部数据。复用既有 4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm），轮转生成任意 N 条（默认 32），前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保 op_name 唯一。Mock 模式 yield rl_single_ops-style shape 走 `_row_to_record` 统一管线，与 real-data 同路径，reward_model 多 `{kind:'mock', template}` 标识便于调试时区分。本地验证 32 条全转 + split 模式 (val_frac=0.1 → train=29 val=3)。Plan §13.15 续写对比表（legacy `create_mock_npu_operator_data.py` 16 行固定 vs 新 mock 模式任意数量）。|
 | 2026-05-25 | v2.12 | **mock parquet 在 dataset filter 挂在 jinja `No user query found in messages`（W2.13）**。根因：3 个 prepare/mock 脚本（`prepare_npu_operator_data.py`、legacy `create_mock_npu_operator_data.py`、`create_mock_npu_ascend_operator_data.py`）都用 `json.dumps([{...}])` 存 prompt 字段，但 verl `_build_messages` 和 `doc2len` 都直接拿 `doc[prompt_key]` 当 list iterate，无 `json.loads`。字符串被按字符 iterate → 找不到 user message。修复：三处都改成直接 `list[dict]`（pyarrow 原生支持 list[struct]）。为什么之前 mock 跑过没挂：之前没开 `filter_overlong_prompts=True`（W2.10 新加），doc2len 路径不触发。W2.10 + W2.13 是一起的。Audit 教训第 5 条：肉眼读 parquet 看不出 string vs list 时要 `type()` 验证。|
 | 2026-05-25 | v2.13 | **W2.13 prompt 修复后 L2b 推进到 verl `_build_tf_config` 挂在 `ModuleNotFoundError: No module named 'megatron.bridge'`**（W2.14）。根因：NPU 环境的 NVIDIA Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`）未 pip install，`from megatron.bridge import AutoBridge` 找不到。修：训练脚本顶部加三路 dispatch（源码路径 → PYTHONPATH；pip 装了 → 不动；都没 → WARN）。可用 `MEGATRON_BRIDGE_DIR` env 覆盖默认路径。Audit 教训第 6 条：依赖装载方式（pip / 源码 clone / 系统包）跨环境不一致，启动脚本应该把源码路径作为可配置 env + 路径不存在显式 WARN。|
+| 2026-05-25 | v2.14 | **L2b 在 Megatron-Bridge load_weights_hf_to_megatron → torch.distributed.broadcast 挂 HCCL error code 6（W2.15）**。**用户关键提示**：verl 自己跑 Qwen3.6 OK，rllm 基于 verl，所以问题在 rllm 这层引入。根因：obs 历史脚本硬编码 `HCCL_IF_IP=80.48.5.88` + `nic_name=ens1f3`，当前 NPU 节点 IP 是 80.48.5.65，HCCL_IF_IP 不存在 → HcclGetRootInfo 挂。verl 自己脚本 env 段只有 3 行（`CUDA_DEVICE_MAX_CONNECTIONS` / `VLLM_USE_V1` / `VLLM_ALLREDUCE_USE_SYMM_MEM`），没设这些 HCCL/socket env，靠容器默认。修：改成 opt-in 模式，`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE` env 才生效。Audit 教训第 7 条：硬编码 IP/MAC/NIC 跨机必爆，machine-specific identifier 不允许进库代码。**Audit 策略调整**：W2.10 只对齐了 ARGS 段，env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，全是潜在地雷；W2.15 先解决最毒的 HCCL_IF_IP，其他等 L2b 跑过再清理。|
 
 ---
 
@@ -1766,3 +1767,64 @@ fi
 **通用教训补充（§13.13 第 6 条）**：
 
 6. **依赖装载方式（pip vs 源码 clone vs 系统包）跨环境不一致** —— stage1 启动脚本应该把"源码 clone 路径"作为可配置 env，并加路径不存在的显式 WARN，避免又跑半天才发现是 PYTHONPATH 没接上。
+
+### 13.18 删 HCCL_IF_IP 硬编码 — 对齐 verl 自己跑的默认（W2.15）
+
+**触发**：L2b 走过 `_build_tf_config` + Megatron-Bridge load HF weights，挂在 `torch.distributed.broadcast`：
+
+```
+RuntimeError: createHCCLCommOrigin:torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:2314
+HCCL function error: HcclGetRootInfo(&hcclID), error code is 6
+[ERROR] (PID:1131801, Device:0, RankID:6) ERR02200 DIST call hccl api failed.
+```
+
+Traceback 头部显示 worker `pid=1131801, ip=80.48.5.65` — **当前节点 IP 是 80.48.5.65**。
+
+**用户关键提示**：verl 自己跑 Qwen3.6 是 OK 的。rllm 基于 verl，所以排查方向必须是"rllm 引入了什么 verl 自己跑时没有的差异"。
+
+**根因**：obs 分支历史脚本硬编码：
+
+```bash
+nic_name="ens1f3"
+export HCCL_IF_IP=80.48.5.88        # ← 当前节点没有这个 IP
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+```
+
+当前 NPU 节点不存在 IP 80.48.5.88，HCCL `HcclGetRootInfo` 找不到对应 NIC → error code 6。
+
+verl 自己的脚本（`run_qwen3_5_35b_megatron.sh`）**根本不设这些**，靠 NPU 容器默认 HCCL 配置就 OK。
+
+**修复**：改成 opt-in 模式：
+
+```bash
+# 默认（与 verl 自己跑一致）：完全不设 HCCL_IF_IP / SOCKET_IFNAME / port range
+
+# 需要 override（多 NIC 机器、端口冲突等）时启动前 export：
+HCCL_IF_IP_OVERRIDE=10.1.2.3 \
+HCCL_NIC_NAME=enp0s8 \
+HCCL_FORCE_PORT_RANGE=1 \
+bash train_openhands_qwen36_npu.sh
+```
+
+三个独立 opt-in env：
+- `HCCL_IF_IP_OVERRIDE` — 多 IP 机器选哪个 NIC 通信
+- `HCCL_NIC_NAME` — GLOO/TP/HCCL SOCKET_IFNAME 一致设
+- `HCCL_FORCE_PORT_RANGE` — 同节点跑多 verl 实例时强制端口段（含 HCCL_INTRA_ROCE/PCIE）
+
+**Audit 教训补充（§13.13 第 7 条）**：
+
+7. **硬编码 IP/MAC/NIC 名称跨机器必爆**。obs 历史脚本对某个 dev 节点是 OK 的，但 stage1 跑在新节点上立刻挂。原则：machine-specific identifier 不允许出现在 commit 进库的代码里，要么用 env override 要么 runtime detect（如 `hostname -I`）。
+
+**Audit 整体策略调整**：
+
+之前 W2.10 做"完整对齐 verl NPU 分支"是对的方向，但只对齐了 `ARGS` 段参数，**没对齐 env 段**。verl 自己脚本 env 段只有 3 行：
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_USE_V1=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+```
+
+我们脚本 env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，**这些都是 stage1 的潜在地雷**。W2.15 解决 HCCL_IF_IP 这个最炸的，其他 env（如 `ASCEND_LAUNCH_BLOCKING=1`、`VLLM_ATTENTION_BACKEND=TORCH_SDPA` 等）等到 L2b 跑过再视情况清理。

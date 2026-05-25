@@ -48,16 +48,42 @@ export PROXY_PORT=5000
 
 export ASCEND_LAUNCH_BLOCKING=1 # TODO
 
-nic_name="ens1f3"
-export HCCL_IF_IP=80.48.5.88
-export GLOO_SOCKET_IFNAME=$nic_name
-export TP_SOCKET_IFNAME=$nic_name
-export HCCL_SOCKET_IFNAME=$nic_name
-
-export HCCL_INTRA_ROCE_ENABLE=1 # TODO
-export HCCL_INTRA_PCIE_ENABLE=0 # TODO
-export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
-export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+# ------------------------------------------------------------------------------
+# HCCL / network env — opt-in only (W2.15)
+#
+# The legacy obs branch hardcoded IP 80.48.5.88 + nic 'ens1f3' for a specific
+# dev machine. That broke L2b when run from a different NPU node (HCCL
+# HcclGetRootInfo error code 6, because the hardcoded IF_IP doesn't exist on
+# the host). verl-native scripts (e.g. run_qwen3_5_35b_megatron.sh) do NOT
+# set these and rely on container defaults — Qwen3.6 trains fine that way.
+#
+# So we leave them unset by default and only export when the user opts in.
+# If you DO need overrides on a multi-NIC machine, set the corresponding
+# env BEFORE running this script:
+#     HCCL_IF_IP_OVERRIDE=10.x.y.z \
+#     HCCL_NIC_NAME=enp0s8 \
+#     HCCL_FORCE_PORT_RANGE=1 \
+#     bash train_openhands_qwen36_npu.sh
+# ------------------------------------------------------------------------------
+if [[ -n "${HCCL_IF_IP_OVERRIDE:-}" ]]; then
+    export HCCL_IF_IP="${HCCL_IF_IP_OVERRIDE}"
+    echo "[stage1] HCCL_IF_IP=${HCCL_IF_IP} (override)"
+fi
+if [[ -n "${HCCL_NIC_NAME:-}" ]]; then
+    export GLOO_SOCKET_IFNAME="${HCCL_NIC_NAME}"
+    export TP_SOCKET_IFNAME="${HCCL_NIC_NAME}"
+    export HCCL_SOCKET_IFNAME="${HCCL_NIC_NAME}"
+    echo "[stage1] *_SOCKET_IFNAME=${HCCL_NIC_NAME} (override)"
+fi
+if [[ "${HCCL_FORCE_PORT_RANGE:-0}" != "0" ]]; then
+    # plan §11.3: only enforce when there's port contention (multiple verl
+    # instances on the same host); otherwise let HCCL pick freely.
+    export HCCL_INTRA_ROCE_ENABLE=1
+    export HCCL_INTRA_PCIE_ENABLE=0
+    export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+    export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+    echo "[stage1] HCCL_*_SOCKET_PORT_RANGE forced (override)"
+fi
 
 export RAY_DEBUG_POST_MORTEM=0
 export RAY_DEDUP_LOGS=0
