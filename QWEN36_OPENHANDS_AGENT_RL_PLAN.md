@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.14 — 删 HCCL_IF_IP 硬编码对齐 verl 默认环境；新增 §13.18)
+> 修订时间：2026-05-25 (v2.15 — enforce_eager=True 与 verl 写死的 cudagraph FULL_AND_PIECEWISE 矛盾导致 vllm worker exit 2；改 False 对齐 verl 默认；新增 §13.19)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -1828,3 +1828,50 @@ export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 ```
 
 我们脚本 env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，**这些都是 stage1 的潜在地雷**。W2.15 解决 HCCL_IF_IP 这个最炸的，其他 env（如 `ASCEND_LAUNCH_BLOCKING=1`、`VLLM_ATTENTION_BACKEND=TORCH_SDPA` 等）等到 L2b 跑过再视情况清理。
+
+### 13.19 enforce_eager 对齐 verl 默认（W2.16）
+
+**触发**：L2b 走过 Megatron load + HCCL broadcast 后，vllm worker 启动时 `exits with an exit code 2`，ray actor 死亡。debug 输出能看到 vllm CLI args 但没有 vllm 内部 stderr。
+
+**verl 自己 vllm worker 关键代码**（`vllm_async_server.py:234-249`）：
+
+```python
+compilation_config = engine_kwargs.pop("compilation_config", None) or {}
+compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")   # ← 写死
+# ...
+args = {
+    "enforce_eager": self.config.enforce_eager,
+    "compilation_config": compilation_config,
+    ...
+}
+```
+
+verl **永远把 `cudagraph_mode='FULL_AND_PIECEWISE'` 传给 vllm**。verl 自己脚本 yaml 默认 `enforce_eager: false`（不显式设），cudagraph 真生效，vllm-ascend 跑 Qwen3.6 OK。
+
+我们脚本从 obs 历史继承了 `actor_rollout_ref.rollout.enforce_eager=True # TODO`，导致 `enforce_eager=True` + `cudagraph_mode=FULL_AND_PIECEWISE` 矛盾，vllm-ascend worker init 时 exit 2。
+
+**修复**：改成 env 可控，默认 False（对齐 verl）：
+
+```bash
+# 默认（与 verl 一致）
+actor_rollout_ref.rollout.enforce_eager=False
+
+# 如 NPU cudagraph warmup 太久或挂，可临时 opt-out
+ROLLOUT_ENFORCE_EAGER=True bash train_openhands_qwen36_npu.sh
+```
+
+**待用户确认**（同时跑 W2.16 + 拿 stderr 验证）：
+
+```bash
+# 在 NPU 节点
+ls -la /tmp/ray/session_latest/logs/ | grep "worker-" | tail -5
+grep -l "vllm" /tmp/ray/session_latest/logs/worker-*.err 2>/dev/null | head -3
+cat /tmp/ray/session_latest/logs/worker-<vllm-worker-pid>.err | tail -50
+```
+
+如果 W2.16 改完跑过：cudagraph 确实是根因。
+如果还挂：stderr 会显示真实错误，可能是别的（如 `--logprobs_mode processed_logprobs` 或 `--enable_sleep_mode` vllm-ascend 不支持）。
+
+**Audit 教训补充（§13.13 第 8 条）**：
+
+8. **下游覆盖上游默认值时要看上游 setdefault / 隐式 fill 的行为**。verl 的 vllm CLI 不只是 user-config 透传，还有 setdefault 自动填充（compilation_config 就是例子），下游显式设的某些值会与 setdefault 自动填的形成矛盾。审 verl 类似自动 fill 行为：`grep -rn "setdefault\|_apply_quantization" verl/workers/`。

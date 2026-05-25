@@ -89,7 +89,7 @@ export RAY_DEBUG_POST_MORTEM=0
 export RAY_DEDUP_LOGS=0
 export VLLM_ASCEND_ENABLE_NZ=0
 
-# vLLM timeout settings — NPU inference can be slow, especially with enforce_eager=True
+# vLLM timeout settings — NPU inference can be slow, especially during cudagraph warmup
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=86400  # 24 hours
 export VLLM_RPC_TIMEOUT=86400000                # 24 hours (ms)
 
@@ -399,7 +399,12 @@ ARGS=(
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.mode=async
   actor_rollout_ref.rollout.dtype=bfloat16                            # plan §0.2 verl ROLLOUT 权威：显式 bf16
-  actor_rollout_ref.rollout.enforce_eager=True # TODO
+  # W2.16: verl 写死 cudagraph_mode='FULL_AND_PIECEWISE'（vllm_async_server.py:237
+  # `compilation_config.setdefault`），enforce_eager=True 与 cudagraph 矛盾，
+  # vllm-ascend NPU 上启动 worker 直接 exit 2。verl 自己脚本不设这条 (yaml 默认
+  # false)，Qwen3.6 能跑通。所以我们也对齐 verl 默认 False，让 cudagraph 真生效。
+  # 如 NPU cudagraph warmup 时间过长可 env override: ROLLOUT_ENFORCE_EAGER=True
+  actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER:-False}
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6
