@@ -1553,3 +1553,95 @@ fi
 - BATCH_SIZE=4 时 mini=4（仍 1 个 mini-batch）
 - 用户 W3 scale up 时改 BATCH_SIZE，mini 自动跟随，**避免再踩 1 vs 4 这种坑**
 - 想分多个 mini-batch (e.g. 4 prompts × 2 mini-batches) 时显式传 `PPO_MINI_BATCH_SIZE=2`
+
+### 13.15 真实数据集 prepare 脚本（W2.11）
+
+**触发**：用户想直接用真实算子数据集（kernelgym 风格 JSONL）训 stage1，问能否复用
+`examples/kernelgym/prepare_kernelbench_data.py`。
+
+**结论**：不能直接复用。两份脚本输出 schema 完全不一致：
+
+| | `prepare_kernelbench_data.py` | stage1 训练脚本期待 |
+|---|---|---|
+| 格式 | JSONL | parquet |
+| 顶层 schema | `{task: {...}, backend: "..."}` | `{prompt: str, extra_info: {...}}` |
+| 字段命名 | `task.problem_id` / `task.reference_code` / `task.prompt` | `extra_info.op_name` / `extra_info.task_code` / `extra_info.instruction` |
+| 注入路径 | `DatasetRegistry.register_dataset()` | verl 直接读 parquet (`data.train_files=<parquet>`) |
+
+**新增 `examples/openhands_sdk/prepare_npu_operator_data.py`**（330 行）支持 3 种输入源：
+
+```bash
+# 1. kernelgym 风格 JSONL（用户实际格式）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-jsonl \
+    --input ./data/drkernel_rl_data.jsonl \
+    --output ./examples/openhands_sdk/real_ops_train.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+
+# 2. rl_single_ops 风格 JSON（既有 mock 的源）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-json --input ./rl_single_ops.json \
+    --output ./examples/openhands_sdk/rl_single_ops.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+
+# 3. HuggingFace dataset（本地 hf_dataset/ 目录或远端 Hub）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source hf --input ./hf_dataset/drkernel-rl-data --hf-split train \
+    --output ./examples/openhands_sdk/real_ops_train.parquet
+
+# Train/val 切分
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-jsonl --input ./data/drkernel_rl_data.jsonl \
+    --output-train ./examples/openhands_sdk/real_ops_train.parquet \
+    --output-val ./examples/openhands_sdk/real_ops_val.parquet \
+    --val-frac 0.05 --seed 42
+```
+
+**统一输出 schema**（与 mock 完全兼容，superset）：
+
+```python
+{
+    "prompt": str,        # json.dumps([{"role":"user", "content": instruction}])
+    "extra_info": {
+        "instruction":  str,     # 给 LLM 的提示
+        "scenario":     str,     # 'npu_operator' / 'npu_ascend_operator'
+        "op_name":      str,     # 短标识，metrics 聚合用
+        "arch":         str,     # 'ascend910b1' / 'ascend910b'
+        "task_code":    str,     # PyTorch 参考实现，写进 OpenHands workspace
+        "reward_model": dict,    # 新增字段：{ground_truth, entry_point, backend, problem_id}
+                                 # 给容器内 reward 函数读，不破坏现有 rollout
+    }
+}
+```
+
+**核心设计**：
+
+- 单一 `_row_to_record(row, scenario, arch)` 函数自动判别 kernelgym-style (有 `task` 字段) vs rl_single_ops-style (有 `prompt`+`py_code/code`)，源端解析与目标 schema 解耦
+- 不认识 schema 的行 `--skip` 计数（前 5 条打 stderr），不阻塞整体转换
+- `--limit N` 支持 smoke 模式（先转 N 条试管线）
+- `--val-frac` deterministic split（seed 固定）
+
+**本地验证**（4 条 mini kernelgym JSONL → parquet）：
+
+```
+✓ top-level columns identical: ['prompt', 'extra_info']
+mock extra_info keys: ['arch', 'instruction', 'op_name', 'scenario', 'task_code']
+real extra_info keys: ['arch', 'instruction', 'op_name', 'reward_model', 'scenario', 'task_code']
+✓ real parquet is a superset of mock keys — rollout will work
+✓ split mode: train=3 val=1
+```
+
+**接到 stage1 训练**：
+
+train_openhands_qwen36_npu.py 当前指向 `rl_single_ops.parquet`：
+
+```python
+_MOCK_NPU_PARQUET = os.path.join(_EX_DIR, "rl_single_ops.parquet")
+```
+
+如果你的 prepare 输出叫 `real_ops_train.parquet`，两种接法：
+
+A. **改 .py 里的常量**指向新 parquet（最干净）
+B. **生成时 `--output=examples/openhands_sdk/rl_single_ops.parquet`** 覆盖现有文件（最少代码改动）
+
+stage1 起步推荐 B（不动 .py，重跑 prepare 时直接覆盖 parquet）。
