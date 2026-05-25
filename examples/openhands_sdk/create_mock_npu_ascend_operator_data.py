@@ -46,8 +46,11 @@ def convert(output_path: str = _OUTPUT_PARQUET, input_path: str = _INPUT_JSON) -
             "reward_model": item.get("reward_model", {}),
         }
 
+        # MUST be list[dict] not JSON string — verl _build_messages / doc2len
+        # call tokenizer.apply_chat_template(doc[prompt_key], ...) directly
+        # with no json.loads; a string crashes jinja with "No user query found".
         rows.append({
-            "prompt": json.dumps(prompt_list, ensure_ascii=False),
+            "prompt": list(prompt_list),
             "extra_info": extra_info,
         })
 

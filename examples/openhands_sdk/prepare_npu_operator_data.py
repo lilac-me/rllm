@@ -5,9 +5,14 @@ Converts source records (kernelgym-style JSONL, rl_single_ops-style JSON, or
 HuggingFace dataset) into the parquet schema consumed by
 ``train_openhands_qwen36_npu.{py,sh}`` via verl's ``data.train_files``.
 
-Target parquet schema (same as create_mock_npu_operator_data.py):
+Target parquet schema (verl-compatible; **list[dict] not str**):
 
-    prompt:     str  -- json-encoded list[{role, content}] (chat messages)
+    prompt:     list[{role, content}]  -- chat messages, stored as native
+                                          pyarrow list[struct]. NOT json.dumps'd —
+                                          verl's _build_messages / doc2len both
+                                          read this directly with no json.loads,
+                                          a string here would crash chat template
+                                          rendering with "No user query found".
     extra_info: dict -- {
         instruction:  str        # user-facing problem statement
         scenario:     str        # 'npu_operator' / 'npu_ascend_operator'
@@ -318,6 +323,12 @@ def _row_to_record(row: dict, *, scenario: str, arch: str) -> dict:
         )
 
     # Chat messages used as the verl `prompt` column.
+    # MUST be a list[dict], NOT a JSON-encoded string.
+    # verl/utils/dataset/rl_dataset.py:_build_messages() and the doc2len()
+    # filter path both call `tokenizer.apply_chat_template(doc[prompt_key], ...)`
+    # directly without any json.loads — so a string here makes jinja iterate
+    # characters and fail with "No user query found in messages".
+    # pyarrow stores list[struct] natively, no serialization needed.
     prompt_messages = [{"role": "user", "content": instruction}]
 
     extra_info = {
@@ -330,7 +341,7 @@ def _row_to_record(row: dict, *, scenario: str, arch: str) -> dict:
     }
 
     return {
-        "prompt": json.dumps(prompt_messages, ensure_ascii=False),
+        "prompt": prompt_messages,
         "extra_info": extra_info,
     }
 

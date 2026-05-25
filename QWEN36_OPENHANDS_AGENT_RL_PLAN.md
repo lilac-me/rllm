@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.11 — prepare 脚本加 --source mock 模式 + 内置 4 模板任意数量轮转；§13.15 续写)
+> 修订时间：2026-05-25 (v2.12 — 修 prompt 字段必须是 list[dict] 不是 JSON string，否则 verl jinja 报 No user query found；新增 §13.16)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -882,6 +882,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.9 | **训练脚本完整校对（W2.10）**：W2.9 修 vanilla_mbridge 后做完整 verl NPU 分支 vs stage1 脚本 diff，发现 17 项遗漏 + 4 项 dynamic_bsz 耦合不一致。用户决策：use_dynamic_bsz 走 verl 套（False + micro_batch=1 + max_token cap）。补 18 项：`CPU_AFFINITY_CONF=1` / `trust_remote_code=True` / `algorithm.use_kl_in_reward=False` / `data.truncation='error'` / `data.filter_overlong_prompts=True` / `megatron.dtype=bfloat16` / `actor.megatron.use_remove_padding=True` / `actor.checkpoint.strict=False` / `attention_backend=auto` / `moe_token_dispatcher_type=alltoall` / `use_naive_l2norm=True` / `overlap_cpu_optimizer_d2h_h2d=True` / `rollout.dtype=bfloat16` + 4 项耦合切换（actor/ref/rollout 三处 `use_dynamic_bsz=False` 同步，`max_token=16384`——按数据规模等比放大 verl 4096，因 OpenHands prompt+response=12288）。不补 `model_engine=megatron`（hydra defaults 链已带入）。34 项 stage1 必需 key 全部就位。新增 §13.13 + audit 教训 4 条（case/if 扫描、耦合识别、cap 等比放大、hydra defaults 追到底）。|
 | 2026-05-25 | v2.10 | **batch sanity 联立约束（用户指出）**：`BATCH_SIZE=1` < `ppo_mini_batch_size=4` 违反 verl actor.py:224。深挖发现还有 DP 维度约束：`total_trajectories (BATCH×ROLLOUT) >= DP_size` 不然 DP rank 分不到 sample。stage1 默认改为 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`（耦合）；脚本顶部加 fail-fast sanity check（两个约束秒级 reject，不进 Ray）；plan §13.14 写联立约束矩阵 + W3 scaling 例子 + 为什么 ROLLOUT_N=4（GRPO group baseline + 覆盖 DP=4）。|
 | 2026-05-25 | v2.11 | **prepare 脚本加 `--source mock` 模式（W2.12）**：用户希望 32 条 mock 跑 layered smoke 不依赖外部数据。复用既有 4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm），轮转生成任意 N 条（默认 32），前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保 op_name 唯一。Mock 模式 yield rl_single_ops-style shape 走 `_row_to_record` 统一管线，与 real-data 同路径，reward_model 多 `{kind:'mock', template}` 标识便于调试时区分。本地验证 32 条全转 + split 模式 (val_frac=0.1 → train=29 val=3)。Plan §13.15 续写对比表（legacy `create_mock_npu_operator_data.py` 16 行固定 vs 新 mock 模式任意数量）。|
+| 2026-05-25 | v2.12 | **mock parquet 在 dataset filter 挂在 jinja `No user query found in messages`（W2.13）**。根因：3 个 prepare/mock 脚本（`prepare_npu_operator_data.py`、legacy `create_mock_npu_operator_data.py`、`create_mock_npu_ascend_operator_data.py`）都用 `json.dumps([{...}])` 存 prompt 字段，但 verl `_build_messages` 和 `doc2len` 都直接拿 `doc[prompt_key]` 当 list iterate，无 `json.loads`。字符串被按字符 iterate → 找不到 user message。修复：三处都改成直接 `list[dict]`（pyarrow 原生支持 list[struct]）。为什么之前 mock 跑过没挂：之前没开 `filter_overlong_prompts=True`（W2.10 新加），doc2len 路径不触发。W2.10 + W2.13 是一起的。Audit 教训第 5 条：肉眼读 parquet 看不出 string vs list 时要 `type()` 验证。|
 
 ---
 
@@ -1672,3 +1673,57 @@ python3 -m examples.openhands_sdk.prepare_npu_operator_data \
 | 走 _row_to_record | 否（直接写 parquet） | 是（与 real-data 统一管线） |
 
 legacy 脚本 stage1 用过、保留不动；新脚本 mock 模式作为统一入口。
+
+### 13.16 prompt 字段类型修正：list[dict] 不是 JSON string（W2.13）
+
+**触发**：用户用 `--source mock --mock-count 32` 生成的 parquet 在 L2b dataset filter 阶段挂在：
+
+```
+jinja2.exceptions.TemplateError: No user query found in messages.
+  File "verl/utils/dataset/rl_dataset.py", line 256, in doc2len
+    tokenized_prompt = tokenizer.apply_chat_template(doc[prompt_key], ...)
+```
+
+**根因**：verl 在两条路径上都假设 `doc[prompt_key]` **已经是 `list[dict]`**：
+
+```python
+# rl_dataset.py:_build_messages
+messages: list = example[key]              # 不 json.loads
+for message in messages:                   # 字符串会被按字符 iterate
+    ...
+
+# rl_dataset.py:doc2len (plain tokenizer path)
+tokenizer.apply_chat_template(doc[prompt_key], ...)   # jinja iterate, 字符串失败
+```
+
+我们三个 prepare/mock 脚本都用了 `json.dumps([{"role":"user",...}])`，所以 prompt 字段是 string，jinja iterate 字符找不到 `role=='user'` → "No user query found"。
+
+**修复**：prompt 字段直接存 list[dict]，pyarrow 原生支持 `list[struct]`。
+
+涉及 3 个文件：
+
+| 文件 | 修改 |
+|---|---|
+| `examples/openhands_sdk/prepare_npu_operator_data.py` | `_row_to_record` 末尾 `json.dumps(...)` → 直接 list |
+| `examples/openhands_sdk/create_mock_npu_operator_data.py` | `prompt = json.dumps(...)` → `prompt = [...]` |
+| `examples/openhands_sdk/create_mock_npu_ascend_operator_data.py` | 同上 |
+
+每处加注释说明 verl 要求 list、字符串会挂 jinja，避免未来回归。
+
+**本地验证**：
+
+```
+prompt type: ndarray   (pyarrow list[struct] → numpy.ndarray of dict)
+prompt[0]: role=user content_head=Implement an AscendC kernel ...
+✓ 1 user message(s) found in row 0 (previously 0 → jinja crashed)
+```
+
+**为什么之前 stage1 跑过 mock 没挂？**
+
+最可能：之前没开 `filter_overlong_prompts=True`（这是 W2.10 新加的，§0.2 verl 权威要求）。`filter_overlong_prompts` off 时，doc2len 路径不触发；prompt 字段后续怎么解 / 有没有别的兜底 json.loads 没追到底。**v2.10 把 `filter_overlong_prompts=True` 加上后，这条 latent bug 立刻显形**。
+
+也就是说：W2.10 完整对齐 verl NPU 分支 → 触发 W2.13 修复 prompt 类型 → 这两个修是一起来的，缺一不可。
+
+**audit 教训补充（§13.13 第 5 条）**：
+
+5. 跨数据/训练边界的 schema 不能假设"看起来对就行" —— pyarrow 能存 list[struct] 也能存 string，但 verl 只接受 list，肉眼读 parquet 看不出 string 还是 list 时要 `type()` 一下。
