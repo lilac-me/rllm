@@ -94,6 +94,26 @@ class RejectionSamplingConfig:
     min_partial_solve_tasks: int = 1
 
 
+@dataclass
+class RolloutCorrectionConfig:
+    """Configuration for rollout correction (TIS, proximal forward passes).
+
+    Backend-agnostic — each backend interprets these according to its infrastructure.
+
+    Attributes:
+        tis_mode: None = disabled (string loss names, current behavior).
+              "token" or "sequence" = enable custom callable loss with TIS at that level.
+        bypass_mode: When True, use rollout (inference) logprobs as π_old — no
+              proximal forward pass. When False, compute π_old via policy.forward()
+              (3-policy / decoupled PPO).
+        tis_cap: Upper clamp on the TIS importance weight.
+    """
+
+    tis_mode: str | None = None
+    bypass_mode: bool | None = None
+    tis_cap: float = 5.0
+
+
 class rLLMAdvantageEstimator(str, Enum):
     """
     A unified advantage estimator for rLLM. Work with both `tinker` and `verl` backends at the expense of
