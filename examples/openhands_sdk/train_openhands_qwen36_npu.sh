@@ -82,6 +82,24 @@ export CPU_AFFINITY_CONF=1
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
+# NVIDIA Megatron-Bridge is shipped as a source clone (not pip-installed) on
+# this NPU env, so its src/ tree must be on PYTHONPATH for `from megatron.bridge
+# import AutoBridge` to resolve (verl/models/mcore/bridge.py:17, reached when
+# actor_rollout_ref.actor.megatron.vanilla_mbridge=False — see plan §13.12).
+#
+# Override MEGATRON_BRIDGE_DIR if the source clone lives elsewhere.
+MEGATRON_BRIDGE_DIR="${MEGATRON_BRIDGE_DIR:-/workspace/Megatron-Bridge}"
+if [[ -d "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge" ]]; then
+    export PYTHONPATH="${MEGATRON_BRIDGE_DIR}/src:${PYTHONPATH}"
+    echo "[stage1] Megatron-Bridge: PYTHONPATH += ${MEGATRON_BRIDGE_DIR}/src"
+elif python3 -c "import megatron.bridge" 2>/dev/null; then
+    echo "[stage1] Megatron-Bridge: already importable (pip-installed)"
+else
+    echo "[stage1] WARN: ${MEGATRON_BRIDGE_DIR}/src/megatron/bridge not found AND megatron.bridge not pip-installed."
+    echo "[stage1] WARN: training will crash at verl _build_tf_config with ModuleNotFoundError."
+    echo "[stage1] WARN: set MEGATRON_BRIDGE_DIR=<path-to-NVIDIA-NeMo/Megatron-Bridge clone> and re-run."
+fi
+
 export OPENHANDS_IMAGE=openhands-triton-env:v1
 
 export HYDRA_FULL_ERROR=1

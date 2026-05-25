@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.12 — 修 prompt 字段必须是 list[dict] 不是 JSON string，否则 verl jinja 报 No user query found；新增 §13.16)
+> 修订时间：2026-05-25 (v2.13 — Megatron-Bridge 源码 clone PYTHONPATH 自动注入；新增 §13.17)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -883,6 +883,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.10 | **batch sanity 联立约束（用户指出）**：`BATCH_SIZE=1` < `ppo_mini_batch_size=4` 违反 verl actor.py:224。深挖发现还有 DP 维度约束：`total_trajectories (BATCH×ROLLOUT) >= DP_size` 不然 DP rank 分不到 sample。stage1 默认改为 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`（耦合）；脚本顶部加 fail-fast sanity check（两个约束秒级 reject，不进 Ray）；plan §13.14 写联立约束矩阵 + W3 scaling 例子 + 为什么 ROLLOUT_N=4（GRPO group baseline + 覆盖 DP=4）。|
 | 2026-05-25 | v2.11 | **prepare 脚本加 `--source mock` 模式（W2.12）**：用户希望 32 条 mock 跑 layered smoke 不依赖外部数据。复用既有 4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm），轮转生成任意 N 条（默认 32），前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保 op_name 唯一。Mock 模式 yield rl_single_ops-style shape 走 `_row_to_record` 统一管线，与 real-data 同路径，reward_model 多 `{kind:'mock', template}` 标识便于调试时区分。本地验证 32 条全转 + split 模式 (val_frac=0.1 → train=29 val=3)。Plan §13.15 续写对比表（legacy `create_mock_npu_operator_data.py` 16 行固定 vs 新 mock 模式任意数量）。|
 | 2026-05-25 | v2.12 | **mock parquet 在 dataset filter 挂在 jinja `No user query found in messages`（W2.13）**。根因：3 个 prepare/mock 脚本（`prepare_npu_operator_data.py`、legacy `create_mock_npu_operator_data.py`、`create_mock_npu_ascend_operator_data.py`）都用 `json.dumps([{...}])` 存 prompt 字段，但 verl `_build_messages` 和 `doc2len` 都直接拿 `doc[prompt_key]` 当 list iterate，无 `json.loads`。字符串被按字符 iterate → 找不到 user message。修复：三处都改成直接 `list[dict]`（pyarrow 原生支持 list[struct]）。为什么之前 mock 跑过没挂：之前没开 `filter_overlong_prompts=True`（W2.10 新加），doc2len 路径不触发。W2.10 + W2.13 是一起的。Audit 教训第 5 条：肉眼读 parquet 看不出 string vs list 时要 `type()` 验证。|
+| 2026-05-25 | v2.13 | **W2.13 prompt 修复后 L2b 推进到 verl `_build_tf_config` 挂在 `ModuleNotFoundError: No module named 'megatron.bridge'`**（W2.14）。根因：NPU 环境的 NVIDIA Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`）未 pip install，`from megatron.bridge import AutoBridge` 找不到。修：训练脚本顶部加三路 dispatch（源码路径 → PYTHONPATH；pip 装了 → 不动；都没 → WARN）。可用 `MEGATRON_BRIDGE_DIR` env 覆盖默认路径。Audit 教训第 6 条：依赖装载方式（pip / 源码 clone / 系统包）跨环境不一致，启动脚本应该把源码路径作为可配置 env + 路径不存在显式 WARN。|
 
 ---
 
@@ -1727,3 +1728,41 @@ prompt[0]: role=user content_head=Implement an AscendC kernel ...
 **audit 教训补充（§13.13 第 5 条）**：
 
 5. 跨数据/训练边界的 schema 不能假设"看起来对就行" —— pyarrow 能存 list[struct] 也能存 string，但 verl 只接受 list，肉眼读 parquet 看不出 string 还是 list 时要 `type()` 一下。
+
+### 13.17 Megatron-Bridge PYTHONPATH 自动注入（W2.14）
+
+**触发**：L2b 走过 dataset filter 后挂在：
+
+```
+File "verl/workers/engine/megatron/transformer_impl.py", line 192, in _build_tf_config
+    from verl.models.mcore.bridge import AutoBridge
+File "verl/models/mcore/bridge.py", line 17, in <module>
+    from megatron.bridge import AutoBridge
+ModuleNotFoundError: No module named 'megatron.bridge'
+```
+
+**根因**：NPU 环境的 Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`），**未 pip install**，所以 `megatron.bridge` 不在 Python path 上。
+
+**修复**：训练脚本顶部加路径自动注入：
+
+```bash
+MEGATRON_BRIDGE_DIR="${MEGATRON_BRIDGE_DIR:-/workspace/Megatron-Bridge}"
+if [[ -d "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge" ]]; then
+    export PYTHONPATH="${MEGATRON_BRIDGE_DIR}/src:${PYTHONPATH}"
+elif python3 -c "import megatron.bridge" 2>/dev/null; then
+    echo "[stage1] Megatron-Bridge: already importable (pip-installed)"
+else
+    echo "[stage1] WARN: not found AND not pip-installed; training will crash"
+fi
+```
+
+三路 dispatch：
+- 源码 clone 存在 → 加入 PYTHONPATH
+- 已 pip install → 不做事
+- 都没有 → 显式 WARN（不立即 exit，让 preflight smoke 也能跑）
+
+`MEGATRON_BRIDGE_DIR` 默认 `/workspace/Megatron-Bridge`，可用环境变量 override。
+
+**通用教训补充（§13.13 第 6 条）**：
+
+6. **依赖装载方式（pip vs 源码 clone vs 系统包）跨环境不一致** —— stage1 启动脚本应该把"源码 clone 路径"作为可配置 env，并加路径不存在的显式 WARN，避免又跑半天才发现是 PYTHONPATH 没接上。
