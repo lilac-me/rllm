@@ -40,6 +40,10 @@ Supported input formats
    ``hf_dataset/`` or remote Hub identifier); each row treated as
    kernelgym-style if ``task`` field present, else rl_single_ops-style.
 
+4. ``--source mock`` — built-in 4-template generator (vector_add / matmul /
+   softmax / layer_norm), control count with ``--mock-count`` (default 32).
+   No external input needed; useful for layered smoke or quick bring-up.
+
 Usage
 -----
 
@@ -66,6 +70,12 @@ Usage
     python3 -m examples.openhands_sdk.prepare_npu_operator_data \\
         --source hf --input ./hf_dataset/drkernel-rl-data --hf-split train \\
         --output ./examples/openhands_sdk/real_ops_train.parquet \\
+        --scenario npu_ascend_operator --arch ascend910b
+
+    # 内置 mock — 32 条用于 layered smoke / 快速 bring-up
+    python3 -m examples.openhands_sdk.prepare_npu_operator_data \\
+        --source mock --mock-count 32 \\
+        --output ./examples/openhands_sdk/rl_single_ops.parquet \\
         --scenario npu_ascend_operator --arch ascend910b
 """
 
@@ -118,6 +128,144 @@ def _load_hf(input_id: str, split: str) -> Iterable[dict]:
     ds = load_dataset(input_id, split=split)
     for row in ds:
         yield dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Built-in mock templates (4 ascendc ops; yielded as rl_single_ops-style
+# rows so they flow through the same _row_to_record path as real data)
+# ---------------------------------------------------------------------------
+
+import textwrap as _textwrap
+
+_MOCK_TEMPLATES = [
+    {
+        "op_name": "vector_add",
+        "instruction": (
+            "Implement an AscendC kernel 'vector_add' that adds two FP16 "
+            "vectors element-wise on Ascend 910B."
+        ),
+        "py_code": _textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                    return a + b
+
+            def get_inputs():
+                return [torch.randn(4096, dtype=torch.float16),
+                        torch.randn(4096, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
+    },
+    {
+        "op_name": "matmul",
+        "instruction": (
+            "Implement an AscendC kernel 'matmul' that multiplies two FP16 "
+            "matrices of shape (M, K) and (K, N) on Ascend 910B."
+        ),
+        "py_code": _textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                    return torch.matmul(a, b)
+
+            def get_inputs():
+                return [torch.randn(512, 256, dtype=torch.float16),
+                        torch.randn(256, 512, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
+    },
+    {
+        "op_name": "softmax",
+        "instruction": (
+            "Implement an AscendC kernel 'softmax' that computes softmax over "
+            "the last dimension of a 2-D FP16 tensor on Ascend 910B."
+        ),
+        "py_code": _textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return torch.softmax(x, dim=-1)
+
+            def get_inputs():
+                return [torch.randn(128, 1024, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
+    },
+    {
+        "op_name": "layer_norm",
+        "instruction": (
+            "Implement an AscendC kernel 'layer_norm' that performs layer "
+            "normalisation along the last dimension of a 2-D FP16 tensor "
+            "on Ascend 910B."
+        ),
+        "py_code": _textwrap.dedent("""\
+            import torch
+            import torch.nn as nn
+
+            class Model(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.ln = nn.LayerNorm(512)
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return self.ln(x.float()).half()
+
+            def get_inputs():
+                return [torch.randn(64, 512, dtype=torch.float16)]
+
+            def get_init_inputs():
+                return []
+        """),
+    },
+]
+
+
+def _load_mock(count: int) -> Iterable[dict]:
+    """Yield `count` mock records, cycling over _MOCK_TEMPLATES.
+
+    Emits rl_single_ops-style shape so _row_to_record handles them uniformly
+    with real `--source local-json` data. Each cycle through the templates
+    gets a unique op_name suffix (_0001, _0002, ...) so problem ids stay
+    distinguishable inside one parquet.
+    """
+    if count <= 0:
+        return
+    n_templates = len(_MOCK_TEMPLATES)
+    for i in range(count):
+        tpl = _MOCK_TEMPLATES[i % n_templates]
+        cycle = i // n_templates
+        suffix = f"_{i:04d}" if cycle > 0 else ""
+        yield {
+            "prompt": [{"role": "user", "content": tpl["instruction"]}],
+            "py_code": tpl["py_code"],
+            "ops": json.dumps([tpl["op_name"] + suffix]),
+            "reward_model": {
+                "ground_truth": tpl["py_code"],
+                "kind": "mock",
+                "template": tpl["op_name"],
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +378,27 @@ def main() -> int:
     p.add_argument(
         "--source",
         required=True,
-        choices=["local-jsonl", "local-json", "hf"],
-        help="Input source format.",
+        choices=["local-jsonl", "local-json", "hf", "mock"],
+        help="Input source format. Use 'mock' to generate built-in template "
+             "records (no --input needed; control count with --mock-count).",
     )
     p.add_argument(
         "--input",
-        required=True,
-        help="Input path (file for local-{jsonl,json}, HF id or local dir for hf).",
+        help="Input path (file for local-{jsonl,json}, HF id or local dir for hf). "
+             "Not used when --source=mock.",
     )
     p.add_argument(
         "--hf-split",
         default="train",
         help="HuggingFace split name when --source=hf (default: train).",
+    )
+    p.add_argument(
+        "--mock-count",
+        type=int,
+        default=32,
+        help="Number of mock records when --source=mock (default: 32). "
+             "Cycles over the 4 built-in templates (vector_add / matmul / "
+             "softmax / layer_norm) and suffixes op_name on each cycle.",
     )
     p.add_argument(
         "--scenario",
@@ -292,15 +449,22 @@ def main() -> int:
             return 2
 
     # ── Load source ─────────────────────────────────────────────────────
-    print(f"[prepare] source={args.source} input={args.input}")
-    if args.source == "local-jsonl":
-        raw_iter = _load_local_jsonl(Path(args.input))
-    elif args.source == "local-json":
-        raw_iter = _load_local_json(Path(args.input))
-    elif args.source == "hf":
-        raw_iter = _load_hf(args.input, args.hf_split)
+    if args.source == "mock":
+        print(f"[prepare] source=mock count={args.mock_count}")
+        raw_iter = _load_mock(args.mock_count)
     else:
-        raise AssertionError("unreachable")
+        if not args.input:
+            print(f"[prepare] --source={args.source} requires --input", file=sys.stderr)
+            return 2
+        print(f"[prepare] source={args.source} input={args.input}")
+        if args.source == "local-jsonl":
+            raw_iter = _load_local_jsonl(Path(args.input))
+        elif args.source == "local-json":
+            raw_iter = _load_local_json(Path(args.input))
+        elif args.source == "hf":
+            raw_iter = _load_hf(args.input, args.hf_split)
+        else:
+            raise AssertionError("unreachable")
 
     # ── Convert ────────────────────────────────────────────────────────
     records: list[dict] = []

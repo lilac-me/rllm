@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.10 — batch sanity 联立约束：train_batch_size/ppo_mini_batch_size/rollout.n/DP 联动检查 + fail-fast；新增 §13.14)
+> 修订时间：2026-05-25 (v2.11 — prepare 脚本加 --source mock 模式 + 内置 4 模板任意数量轮转；§13.15 续写)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -881,6 +881,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.8 | **L2b 第二次重跑（带 W2.8 worker shim）走到 `engine.initialize()` 挂在 `mbridge.AutoBridge.from_config` "Unregistered model type: qwen3_5_moe"**。**根因 audit 错误**：plan §0.2 v2.1~v2.7 抄 verl 脚本 ACTOR 主行 `vanilla_mbridge=True`，**漏读 NPU case override 块**（verl 脚本 :196 明确 NPU 用 `vanilla_mbridge=False`）。两个独立 bridge 库澄清：`mbridge`（pypi 0.15.1，不支持 qwen3_5_moe）vs `Megatron-Bridge`（NVIDIA-NeMo，含 Qwen3.5 recipe，你环境已装）；`vanilla_mbridge` 是两者的开关，NPU 必须 False。修正：plan §0.2 + §13.9 改 False + 长注释解释；`train_openhands_qwen36_npu.sh` actor + ref 两处改 False + 详细注释；新增 §13.12 documenting 根因 + audit 教训（抄上游脚本要扫 case/if/elif override）。不需要升级 mbridge pypi 包。|
 | 2026-05-25 | v2.9 | **训练脚本完整校对（W2.10）**：W2.9 修 vanilla_mbridge 后做完整 verl NPU 分支 vs stage1 脚本 diff，发现 17 项遗漏 + 4 项 dynamic_bsz 耦合不一致。用户决策：use_dynamic_bsz 走 verl 套（False + micro_batch=1 + max_token cap）。补 18 项：`CPU_AFFINITY_CONF=1` / `trust_remote_code=True` / `algorithm.use_kl_in_reward=False` / `data.truncation='error'` / `data.filter_overlong_prompts=True` / `megatron.dtype=bfloat16` / `actor.megatron.use_remove_padding=True` / `actor.checkpoint.strict=False` / `attention_backend=auto` / `moe_token_dispatcher_type=alltoall` / `use_naive_l2norm=True` / `overlap_cpu_optimizer_d2h_h2d=True` / `rollout.dtype=bfloat16` + 4 项耦合切换（actor/ref/rollout 三处 `use_dynamic_bsz=False` 同步，`max_token=16384`——按数据规模等比放大 verl 4096，因 OpenHands prompt+response=12288）。不补 `model_engine=megatron`（hydra defaults 链已带入）。34 项 stage1 必需 key 全部就位。新增 §13.13 + audit 教训 4 条（case/if 扫描、耦合识别、cap 等比放大、hydra defaults 追到底）。|
 | 2026-05-25 | v2.10 | **batch sanity 联立约束（用户指出）**：`BATCH_SIZE=1` < `ppo_mini_batch_size=4` 违反 verl actor.py:224。深挖发现还有 DP 维度约束：`total_trajectories (BATCH×ROLLOUT) >= DP_size` 不然 DP rank 分不到 sample。stage1 默认改为 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`（耦合）；脚本顶部加 fail-fast sanity check（两个约束秒级 reject，不进 Ray）；plan §13.14 写联立约束矩阵 + W3 scaling 例子 + 为什么 ROLLOUT_N=4（GRPO group baseline + 覆盖 DP=4）。|
+| 2026-05-25 | v2.11 | **prepare 脚本加 `--source mock` 模式（W2.12）**：用户希望 32 条 mock 跑 layered smoke 不依赖外部数据。复用既有 4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm），轮转生成任意 N 条（默认 32），前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保 op_name 唯一。Mock 模式 yield rl_single_ops-style shape 走 `_row_to_record` 统一管线，与 real-data 同路径，reward_model 多 `{kind:'mock', template}` 标识便于调试时区分。本地验证 32 条全转 + split 模式 (val_frac=0.1 → train=29 val=3)。Plan §13.15 续写对比表（legacy `create_mock_npu_operator_data.py` 16 行固定 vs 新 mock 模式任意数量）。|
 
 ---
 
@@ -1568,7 +1569,7 @@ fi
 | 字段命名 | `task.problem_id` / `task.reference_code` / `task.prompt` | `extra_info.op_name` / `extra_info.task_code` / `extra_info.instruction` |
 | 注入路径 | `DatasetRegistry.register_dataset()` | verl 直接读 parquet (`data.train_files=<parquet>`) |
 
-**新增 `examples/openhands_sdk/prepare_npu_operator_data.py`**（330 行）支持 3 种输入源：
+**新增 `examples/openhands_sdk/prepare_npu_operator_data.py`**（460 行，含 W2.12 mock 模式）支持 4 种输入源：
 
 ```bash
 # 1. kernelgym 风格 JSONL（用户实际格式）
@@ -1645,3 +1646,29 @@ A. **改 .py 里的常量**指向新 parquet（最干净）
 B. **生成时 `--output=examples/openhands_sdk/rl_single_ops.parquet`** 覆盖现有文件（最少代码改动）
 
 stage1 起步推荐 B（不动 .py，重跑 prepare 时直接覆盖 parquet）。
+
+**W2.12 内置 mock 模式（`--source mock`）**：
+
+不依赖任何外部数据源，4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm）轮转生成任意 N 条；前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保唯一。
+
+```bash
+# 32 条 mock，single file
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source mock --mock-count 32 \
+    --output examples/openhands_sdk/rl_single_ops.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+# 输出：32 行 parquet，extra_info.reward_model 含 {ground_truth, kind="mock", template}
+# 用途：layered smoke L2b/L3 不需要真实数据时；快速 bring-up
+```
+
+**与既有 `create_mock_npu_operator_data.py` 的关系**：
+
+| | `create_mock_npu_operator_data.py` (legacy, 4×4=16 rows) | `prepare_npu_operator_data.py --source mock` (新) |
+|---|---|---|
+| 行数 | 固定 16（4 模板 × 4 重复） | 任意 N (`--mock-count N`，默认 32) |
+| op_name 唯一 | 否（vector_add 出现 4 次） | 是（加 `_NNNN` 后缀） |
+| reward_model | 无 | `{ground_truth, kind="mock", template}` |
+| 输出位置 | 固定 `mock_npu_operator.parquet` | 任意 `--output <path>` |
+| 走 _row_to_record | 否（直接写 parquet） | 是（与 real-data 统一管线） |
+
+legacy 脚本 stage1 用过、保留不动；新脚本 mock 模式作为统一入口。
