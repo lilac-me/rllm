@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.7 — verl fork shim 第二轮：megatron_workers/fsdp_workers re-export engine_workers；新增 §13.11)
+> 修订时间：2026-05-25 (v2.8 — 修 vanilla_mbridge NPU 必须 False 的 audit 错误；新增 §13.12)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -71,9 +71,21 @@ actor_rollout_ref.actor.kl_loss_coef=0.01
 actor_rollout_ref.actor.kl_loss_type=low_var_kl
 actor_rollout_ref.actor.entropy_coeff=0
 
-# Megatron-Bridge 集成（核心：use_mbridge=True + vanilla_mbridge=True）
+# Bridge 集成
+#
+# verl 提供两条 bridge 路径（verl/workers/engine/megatron/transformer_impl.py:173+）：
+#   vanilla_mbridge=True  → pypi `mbridge` 库 (`from mbridge import AutoBridge`)
+#   vanilla_mbridge=False → NVIDIA Megatron-Bridge (`from megatron.bridge import AutoBridge`)
+#
+# **NPU 必须 vanilla_mbridge=False**（与 verl 脚本 NPU case override 一致）。
+# 原因：pypi mbridge 0.15.1 不注册 qwen3_5_moe model_type，会 raise
+#       "Unregistered model type: qwen3_5_moe"；NVIDIA Megatron-Bridge 已有 PR #2654
+#       Qwen3.5 recipe。
+#
+# 注意：plan v2.4 以前的版本（本节早期）错抄了 verl 脚本"主行"的 True，遗漏 NPU
+#       case override。W2.9 (v2.8) 修正。
 actor_rollout_ref.actor.megatron.use_mbridge=True
-actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+actor_rollout_ref.actor.megatron.vanilla_mbridge=False    # NPU 必须 False
 actor_rollout_ref.actor.megatron.use_remove_padding=False  # GDN 默认值（W2 可调）
 actor_rollout_ref.actor.megatron.dtype=bfloat16
 actor_rollout_ref.actor.megatron.param_offload=True
@@ -866,6 +878,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.5 | **W1 全部完成进入 W2**。NPU smoke 第二轮 20/20 import OK + vllm-ascend Qwen3.6 4 项推理 smoke 全过（含 qwen3_coder tool call 单轮/多轮、关 thinking、32k context）。**W2.2 stage1 训练脚本交付**：新增 `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}`（py 100 行/sh 290 行），融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置。Surgical changes vs `train_open_megatron.sh`：env 补 `CUDA_DEVICE_MAX_CONNECTIONS=1` / `VLLM_ALLREDUCE_USE_SYMM_MEM=0`；ARGS 补 §0.2 MoE 4 项 + `vanilla_mbridge=True`；改 `calculate_log_probs=True` / `kl_loss_coef=0.0`；新增 `+rllm.algorithm.router_replay=disabled`；并行改成单节点 TP=2 EP=4 ETP=1（用户决策）；`max_model_len` 改 32k；rollout TP=8。Legacy `train_open_megatron.{py,sh}` 保留作参考。新增 §13.9（脚本交付清单 + W2.3 起 NPU 验证入口）。|
 | 2026-05-25 | v2.6 | **W2.0 stage1 分段测试基础设施落地（B 档）**。设计 6 层逻辑模型 + L1..L4 fail-fast orchestrator，把端到端跑挂时的定位时间从小时级压到秒级。新文件：(1) `preflight_qwen36_npu.py` Layer 1 隔离（imports / dataset / rollout signature / hydra compose / AgentTrainer ctor 5 个子检查）；(2) `mock_rollout.py` Layer 4 drop-in 假 rollout（确定性 trajectory，无 docker/LLM）；(3) `mock_llm_server.py` Layer 2 FastAPI mock OpenAI-compatible server（已本地 curl 验通，schema 与真 vllm-ascend 一致）；(4) `stage1_test_layered.sh` orchestrator（L1/L2a/L2b/L3/L4 任选子集、bash 3.2 兼容、独立 log、summary 表）。train 脚本新增三个互相正交的 env hatch：`PREFLIGHT_ONLY=1` / `STAGE1_DRY_STEPS=N` / `STAGE1_MOCK_ROLLOUT=1`。新增 §13.10。|
 | 2026-05-25 | v2.7 | **L2b 跑挂暴露 verl fork 第二轮 API 漂移**：`verl/workers/megatron_workers.py` / `fsdp_workers.py` 已合并成 backend-agnostic `engine_workers.py`（只有 `ActorRolloutRefWorker` + `TrainingWorker`）。rllm 三处 import 仍是旧路径。verl-BryanChen408 分支 `qwen36-rllm-compat` commit `85159408` 加 2 个 shim 文件（+139 行）re-export `engine_workers`，并 alias `AsyncActorRolloutRefWorker=ActorRolloutRefWorker`（async 改 config 驱动）、`CriticWorker=TrainingWorker`（stage1 GRPO 不实例化 critic）。累计 verl fork compat 文件清单详见 §13.11。NPU 节点重 pull verl fork 后重跑 L2b。|
+| 2026-05-25 | v2.8 | **L2b 第二次重跑（带 W2.8 worker shim）走到 `engine.initialize()` 挂在 `mbridge.AutoBridge.from_config` "Unregistered model type: qwen3_5_moe"**。**根因 audit 错误**：plan §0.2 v2.1~v2.7 抄 verl 脚本 ACTOR 主行 `vanilla_mbridge=True`，**漏读 NPU case override 块**（verl 脚本 :196 明确 NPU 用 `vanilla_mbridge=False`）。两个独立 bridge 库澄清：`mbridge`（pypi 0.15.1，不支持 qwen3_5_moe）vs `Megatron-Bridge`（NVIDIA-NeMo，含 Qwen3.5 recipe，你环境已装）；`vanilla_mbridge` 是两者的开关，NPU 必须 False。修正：plan §0.2 + §13.9 改 False + 长注释解释；`train_openhands_qwen36_npu.sh` actor + ref 两处改 False + 详细注释；新增 §13.12 documenting 根因 + audit 教训（抄上游脚本要扫 case/if/elif override）。不需要升级 mbridge pypi 包。|
 
 ---
 
@@ -1158,7 +1171,7 @@ actor_rollout_ref.rollout.calculate_log_probs=True           # 原 False
 +rllm.algorithm.router_replay=disabled                       # 新增防御性显式
 
 # §0.2 verl 脚本权威 MoE 配置（原全缺）
-actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+actor_rollout_ref.actor.megatron.vanilla_mbridge=False   # NPU 必须 False，见 §0.2 / §13.12
 +actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=0.01
 +actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=0.001
 +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
@@ -1339,3 +1352,58 @@ git pull origin qwen36-rllm-compat   # 应拉到 85159408
 cd /workspace/rllm-071
 bash examples/openhands_sdk/stage1_test_layered.sh L2b
 ```
+
+### 13.12 `vanilla_mbridge` NPU 必须 False（W2.9）
+
+**触发**：L2b 重跑（带 W2.8 worker shim 后）走到 `engine.initialize()` 时挂在：
+
+```
+File "verl/workers/engine/megatron/transformer_impl.py", line 178, in _build_tf_config
+    bridge = AutoBridge.from_config(self.model_config.hf_config, dtype=self.param_dtype)
+File "mbridge/core/auto_bridge.py", line 50, in from_config
+    raise ValueError("Unregistered model type: qwen3_5_moe, now only support
+                      dict_keys(['deepseek_v3', 'llama', 'qwen2', 'mimo',
+                      'mixtral', 'qwen2_5_vl', 'qwen2_moe', 'qwen3', 'qwen3_moe',
+                      'glm4_moe', 'glm4v', 'glm4v_moe', 'gemma3', 'internvl_chat']))
+```
+
+**重要澄清：两个独立库**
+
+| | `Megatron-Bridge` (NVIDIA-NeMo) | `mbridge` (pypi 包) |
+|---|---|---|
+| 来源 | github.com/NVIDIA-NeMo/Megatron-Bridge | github.com/ISEEKYAN/mbridge → pypi |
+| 用途 | offline HF↔Megatron 权重转换 + recipes | runtime build TransformerConfig + model |
+| plan §0 装的版本 | `de93536e`（含 PR #2654 Qwen3.5 recipe） | `0.15.1`（pypi）— **不支持 qwen3_5_moe** |
+
+verl 提供两条 bridge 路径（`verl/workers/engine/megatron/transformer_impl.py:173+`）：
+
+| `vanilla_mbridge` | 走的库 | import 路径 |
+|---|---|---|
+| `True` | pypi `mbridge` | `verl/models/mcore/mbridge.py` → `from mbridge import AutoBridge` |
+| `False` | NVIDIA `Megatron-Bridge` | `verl/models/mcore/bridge.py` → `from megatron.bridge import AutoBridge` |
+
+**verl 自己的 Qwen3.5 NPU 脚本明确 NPU case override 为 False**（`run_qwen3_5_35b_megatron.sh:196`）：
+
+```bash
+case "${DEVICE}" in
+    npu)
+        ACTOR+=(
+            actor_rollout_ref.actor.megatron.vanilla_mbridge=False    # ← NPU override
+            ...
+        )
+```
+
+**plan §0.2 早期版本的 audit 错误**（v2.1 ~ v2.7）：抄了 verl 脚本 ACTOR 主行参数 `vanilla_mbridge=True`，**没读 case override 块**。stage1 训练脚本（v2.5）继承了这个错误，导致 L2b 重跑挂。
+
+**修正**：
+- plan §0.2 改正 + 长注释说明两个 bridge 路径区分 + NPU 必须 False 的根因
+- plan §13.9 W2.2 记录里的 `vanilla_mbridge=True` 改 False
+- `train_openhands_qwen36_npu.sh` 改 actor + ref 两处 `vanilla_mbridge=False`，加详细注释解释
+
+**stage1 影响**：不需要升级 mbridge pypi 包，也不需要装新 NVIDIA Megatron-Bridge 版本（你环境 `de93536e` 已经够）。
+
+**通用教训（写给 stage2 / 类似项目）**：
+
+抄上游脚本主行参数时要扫一下 case/if/elif 块的 override —— 主行表的"权威值"可能被 device/strategy/mode 分支 case override，audit 时容易漏。Plan §0.2 接下来对照 `run_qwen3_5_35b_megatron.sh` 应该重做一次 case-aware 抄录。
+
+**下一步**：NPU 节点上 `git pull` rllm 拉到这个修正后重跑 L2b。

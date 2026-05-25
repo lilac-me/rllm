@@ -241,8 +241,11 @@ ARGS=(
   # =========================
   actor_rollout_ref.actor.strategy=megatron
   actor_rollout_ref.actor.megatron.use_mbridge=True
-  # plan §0.2: verl 脚本权威，A3B 上需要 vanilla_mbridge=True
-  actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+  # plan §0.2 NPU override: 走 NVIDIA Megatron-Bridge (`from megatron.bridge import AutoBridge`)
+  # 而非 pypi mbridge (vanilla_mbridge=True)。原因：当前 pypi mbridge 0.15.1 不注册
+  # qwen3_5_moe model_type，会 raise "Unregistered model type"。NPU 上必须 False，
+  # 与 verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh NPU case override 一致。
+  actor_rollout_ref.actor.megatron.vanilla_mbridge=False
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
 
   actor_rollout_ref.actor.megatron.param_offload=True
@@ -293,7 +296,7 @@ ARGS=(
   actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1
   actor_rollout_ref.ref.megatron.param_offload=True
   actor_rollout_ref.ref.megatron.use_mbridge=True
-  actor_rollout_ref.ref.megatron.vanilla_mbridge=True
+  actor_rollout_ref.ref.megatron.vanilla_mbridge=False
   actor_rollout_ref.ref.megatron.use_dist_checkpointing=False
 
   # =========================
