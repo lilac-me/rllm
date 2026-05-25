@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.15 — enforce_eager=True 与 verl 写死的 cudagraph FULL_AND_PIECEWISE 矛盾导致 vllm worker exit 2；改 False 对齐 verl 默认；新增 §13.19)
+> 修订时间：2026-05-25 (v2.16 — 删 obs 历史 vllm engine_kwargs，vllm-ascend 不识别 --swap-space 等；新增 §13.20)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -886,6 +886,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.13 | **W2.13 prompt 修复后 L2b 推进到 verl `_build_tf_config` 挂在 `ModuleNotFoundError: No module named 'megatron.bridge'`**（W2.14）。根因：NPU 环境的 NVIDIA Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`）未 pip install，`from megatron.bridge import AutoBridge` 找不到。修：训练脚本顶部加三路 dispatch（源码路径 → PYTHONPATH；pip 装了 → 不动；都没 → WARN）。可用 `MEGATRON_BRIDGE_DIR` env 覆盖默认路径。Audit 教训第 6 条：依赖装载方式（pip / 源码 clone / 系统包）跨环境不一致，启动脚本应该把源码路径作为可配置 env + 路径不存在显式 WARN。|
 | 2026-05-25 | v2.14 | **L2b 在 Megatron-Bridge load_weights_hf_to_megatron → torch.distributed.broadcast 挂 HCCL error code 6（W2.15）**。**用户关键提示**：verl 自己跑 Qwen3.6 OK，rllm 基于 verl，所以问题在 rllm 这层引入。根因：obs 历史脚本硬编码 `HCCL_IF_IP=80.48.5.88` + `nic_name=ens1f3`，当前 NPU 节点 IP 是 80.48.5.65，HCCL_IF_IP 不存在 → HcclGetRootInfo 挂。verl 自己脚本 env 段只有 3 行（`CUDA_DEVICE_MAX_CONNECTIONS` / `VLLM_USE_V1` / `VLLM_ALLREDUCE_USE_SYMM_MEM`），没设这些 HCCL/socket env，靠容器默认。修：改成 opt-in 模式，`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE` env 才生效。Audit 教训第 7 条：硬编码 IP/MAC/NIC 跨机必爆，machine-specific identifier 不允许进库代码。**Audit 策略调整**：W2.10 只对齐了 ARGS 段，env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，全是潜在地雷；W2.15 先解决最毒的 HCCL_IF_IP，其他等 L2b 跑过再清理。|
 | 2026-05-25 | v2.15 | **W2.15 修 HCCL 后 vllm worker 启动 exit 2（W2.16）**。继续应用 verl-self-OK 诊断原则：审 verl vllm_async_server.py:237 写死 compilation_config.setdefault cudagraph_mode=FULL_AND_PIECEWISE，无论 user 怎么配 cudagraph 默认开。verl 自己脚本不设 enforce_eager（yaml 默认 false），cudagraph 真生效跑通。我们 obs 历史脚本 enforce_eager=True # TODO 与 cudagraph 矛盾，vllm-ascend worker init 时挂。改成 env 可控默认 False，ROLLOUT_ENFORCE_EAGER=True 可 opt-out。Audit 教训第 8 条：下游覆盖上游默认时要看上游 setdefault 隐式 fill。同时让用户去 /tmp/ray/session_latest/logs/worker-*.err 拿 vllm 真 stderr 验证。|
+| 2026-05-25 | v2.16 | **W2.16 改 enforce_eager 后 vllm worker 仍 exit 2（W2.17）**。拿 ray log 看到真实 vllm error: `unrecognized arguments: --swap-space 0`。obs 历史脚本通过 `engine_kwargs.vllm.<key>=...` 给 vllm CLI 加了 3 个参数（swap_space / cpu_offload_gb / enable_prefix_caching），vllm-ascend 不识别（vllm fork lag）。verl 自己脚本不设这三个，靠 vllm 默认。注释 3 行，保留 tool_call 必需的 2 行。Audit 教训第 9 条：vllm-ascend 是 vllm fork，CLI 参数有 lag；删到只剩业务必需的。**连续 W2.15/W2.16/W2.17 都是同模式**：obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过；剩余可疑 obs env/config 暂不动，待 L2b 跑过再清理。|
 
 ---
 
@@ -1876,3 +1877,62 @@ cat /tmp/ray/session_latest/logs/worker-<vllm-worker-pid>.err | tail -50
 **Audit 教训补充（§13.13 第 8 条）**：
 
 8. **下游覆盖上游默认值时要看上游 setdefault / 隐式 fill 的行为**。verl 的 vllm CLI 不只是 user-config 透传，还有 setdefault 自动填充（compilation_config 就是例子），下游显式设的某些值会与 setdefault 自动填的形成矛盾。审 verl 类似自动 fill 行为：`grep -rn "setdefault\|_apply_quantization" verl/workers/`。
+
+### 13.20 删 obs 历史 vllm engine_kwargs（W2.17）
+
+**触发**：W2.16 改 enforce_eager 后 vllm worker 仍 exit 2。Ray log 显示真实 vllm CLI parse error：
+
+```
+:job_id:02000000
+:actor_name:InstrumentedvLLMHttpServer
+usage: default_worker.py [-h] {serve} ...
+default_worker.py: error: unrecognized arguments: --swap-space 0
+```
+
+**根因**：obs 历史脚本通过 verl 的 `engine_kwargs.vllm.<key>=...` 透传机制给 vllm CLI 加了 3 个参数：
+
+```bash
++actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
++actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
++actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
+```
+
+verl 把它们转成 `--swap-space 0` 等 vllm CLI args。**vllm-ascend 不识别这些参数**（vllm-ascend fork 早，vllm 主线后加的 args 没跟）。
+
+verl 自己脚本根本不设这三个，靠 vllm 默认 → 能跑通。
+
+**修复**：注释三行，对齐 verl 默认。tool call 必需的两个保留：
+
+```bash
+# 保留
++actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True   # tool call 必需
++actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=qwen3_coder    # 同
+
+# 注释（vllm-ascend 不识别）
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
+```
+
+**vllm-ascend 不识别的 vllm 参数**：累计这次 + 之前 (`--logprobs_mode processed_logprobs` 等)，后续如需 disable swap / prefix_caching 要查 vllm-ascend 对应参数名（可能 vllm-ascend 用 `--ascend-swap-space` 之类的）。
+
+**Audit 教训补充（§13.13 第 9 条）**：
+
+9. **vllm-ascend 是 vllm 的 fork，CLI 参数与 vllm 主线有 lag**。obs 历史脚本可能是为 GPU+vllm 写的，迁到 vllm-ascend 上时凡是 `engine_kwargs.vllm.*` 透传的参数都要"上下游 fork 是否同步"逐个验证。最简方式：删到只剩业务必需的（如 tool_call_parser），其他靠默认。
+
+**W2.17 体现的 audit 模式**（连续 W2.15/W2.16/W2.17 三次都是同一类）：
+
+```
+obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过
+```
+
+W2.15 删 HCCL_IF_IP 硬编码 / W2.16 改 enforce_eager / W2.17 删 vllm engine_kwargs，全是同样模式。剩余可疑 obs 历史 env / config：
+
+- `actor_rollout_ref.rollout.max_num_seqs=4`（vllm-ascend 应该支持但 verl 默认不设）
+- `actor_rollout_ref.rollout.max_num_batched_tokens=8192`（同）
+- `actor_rollout_ref.rollout.enable_chunked_prefill=True`（同）
+- `actor_rollout_ref.rollout.free_cache_engine=True`（同）
+- `++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096`（同）
+- 顶部 env：`ASCEND_LAUNCH_BLOCKING=1` / `VLLM_ATTENTION_BACKEND=TORCH_SDPA` / `PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` / `VLLM_ENGINE_ITERATION_TIMEOUT_S=...` / `RAY_DEBUG_POST_MORTEM=0` / `RAY_DEDUP_LOGS=0` / `VLLM_ASCEND_ENABLE_NZ=0` / `OOM_SNAPSHOT_*`
+
+这些先不动（"非必要不改"原则），等 L2b 跑过看哪些真的是必需的，再视情况清理。

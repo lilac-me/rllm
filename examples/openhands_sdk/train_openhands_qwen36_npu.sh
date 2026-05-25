@@ -425,9 +425,13 @@ ARGS=(
 
   actor_rollout_ref.rollout.enable_chunked_prefill=True
   actor_rollout_ref.rollout.free_cache_engine=True
-  +actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
-  +actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
-  +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
+  # W2.17: obs 历史这三个 engine_kwargs 透传给 vllm CLI，但 vllm-ascend 不识别
+  # （ray log: "default_worker.py: error: unrecognized arguments: --swap-space 0"）。
+  # verl 自己脚本不设这三个，靠 vllm 默认能跑通 → 直接删，对齐 verl 默认。
+  # 如确实需要 disable swap / prefix_caching 等，得改去找 vllm-ascend 对应参数名。
+  # +actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
+  # +actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
+  # +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
 
   # =========================
   # rllm
