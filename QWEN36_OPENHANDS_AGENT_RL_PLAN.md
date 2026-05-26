@@ -707,6 +707,26 @@ stage1 不做、留到 stage2+ 处理的功能项：
 - **bypass rollout / token-id 调试代码归位**：HEAD 私有提交与上游 `d09f6155` 等 patch 的去重
 - **legacy example 标 deprecated**：14 个 example 入口具体到 PR/commit 动作
 - **GDN bshd 模式下 multi-turn merge / response_mask 的可视化验收**（当 §0.1 实测决定走 `use_remove_padding=False` 时）
+- **🔴 删除 stage1 random reward fallback**（plan §13.25 + §13.27，代码块在 [openhands_agent.py:717-740](rllm/examples/openhands_sdk/openhands_agent.py:717)）：
+  - **触发条件（4 个必须同时满足）**：
+    1. OpenHands `Condenser` 接入完成（多 turn prompt 不再线性增长）
+    2. `OPENHANDS_MAX_ITERATIONS` 从 1 拉回正常值（30+）
+    3. 真训练 log 里 `grep "STAGE1_MOCK keeping random"` 极少出现或为空
+    4. 4 个 rollout 之间的 reward variance 来源于真信号，不是随机噪声
+  - **修法（纯代码改动，无 env / config）**：恢复 `reward = 0.0` 初值 + 删 `if real_reward > 0.0` 条件覆盖 + 真值无条件覆盖 + 删 `import random`（如其他代码不用）
+  - **after 状态**（[openhands_agent.py 注释里有完整版本](rllm/examples/openhands_sdk/openhands_agent.py:717)）：
+    ```python
+    reward = 0.0
+    try:
+        output = _run_openhands_container(...)
+        reward = _npu_operator_reward(task, metrics_dir, output)
+    except Exception:
+        logger.exception(...)
+    finally:
+        _archive_npu_artifacts(...)
+    return reward
+    ```
+  - **W3 验收时必查**：跑前先 grep production log 看 STAGE1_MOCK 还出不出现；不出现 = 可以放心删
 
 ### Q2（本计划交付后 1–2 个月）
 
@@ -2303,7 +2323,24 @@ except Exception:
 | 真解出题 | 0.5/0.8/0.95 | 真值 ✓ | 真值 ✓ |
 | W3 condenser 接入 | > 0 主流 | 真值, fallback dormant | 同左，**完全一样** |
 
-**W3 transition 零摩擦**：真 reward > 0 自然接管，random fallback dormant。代码不需要 stage2 cleanup，不需要 env gate。
+**W3 transition 路径**（plan §9 stage2 TODO 也跟踪）：
+
+| W3 阶段 | 用户希望的状态 | Random fallback 状态 |
+|---|---|---|
+| 现在（W2.x stage1） | trainer 链路跑通 | **engaged**（agent 没机会写 impl，real_reward=0 走 fallback）|
+| 早期 W3（condenser 接入，MAX_ITERATIONS 30+，agent 多 turn 工作） | reward 大部分 > 0，少数 0 | dormant 主导，偶发噪声 |
+| 中期 W3（reward variance 充足） | reward 全 > 0 | 完全 dormant（log 里 `grep "STAGE1_MOCK keeping random"` 无结果） |
+| **W3 验收点：删除 fallback 代码** | grep production log 见无 STAGE1_MOCK | 代码块物理删除，random `import` 删除 |
+
+**用户决策（2026-05-26）**：random 在真实场景不合理，**功能验证完后必须删**。代码侧（W2.24+）已加显式 markers：
+
+- 代码块外**显著注释** `⚠️ STAGE1 MOCK REWARD FALLBACK — MUST REMOVE BEFORE W3 REAL TRAINING ⚠️`
+- 4 条 removal criteria 列在 comment 里
+- "after" code 内联在 comment 里，删的人直接 copy/paste 就行
+- log message 加 `STAGE1_MOCK` prefix → 一行 grep 就能扫到 production 还有没有用 fallback
+- plan §9 stage2 TODO 加 🔴 高优先级条目跟踪
+
+**不引入 env gate / config flag** 的理由：用户决策"env 已太多"，且 fallback 删除时机 ≠ runtime toggle 时机（需要前置 condenser 等条件成熟），env 反而误导。物理删代码是正确语义。
 
 **Audit 教训第 16 条**：**fallback 的触发条件要精确写在 docstring/comment 里 + 单测覆盖**。W2.22 我口头说"正常路径不触发"，没说"reward 在 try 内被无条件覆盖"。下次写 fallback：(a) 列出明确的触发 condition；(b) 加 unit test 覆盖所有 fallback case。
 
@@ -2508,9 +2545,14 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 - rollout fallback reward = `random.random()`：**两种情况都生效**（W2.24 修正）：
   - (a) exception 路径（容器 crash / reward 函数 raise）
   - (b) `_npu_operator_reward` 返回 0.0（"no impl file"）→ `if real_reward > 0.0` 条件不通过 → 保留 random
-- 真 reward > 0 时（W3+ condenser 接入后主流）自动接管，random 自然 dormant，**W3 transition 零摩擦**
+- 真 reward > 0 时自动接管真值（W3 transition 零摩擦），但 **W3 验收完后必须物理删除 fallback 代码块**（用户决策：random 在真实训练不合理）
+- 代码侧已加 4 个清晰的 removal markers：
+  - [openhands_agent.py:717](rllm/examples/openhands_sdk/openhands_agent.py:717) 前的 ⚠️ block + after-code 内联
+  - log message 全部 `STAGE1_MOCK` prefix（grep 容易）
+  - §9 stage2 TODO 🔴 高优先级条目跟踪
+  - removal criteria 4 条同时满足才删（condenser + MAX_ITER 拉回 + reward 真稳定 > 0 + variance 来自真信号）
 - **训练信号是 mock 的**：stage1 纯噪声 advantage，不要期待 reward 曲线上升 / 模型学到东西
-- 不加 `STAGE1_MOCK_REWARD` env gate（已决策"env 太多"），fallback 永远 in 但正常时 dormant
+- 不加 `STAGE1_MOCK_REWARD` env gate（已决策"env 太多"，且 fallback 删除时机 ≠ runtime toggle，env 反而误导）
 
 **`data.max_prompt_length` vs OpenHands 真 prompt 量级**（plan §13.26，audit 教训第 15 条）：
 - OpenHands 首轮 prompt 30k+，stage1 默认 `data.max_prompt_length=32768`（W2.23 从 8192 升）必须 ≥ 实际 prompt

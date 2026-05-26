@@ -715,15 +715,39 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
 
     workspace = _setup_npu_operator_workspace(task, trace_label)
     instruction = task.get("instruction", "")
-    # Stage1 unblock (W2.22 + W2.24 correction):
-    # Fallback reward is random uniform [0,1). It engages in TWO cases:
-    #   (a) _run_openhands_container or _npu_operator_reward raises an exception
-    #   (b) _npu_operator_reward returns exactly 0.0 (means "no impl file";
-    #       typical when MAX_ITERATIONS=1 — agent has no chance to write kernel)
-    # Without case (b), all 4 rollouts return 0.0 → GRPO std=0 → NaN advantage
-    # → PPO step fails. W2.22 only covered (a); W2.24 adds (b).
-    # Real reward > 0 still takes over (W3+ condenser + multi-turn). Random
-    # fallback goes dormant naturally when real signal is non-zero.
+
+    # =========================================================================
+    # ⚠️  STAGE1 MOCK REWARD FALLBACK — MUST REMOVE BEFORE W3 REAL TRAINING ⚠️
+    # =========================================================================
+    # Why this block exists (W2.22 + W2.24, see plan §13.25 / §13.27):
+    #   In stage1 we force MAX_ITERATIONS=1 to lock OpenHands prompt at first-turn
+    #   ~30k tokens (otherwise it grows past max_model_len within 2 turns). At
+    #   MAX_ITERATIONS=1 the agent has no time to write any kernel file, so
+    #   `_npu_operator_reward` returns 0.0 ("no impl file" branch). All 4
+    #   rollouts returning 0.0 → GRPO `std=0` → NaN advantage → PPO step crashes.
+    #   Random fallback gives variance so GRPO + PPO step can run.
+    #
+    # Removal criteria (when to delete this block):
+    #   1. OpenHands condenser is integrated (LLM-based summarization or Recent)
+    #      so prompts don't grow past max_model_len in multi-turn
+    #   2. MAX_ITERATIONS raised back from 1 to a real value (typical: 30+)
+    #   3. Real rollouts produce reward > 0 reliably (verify by grepping
+    #      "real_reward=0.0" in production logs; should be rare/empty)
+    #   4. Variance across rollouts comes from real signal, not noise
+    #
+    # Tracked in plan §9 "stage2 TODO" + §13.27. The removal is a code-only
+    # change (no env, no config); just revert this block to:
+    #     reward = 0.0
+    #     try:
+    #         output = _run_openhands_container(...)
+    #         reward = _npu_operator_reward(task, workspace+"/agent_workdir", output)
+    #     except Exception:
+    #         logger.exception(...)
+    #     finally:
+    #         _archive_npu_artifacts(...)
+    #     return reward
+    # and remove `import random` if no other code uses it.
+    # =========================================================================
     reward = random.random()
 
     try:
@@ -739,13 +763,14 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
                 trace_label, reward, instruction[:80],
             )
         else:
+            # STAGE1 MOCK: real_reward == 0 (no impl file), keep random fallback
             logger.info(
-                "[openhands] trace_label=%s real_reward=0.0 (no impl file); keeping random fallback %.3f for stage1 GRPO variance",
+                "[openhands] trace_label=%s real_reward=0.0 (no impl file); STAGE1_MOCK keeping random=%.3f",
                 trace_label, reward,
             )
     except Exception:
         logger.exception(
-            "[openhands] Rollout failed (trace_label=%s); keeping random fallback reward=%.3f for stage1 unblock",
+            "[openhands] Rollout failed (trace_label=%s); STAGE1_MOCK keeping random=%.3f",
             trace_label, reward,
         )
     finally:
