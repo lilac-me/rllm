@@ -46,7 +46,7 @@ export OPENHANDS_DATASET=mock_npu
 export MODEL_PATH=/home/docker/Qwen3.6-35B-A3B
 export PROXY_PORT=5000
 
-export ASCEND_LAUNCH_BLOCKING=1 # TODO
+# export ASCEND_LAUNCH_BLOCKING=1 # TODO
 
 # ------------------------------------------------------------------------------
 # HCCL / network env — opt-in only (W2.15)
