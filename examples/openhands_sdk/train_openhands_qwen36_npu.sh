@@ -325,10 +325,15 @@ ARGS=(
   # =========================
   data.train_batch_size=${BATCH_SIZE}
   data.val_batch_size=16
-  data.max_prompt_length=8192       # 8K
-  data.max_response_length=4096     # 4K (8K + 4K = 12K ≤ max_model_len 32K)
+  data.max_prompt_length=32768      # 32K (W2.23 L3 unblock; OpenHands 首轮 prompt 30k+)
+  # 上面 8192 → 32768 的根因：agent_sdk_engine.py:563 用 data.max_prompt_length 过滤 step。
+  # OpenHands 首轮真 prompt = 30721 tokens, 8K 阈值会把所有 step 过滤掉 → pad_sequence empty。
+  # NOTE: agent_sdk_engine.py:624 硬编码 max_prompt_length=16384 做 padding/truncation，
+  # 所以 PPO 实际拿到的 prompt 会被 left-truncate 到 16K（保留后 16K tokens），不会爆显存。
+  # 那一行是独立 issue（应读 config），stage1 不动。
+  data.max_response_length=4096     # 4K (verl 权威默认；OpenHands LLM client 默认 max_tokens=2048 也不超)
   data.truncation='error'                                # plan §0.2 verl 权威：超长 prompt 直接报错
-  data.filter_overlong_prompts=True                      # plan §0.2 verl 权威：dataloader 阶段过滤超长
+  data.filter_overlong_prompts=True                      # plan §0.2 verl 权威：dataloader 阶段过滤超长 (dataset 端 task instruction 远小于 32k，不受影响)
 
   # =========================
   # actor_rollout_ref - common
