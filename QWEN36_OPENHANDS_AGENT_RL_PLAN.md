@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.24 — W2.24 W2.22 random fallback 漏洞修正：reward==0 是 normal return 路径（非 exception）会被覆盖，fallback 不生效 → GRPO NaN。修：try 内 `if real_reward > 0.0` 条件覆盖。新增 §13.27 + audit 教训第 16 条。前置 v2.23 max_prompt_length, v2.22 MAX_ITERATIONS=1, v2.21 max_model_len, v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.25 — W2.25 verl-fork shim #3：`tu.pop` 缺失 key 守卫修正。前 5 层闭环后挂在 PPO step `infer_batch → tu.pop("no_lora_adapter") → DataProto.pop(str)` 字符迭代 assert。修在 verl-fork `qwen36-rllm-compat 370e1148`，rllm 不动。新增 §13.28 + audit 教训第 17 条。前置 v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITERATIONS=1, v2.21 max_model_len, v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -910,6 +910,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.25 | **verl-fork shim #3：tu.pop 缺失 key 守卫（W2.25）**：W2.24 后 L3 重跑前 5 层全闭环（pad_sequence/step/episode/is_valid/进 PPO step），挂在 `actor_rollout_compute_log_prob` 内部：`verl/utils/tensordict_utils.py:759 tu.pop` 调 `tensordict.pop("no_lora_adapter", _sentinel)` 时，实际 `data` 是 DataProto（非 TensorDict，dispatch 默认传 DataProto），DataProto.pop 签名是 `(batch_keys, ...)` 取 list，把字符串当字符迭代，每个 char 撞 `assert key in self.batch.keys()`。tu.get 有同样守卫但 tu.pop 漏了。修：verl-fork 在 tu.pop 加 `if key not in tensordict: return default` 守卫（4 行），对齐 tu.get 行为。修在 verl-fork qwen36-rllm-compat `370e1148`，**rllm 一行不改**（沿用 W2.8/W2.14 同样模式）。新增 §13.28 + audit 教训第 17 条（verl API drift 持续暴露；helper 函数都要审 sentinel/default 处理是否对齐）。verl-fork 累计 compat 3 个：`881a98d7` agent_loop + `85159408` workers + `370e1148` tu.pop。|
 | 2026-05-26 | v2.24 | **W2.22 random fallback 漏洞修正（W2.24）**：用户预判 W2.23 后 4 rollout 全 reward=0.0 → GRPO `std=0` → NaN advantage → PPO 仍挂。根因：W2.22 我设的 `reward = random.random()` 初值会被 try 内 `reward = _npu_operator_reward(...)` **无条件覆盖**，return 0.0 是正常返回路径（不是 exception）会把 random 刷掉。fallback 只在 except 触发，reward=0 不触发 = W2.22 描述里没说清的逻辑漏洞。修：try 内加 `if real_reward > 0.0: reward = real_reward` 条件覆盖（3 行）。W3 transition 零摩擦：真 reward > 0 自然接管。新增 §13.27 + audit 教训第 16 条（fallback 触发条件要精确写在 docstring + 单测覆盖；test_reward_pipeline.py 未来要加 `reward != 0.0` 回归 case）。|
 | 2026-05-26 | v2.23 | **L3 `data.max_prompt_length` 过滤掉所有 step（W2.23）**：W2.22 后 4 rollout 全部 200 OK + reward=0.0 完成，但依然 `pad_sequence empty`。用户深度诊断 path：(1) 写 `diagnose_trace_store.py` 验 DB 干净 → 排除 DB；(2) `json_extract` 比对 `data.session_name` vs `metadata.session_name` 全对齐 → 排除字段错位；(3) 沿代码下查到 `agent_sdk_engine.py:563` 用 `data.max_prompt_length=8192` 过滤 step，OpenHands 真 prompt 30721 全 skip → trajectory 无 valid step → episode drop → batch 空。修：1 行，`data.max_prompt_length` 8192 → 32768 给 OpenHands 实际 prompt 留出空间。顺手发现 `agent_sdk_engine.py:624` 硬编码 `max_prompt_length=16384` 是 debug 残留（"[DEBUG format]" 打印泄露），对 stage1 反而是 KV cache 保护（padding 阶段 left-truncate 到 16K）→ 列入 stage2 cleanup 不动。新增 §13.26 + audit 教训第 15 条：分层 mock 漏覆盖"OpenHands 实际 prompt 量级 vs dataloader 阈值"。教训：调试数据流问题需 grep warning 级别日志（"Skipping step..." 被 info 淹没）。新增诊断工具 `diagnose_trace_store.py`（可复用）。|
 | 2026-05-26 | v2.22 | **L3 改换策略：MAX_ITERATIONS=1 + random fallback reward（W2.22）**：W2.21 升 max_model_len 到 49152 后第二轮 prompt 47105 又越界 1。观察：每 turn 增长 ~16k，盲升 context 不是路。用户决策 stage1 只验 trainer 链路、不在乎 reward 真假。修：(1) `OPENHANDS_MAX_ITERATIONS` 默认 1000 → 1，prompt 锁首轮 ~30k，永不超 49k；(2) rollout fallback reward `0.0` → `random.random()`，避免 GRPO `std=0` → NaN 让 PPO 跑得动；(3) 不加新 env gate（"env 已太多"）。Trade-off：纯噪声 PPO 信号，stage1 不在乎，W3 + condenser 后 real reward 接管自然 dormant。新增 §13.25 + audit 教训第 14 条（mock_rollout 该返随机 [0,1) 暴露 GRPO std=0 corner case）。|
@@ -2346,6 +2347,73 @@ except Exception:
 
 `test_reward_pipeline.py`（未来要写的 fixture 测试，§13.25 提到过）应该加一个 `assert reward != 0.0` 的回归 case，保证未来代码改动不破坏这个保护。
 
+### 13.28 verl-fork shim #3：`tu.pop` 缺失 key 守卫（W2.25）
+
+**症状**：W2.24 后 L3 重跑，**前 5 层全闭环**：
+
+```
+[DEBUG format] len(prompts): 4              ✓ pad_sequence 不空（W2.23 fix）
+prompt_lengths: tensor([10205, 10205, ...]) ✓ step 过过滤、line 624 truncate 到合理大小
+response_lengths: tensor([256, 336, ...])   ✓ 真生成
+unique episode_ids: 4                       ✓ 4 个 rollout 都进 batch
+is_valid: Counter({True: 4})                ✓ compact_filtering 不挡
+                                            ↓
+                            进入 actor_rollout_compute_log_prob
+                                            ↓
+                            verl-fork tu.pop AssertionError
+```
+
+```
+File "/workspace/pri/verl/verl/workers/engine_workers.py", line 385, in infer_batch
+    no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
+File "/workspace/pri/verl/verl/utils/tensordict_utils.py", line 759, in pop
+    output = tensordict.pop(key, _sentinel)
+File "/workspace/pri/verl/verl/protocol.py", line 741, in pop
+    assert key in self.batch.keys()
+AssertionError
+```
+
+**根因（verl-fork 内部 bug）**：
+- `engine_workers.infer_batch` 的 `data: TensorDict` annotation 是骗人的；rllm dispatch 实际传的是 **DataProto** 对象（这是 verl 整个 worker 抽象的常态，dispatcher 名字 `make_nd_compute_dataproto_dispatch_fn` 已说明）
+- `DataProto.pop` 签名是 `(batch_keys, non_tensor_batch_keys, meta_info_keys)`，**取 LIST 不取单 key**
+- 当 `tu.pop` 调 `tensordict.pop("no_lora_adapter", _sentinel)`：
+  - 字符串 `"no_lora_adapter"` 当 `batch_keys` 迭代，逐字符 `'n', 'o', '_', 'l', ...`
+  - 每个字符进 `assert key in self.batch.keys()` → 一定 False → AssertionError
+- `tu.get` 提前用 `if key not in tensordict: return default` 守卫，所以 4 个 `tu.get` 调用都过；`tu.pop` 漏了同样守卫
+
+**为什么本次才暴露**：`no_lora_adapter` 在 stage1 路径（不开 LoRA）从来没被任何上游写入 `data.batch`。PPO step 1 第一次摸到这条路径 = 第一次触发。`engine_workers.py` 共 7 处 `tu.pop` 调用都有同样脆弱性（`disable_auto_offload`/`mini_batch_size`/`num_mini_batch`/`epochs`/`seed`/`dataloader_kwargs`/`no_lora_adapter`），全靠 `default=` fallback，全会踩同样坑。
+
+**修复（W2.25，verl-fork shim #3）**：[verl/utils/tensordict_utils.py:737](verl-BryanChen408/verl/utils/tensordict_utils.py:737) `tu.pop` 加守卫：
+
+```python
+def pop(tensordict, key, default=None):
+    """..."""
+    if key not in tensordict:        # ← 新加 4 行，行为对齐 tu.get
+        return default
+    _sentinel = object()
+    output = tensordict.pop(key, _sentinel)
+    ...
+```
+
+**为什么改 verl-fork 而非 rllm**（W2.8 / W2.14 同样模式）：
+- bug 在 verl-fork 内部代码路径，rllm 这边不能控制 dispatcher 传什么类型
+- rllm `agent_sdk_engine` 走的就是 verl 标准 dispatcher 路径，传 DataProto 是合理的
+- 在 verl-fork 加 1 个 compat fix 既不动 rllm，也兼容上游真传 TensorDict 的场景（`key in tensordict` 对 TensorDict 一样 work）
+
+**累计 verl-fork compat 文件**：
+
+| Commit | 文件 | 作用 |
+|---|---|---|
+| `881a98d7` (W1.8) | `agent_loop.py` shim | `AsyncLLMServerManager` 别名 + `AgentLoopManager` 3 个 property |
+| `85159408` (W2.8) | `megatron_workers.py` + `fsdp_workers.py` | re-export `engine_workers` |
+| `370e1148` (W2.25) | `tensordict_utils.py:pop` | 缺失 key 守卫 |
+
+**Audit 教训第 17 条**：**verl-fork API drift 不是一次性事件，是持续地暴露**。每次 stage1 链路推进一步，可能解锁下一处 verl 内部代码的 corner case。处理模式：(1) traceback 在 verl/ 内部 → 在 verl-fork compat 分支加 shim 不动 rllm；(2) 否 → 修 rllm。本次第一次在 `utils/` 加 shim（W1.8/W2.8 都在 `workers/`），说明 drift 已经渗到工具层。
+
+未来如果还遇到 `data.batch.keys()` 报错相关 + verl 内部代码，第一时间怀疑同款 DataProto vs TensorDict 类型混淆；`tu.get / tu.pop` 类的 helper 函数都要审一遍 sentinel/default 处理是否对齐。
+
+stage1 此后 verl-fork 用 `qwen36-rllm-compat` 分支 HEAD `370e1148`。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2387,8 +2455,10 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.21 §14 onboarding 同步 | 1 | `87f03325` |
 | W2.22 MAX_ITERATIONS=1 + random fallback reward | 1 | `2a2fdbb7` |
 | W2.23 `data.max_prompt_length` 8192→32768 + 诊断工具 | 1 | `4f941da2` |
-| W2.24 random fallback 条件覆盖修正 | 1 | （本轮 commit） |
-| 最新 | — | 本轮（plan §13.27 + W2.24） |
+| W2.24 random fallback 条件覆盖修正 | 1 | `90690d55` |
+| W2.24 fallback removal markers（doc-only） | 1 | `bf0943cf` |
+| W2.25 verl-fork shim #3 tu.pop（在 verl-fork 仓） | 0 | （rllm 仅 plan 更新；verl-fork `370e1148`） |
+| 最新 | — | 本轮 plan + verl-fork `370e1148` |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2402,6 +2472,7 @@ push 到:  origin/qwen36-rllm-compat
 |---|---|
 | `881a98d7` | shim 1: `AsyncLLMServerManager` 别名 + `AgentLoopManager` 3 个 property |
 | `85159408` | shim 2: `megatron_workers.py` + `fsdp_workers.py` re-export `engine_workers` |
+| `370e1148` | shim 3: `tu.pop` 缺失 key 守卫（W2.25） |
 
 ### 14.3 NPU 节点环境（已知路径）
 
@@ -2454,8 +2525,9 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.22 改换策略：MAX_ITERATIONS=1 + rollout fallback reward random.random()（stage1 只验 trainer 链路、不在乎 reward 真假）
 - ✓ W2.23 `data.max_prompt_length` 8192→32768 解决 `agent_sdk_engine.py:563` step 过滤把所有 trace step 全 drop 的问题；过程中诊断完 DB 链路完全干净（trace_store / session_uid / data vs metadata 字段对齐都验过）
 - ✓ W2.24 W2.22 random fallback 漏洞修正：reward==0 也走 fallback（之前只在 exception 触发，正常返回 0 直接覆盖；加 `if real_reward > 0.0` 条件覆盖）
+- ✓ W2.25 verl-fork shim #3 `tu.pop` 缺失 key 守卫：前 5 层全闭环后挂在 verl 内部 `infer_batch → DataProto.pop(str)`，4 行修在 verl-fork 不动 rllm
 
-**当前位置**：W2.23 fix 后等待 L3 重跑结果。已诊断清楚 trace store / session_uid / max_prompt_length 全链路；上一次 L3 跑全部子链路通到 `transform_results_for_verl`，因 step 过滤阈值过低被全 drop。fix 后 step 应能放行，期望挂点回到 PPO step 真挂这种"上游链路全通"的位置。
+**当前位置**：W2.25 verl-fork shim #3 落地后等待 L3 重跑结果。W2.24 已闭环 reward variance，L3 跑出前 5 层全过 + 进入 `actor_rollout_compute_log_prob`；挂在 verl-fork 内部 `tu.pop` 缺失守卫。W2.25 4 行 fix 修在 verl-fork（rllm 不动），下一次 L3 期望真进 PPO step actor compute / loss / backward / optimizer.step。
 
 **下一步（用户该做的）**：
 
