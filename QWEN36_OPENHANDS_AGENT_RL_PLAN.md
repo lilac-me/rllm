@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.26 — W2.26 verl-fork shim #4：engine_workers 3 batch 方法入口 DataProto→TensorDict 转换。W2.25 修 tu.pop 后同函数下面 12 行 data.keys() 再挂。根因 verl PR #2733 渐进 migration 中间态。修在 verl-fork `7e30674e`，rllm 不动。新增 §13.29 + audit 教训第 18 条。前置 v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.27 — W2.27 supersede W2.26：rllm 侧 `AgentSdkTrainer` 3 处补 verl 自家 3 步桥接（to_tensordict + left_right_2_no_padding + assign_non_tensor），revert verl-fork `7e30674e`。用户两轮追问推动 full audit + 第一原则重申。新增 §13.30 + audit 教训第 19 / 20 条。前置 v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -915,6 +915,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.27 | **W2.27 supersede W2.26：rllm 侧补 trainer 桥接 + revert W2.26 worker-entry shim**。用户两轮追问推动重审：第一次"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 mid-#2733 加的 3 步桥接）；第二次"逐 commit 评估"催出全面 audit。结论 W2.26 是唯一"side 选错"的 commit。修：(1) rllm `agent_sdk_trainer.py` 3 处（compute_log_prob/compute_ref_log_prob/update_actor）补 5 步桥接（to_tensordict + left_right_2_no_padding + tu.assign_non_tensor + 调 worker + DataProto.from_tensordict），mirror verl `RayPPOTrainer._compute_old_log_prob/_compute_ref_log_prob/_update_actor`；(2) revert verl-fork `7e30674e`。Stage2 TODO 加 follow-up：逐字段 no_padding_2_padding 输出转换（W2.27 用 from_tensordict 整体转，未验证下游 `.batch["entropys"]` shape 期望）。新增 §13.30 + audit 教训第 19 + 20 条。W2.28 候选：W2.8 worker re-export shim 也可移到 rllm 侧（4 个 import 更新），不紧急。|
 | 2026-05-26 | v2.26 | **verl-fork shim #4：engine_workers 3 个 batch 方法入口 DataProto→TensorDict 转换（W2.26）**：W2.25 后 `infer_batch` 又挂在下面 12 行的 `data.keys()` 上（DataProto 无 .keys()）。根因 W2.25 同源扩大版：3 个 batch 方法（train_mini_batch/train_batch/infer_batch）整段都按 TensorDict 写但实际收 DataProto，`tu.assign_non_tensor` / `tu.make_iterator` / `data.shape` 全踩。修：3 方法入口加 3 行 `if not isinstance(data, TensorDict): data = data.to_tensordict()`，幂等，下游零改动。`to_tensordict()` 是 verl 上游 native API（protocol.py:1102）。verl-fork compat 累计 4 个 commit: `881a98d7` + `85159408` + `370e1148` + `7e30674e`。新增 §13.29 + audit 教训第 18 条（PR #2733 是渐进 migration，同方法连续 type error 优先怀疑同源；修在入口比逐行修 helper 更稳）。|
 | 2026-05-26 | v2.25 | **verl-fork shim #3：tu.pop 缺失 key 守卫（W2.25）**：W2.24 后 L3 重跑前 5 层全闭环（pad_sequence/step/episode/is_valid/进 PPO step），挂在 `actor_rollout_compute_log_prob` 内部：`verl/utils/tensordict_utils.py:759 tu.pop` 调 `tensordict.pop("no_lora_adapter", _sentinel)` 时，实际 `data` 是 DataProto（非 TensorDict，dispatch 默认传 DataProto），DataProto.pop 签名是 `(batch_keys, ...)` 取 list，把字符串当字符迭代，每个 char 撞 `assert key in self.batch.keys()`。tu.get 有同样守卫但 tu.pop 漏了。修：verl-fork 在 tu.pop 加 `if key not in tensordict: return default` 守卫（4 行），对齐 tu.get 行为。修在 verl-fork qwen36-rllm-compat `370e1148`，**rllm 一行不改**（沿用 W2.8/W2.14 同样模式）。新增 §13.28 + audit 教训第 17 条（verl API drift 持续暴露；helper 函数都要审 sentinel/default 处理是否对齐）。verl-fork 累计 compat 3 个：`881a98d7` agent_loop + `85159408` workers + `370e1148` tu.pop。|
 | 2026-05-26 | v2.24 | **W2.22 random fallback 漏洞修正（W2.24）**：用户预判 W2.23 后 4 rollout 全 reward=0.0 → GRPO `std=0` → NaN advantage → PPO 仍挂。根因：W2.22 我设的 `reward = random.random()` 初值会被 try 内 `reward = _npu_operator_reward(...)` **无条件覆盖**，return 0.0 是正常返回路径（不是 exception）会把 random 刷掉。fallback 只在 except 触发，reward=0 不触发 = W2.22 描述里没说清的逻辑漏洞。修：try 内加 `if real_reward > 0.0: reward = real_reward` 条件覆盖（3 行）。W3 transition 零摩擦：真 reward > 0 自然接管。新增 §13.27 + audit 教训第 16 条（fallback 触发条件要精确写在 docstring + 单测覆盖；test_reward_pipeline.py 未来要加 `reward != 0.0` 回归 case）。|
@@ -2506,6 +2507,61 @@ def train_mini_batch(self, data: TensorDict) -> TensorDict:
 
 stage1 此后 verl-fork 用 `qwen36-rllm-compat` 分支 HEAD `7e30674e`。
 
+**⚠️ W2.27 后续 supersede 此节**：W2.26 worker-entry shim 被 revert（verl-fork `9998be02`），改为在 rllm `AgentSdkTrainer` 加 3 步桥接（更架构正确），见 §13.30。
+
+### 13.30 rllm 侧补 trainer 桥接 supersede W2.26 worker-entry shim（W2.27）
+
+**触发原因**：用户两轮深查指出我策略错。第一次问"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 trainer 在 mid-#2733 加的 3 步桥接）；第二次问"按 性价比 / 架构发展 是否应该改 rllm 侧"，我重新评估后承认 W2.26 worker-entry shim 是 **side 选错**：
+
+- W2.26 入口转换只覆盖类型问题，**未补 metadata**（`compute_loss` 默认 True，verl 自家 trainer 显式设 False）
+- W2.26 fork 债务：上游 PR #2733 part-N 完成后 shim 可能仍要 reconcile
+- W2.27 改 rllm 侧 trainer = 既补类型也补 metadata，且与 AgentFlow 迁移方向一致
+
+**实施（W2.27）**：
+
+| 改动 | 仓 | Commit |
+|---|---|---|
+| `rllm/trainer/verl/agent_sdk_trainer.py` 3 处补 3 步桥接（mirror verl `RayPPOTrainer._compute_old_log_prob/_compute_ref_log_prob/_update_actor`） | rllm | `dd229d51` |
+| revert `7e30674e` (W2.26 worker-entry shim) | verl-fork | `9998be02` |
+
+**每处的桥接 = 5 步**（源自 [verl ray_trainer.py:1188-1289](verl-BryanChen408/verl/trainer/ppo/ray_trainer.py:1188)）：
+
+1. `batch_td = batch.to_tensordict()` —— DataProto → TensorDict（verl `protocol.py:1102` native API）
+2. `batch_td = left_right_2_no_padding(batch_td)` —— padded → no-padding（必须，因为我们 stage1 设 `use_remove_padding=True`）
+3. `tu.assign_non_tensor(batch_td, **metadata)` —— 注入方法特定 metadata：
+   - compute_log_prob: `calculate_entropy=True, calculate_sum_pi_squared=False, compute_loss=False`
+   - compute_ref_log_prob: `calculate_entropy=False, compute_loss=False`（+ `no_lora_adapter=True` 若 `ref_in_actor`）
+   - update_actor: `calculate_entropy=actor.calculate_entropy OR entropy_coeff!=0, distillation_use_topk=False, global_batch_size/mini_batch_size=ppo_mini_batch_size*rollout.n, epochs=ppo_epochs, seed=data_loader_seed, dataloader_kwargs={shuffle}, compute_loss=True`
+4. 调 worker（传 TensorDict）
+5. `DataProto.from_tensordict(output)` —— TensorDict → DataProto，让 rllm 下游 `.batch[...]` / `.meta_info["metrics"]` API 仍可用
+
+**W2.27 (β) 范围未做的事**（标 stage2 TODO）：
+
+- **逐字段 `no_padding_2_padding` 输出转换**：verl 自家 `_compute_old_log_prob` 对 log_probs/entropy/sum_pi_squared 各自做 `no_padding_2_padding(field, batch_td)` 还原 padded shape；W2.27 用 `DataProto.from_tensordict` 整体转，**不做逐字段重塑**。如果 rllm 下游 `old_log_prob.batch["entropys"]` 期望 padded shape 但拿到 no-padding，会再挂一次。**未验证**，等 L3 跑出来看
+- **routed_experts / teacher_logprobs 处理**：verl 自家有这两个 corner case，stage1 用不到，跳过
+- **update_actor 输出整形（`rename_dict("actor/") + from_single_dict`）**：verl 自家做完整重命名 + 重包，rllm 只读 `actor_output.meta_info["metrics"]`，`DataProto.from_tensordict` 应当能填这个字段（NonTensorData → meta_info），**未验证**
+
+**Audit 反思（重审 W2.20-W2.26 整批 commit 后）**：
+
+User 第二轮提的"逐 commit 评估"逼出 4 类 commit 分布：
+
+| 类别 | 例 | 状态 |
+|---|---|---|
+| Side 选对 + 实施正确 | W2.20/W2.21/W2.23 | ✅ 保留 |
+| Side 选对但实施有质量瑕疵 | W2.22 fallback 漏 reward=0 (→W2.24 修)；W2.23 `agent_sdk_engine.py:624` 硬编码未一并修（stage2 cleanup） | ⚠️ 已补 / 进 stage2 |
+| Side 选对且通用硬化 | W2.25 `tu.pop` 守卫 | ✅ 保留（rllm 不调，verl 内部 helper 硬化合理在 verl-fork） |
+| **Side 选错** | **W2.26 worker-entry shim** | ❌ **W2.27 revert + 移到 rllm** |
+| Side 次优但能工作 | W2.8 `megatron_workers/fsdp_workers` re-export shim（rllm 4 个旧 import 都在 `train_agent_ppo.py` 可改区） | ⚠️ **W2.28 候选**，不紧急 |
+| 选 verl-fork 是因为 rllm 改动会触碰 `rllm/sdk/*` 不动区 | W1.8 agent_loop shim | ✅ 保留 |
+
+**Audit 教训第 19 条**：side 选择不是"rllm 不动是绝对原则"，而是 case-by-case 评估：
+- 改 rllm 是否触碰 `rllm/sdk/*` 子系统？ → 是 → verl-fork shim
+- 改 rllm 是否只在 `rllm/trainer/verl/` / `examples/` 等可改区？ → 是 → 优先 rllm 侧
+- 是 verl 内部 generic 助手的 bug？ → verl-fork
+- 是 rllm 缺了 verl 自家 trainer 已做的桥接？ → **rllm 侧（不要图省事做 worker-entry shim）**
+
+**Audit 教训第 20 条**：**用户两轮追问（"为什么这么多问题" + "逐 commit 评估"）改变了我对策略的认识**。下次实施 shim 前先问"verl 自家 trainer 在调这个 worker 前做了什么？rllm 是不是没做？"，避免无脑选 worker-entry shim。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2550,8 +2606,9 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.24 random fallback 条件覆盖修正 | 1 | `90690d55` |
 | W2.24 fallback removal markers（doc-only） | 1 | `bf0943cf` |
 | W2.25 verl-fork shim #3 tu.pop（在 verl-fork 仓） | 0 | （rllm 仅 plan 更新；verl-fork `370e1148`） |
-| W2.26 verl-fork shim #4 入口 DataProto→TensorDict | 0 | （rllm 仅 plan 更新；verl-fork `7e30674e`） |
-| 最新 | — | 本轮 plan + verl-fork `7e30674e` |
+| W2.26 verl-fork shim #4 入口 DataProto→TensorDict | 0 | （rllm 仅 plan 更新；verl-fork `7e30674e`，**W2.27 revert**） |
+| W2.27 rllm AgentSdkTrainer 补 3 处桥接 + revert W2.26 | 1 | rllm `dd229d51` + verl-fork `9998be02` |
+| 最新 | — | 本轮（rllm `dd229d51` + verl-fork `9998be02`） |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2566,7 +2623,8 @@ push 到:  origin/qwen36-rllm-compat
 | `881a98d7` | shim 1: `AsyncLLMServerManager` 别名 + `AgentLoopManager` 3 个 property |
 | `85159408` | shim 2: `megatron_workers.py` + `fsdp_workers.py` re-export `engine_workers` |
 | `370e1148` | shim 3: `tu.pop` 缺失 key 守卫（W2.25） |
-| `7e30674e` | shim 4: engine_workers 3 batch 方法入口 DataProto→TensorDict 转换（W2.26） |
+| `7e30674e` | shim 4: engine_workers 3 batch 方法入口 DataProto→TensorDict 转换（W2.26） — ⚠️ **W2.27 revert（commit `9998be02`），改在 rllm 侧 trainer 补桥接** |
+| `9998be02` | revert W2.26 |
 
 ### 14.3 NPU 节点环境（已知路径）
 
@@ -2620,9 +2678,10 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.23 `data.max_prompt_length` 8192→32768 解决 `agent_sdk_engine.py:563` step 过滤把所有 trace step 全 drop 的问题；过程中诊断完 DB 链路完全干净（trace_store / session_uid / data vs metadata 字段对齐都验过）
 - ✓ W2.24 W2.22 random fallback 漏洞修正：reward==0 也走 fallback（之前只在 exception 触发，正常返回 0 直接覆盖；加 `if real_reward > 0.0` 条件覆盖）
 - ✓ W2.25 verl-fork shim #3 `tu.pop` 缺失 key 守卫：前 5 层全闭环后挂在 verl 内部 `infer_batch → DataProto.pop(str)`，4 行修在 verl-fork 不动 rllm
-- ✓ W2.26 verl-fork shim #4 engine_workers 3 batch 方法入口 DataProto→TensorDict 转换：W2.25 后 `data.keys()` 又挂，根因同源（mid-migration），修方法入口 1 行/方法 × 3 方法，下游零改动
+- ✓ W2.26 verl-fork shim #4 engine_workers 3 batch 方法入口 DataProto→TensorDict 转换：W2.25 后 `data.keys()` 又挂，根因同源（mid-migration），修方法入口 1 行/方法 × 3 方法，下游零改动 ⚠️ **被 W2.27 supersede**
+- ✓ W2.27 rllm 侧补 trainer 桥接（3 处 mirror verl `_compute_old_log_prob/_compute_ref_log_prob/_update_actor`）+ revert W2.26 verl-fork shim：side 修正
 
-**当前位置**：W2.26 verl-fork shim #4 落地后等待 L3 重跑结果。L3 前 5 层 + PPO step 入口全闭环；W2.25 修 tu.pop 后 W2.26 解决同函数下面 `data.keys()`。verl-fork compat 累计 4 处（agent_loop / workers / tu.pop / engine_workers 入口转换）。下一次 L3 期望进 actor model forward / log_prob 计算 / loss / backward。
+**当前位置**：W2.27 完成 —— rllm `AgentSdkTrainer` 3 处补桥接（mirror verl 自家），W2.26 verl-fork shim revert。架构上 side 选对，metadata 补全（`compute_loss=False` 等显式注入）。等待 L3 重跑。**已知未验证项**（β 范围）：(a) 逐字段 `no_padding_2_padding` 输出转换没做；(b) `update_actor` 没复刻 verl 的 `rename_dict + from_single_dict` 后处理 —— 跑挂再补。verl-fork compat 累计 3 处有效（agent_loop / workers / tu.pop；W2.26 已 revert）。
 
 **下一步（用户该做的）**：
 
