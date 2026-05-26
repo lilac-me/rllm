@@ -156,7 +156,11 @@ export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
 # proxy 里用的是 actor_rollout_ref.model.path，即完整路径
 export OPENHANDS_MODEL_NAME="${MODEL_PATH}"
 export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
-export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
+# Stage1 unblock (W2.22): default 1 to lock LLM prompt at first-turn ~30k tokens.
+# Each turn adds ~16k of tool-result history → with default 1000 the prompt
+# blows max_model_len within 2-3 turns. Override only after OpenHands condenser
+# (W3/W4) is in place or max_model_len is raised significantly.
+export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
 export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
 
@@ -263,7 +267,7 @@ echo "  Model           : ${MODEL_PATH}"
 echo "  N_GPUS (trainer) : ${N_GPUS}"
 echo "  Proxy port      : ${PROXY_PORT}"
 echo "  OpenHands image : ${OPENHANDS_IMAGE}"
-echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
+echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS} (W2.22 stage1 unblock; raise after condenser)"
 echo "  Tool parser     : ${TOOL_PARSER}"
 echo "  Parallelism     : TP=2 PP=1 CP=1 EP=4 ETP=1 (single-node 8-NPU)"
 echo "  max_model_len   : 49152 (W2.21 L3 unblock; up from 32k baseline)"
