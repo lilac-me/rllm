@@ -341,9 +341,13 @@ ARGS=(
   actor_rollout_ref.hybrid_engine=True
   actor_rollout_ref.model.path=${MODEL_PATH}
   actor_rollout_ref.model.trust_remote_code=True   # plan §0.2 verl MODEL 权威：Qwen3.6 自定义 arch 需要
-  # plan §0.1 软约束：use_remove_padding 视实测决定。stage1 起步沿用 True
-  # （现有 NPU 训练脚本验证过可跑），W2 若挂或 OOM 再切 False
-  actor_rollout_ref.model.use_remove_padding=True
+  # plan §0.1 + W2.29 实测：必须 False。GDN linear attention 不支持 packed
+  # sequence (MindSpeed/mindspeed/core/ssm/gated_delta_net.py:292 raise
+  # NotImplementedError if packed_seq_params is not None)。verl
+  # transformer_impl.py:908 用 `data_format = "thd" if use_remove_padding
+  # else "bshd"`，True 触发 thd → packed_seq → GDN raise。verl NPU 脚本
+  # 默认 False。
+  actor_rollout_ref.model.use_remove_padding=False
 
   # =========================
   # actor - optimization / PPO (plan §13.7 + verl NPU 套：use_dynamic_bsz=False)
@@ -377,7 +381,7 @@ ARGS=(
   # 与 verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh NPU case override 一致。
   actor_rollout_ref.actor.megatron.vanilla_mbridge=False
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
-  actor_rollout_ref.actor.megatron.use_remove_padding=True   # 与 model.use_remove_padding 同步；plan §0.1 软约束
+  actor_rollout_ref.actor.megatron.use_remove_padding=False  # 与 model.use_remove_padding 同步 (W2.29 GDN 不支持 packed seq)
   actor_rollout_ref.actor.megatron.dtype=bfloat16            # plan §0.2 verl ACTOR 权威：显式 bf16
   actor_rollout_ref.actor.checkpoint.strict=False            # plan §0.2 verl NPU case：ckpt key 不严格匹配
 
