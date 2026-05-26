@@ -15,6 +15,9 @@ import omegaconf
 from typing import Any, Dict, Optional, Tuple, List, Sequence, Callable
 from rllm.environments.base.multi_turn_env import MultiTurnEnvironment
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 MESSAGE_PASSTHROUGH_MARKER = "<|message_passthrough|>"
@@ -44,17 +47,11 @@ class _HybridHttpWorker:
             proxy=None,
             trust_env=False,
         )
-        # TokenBucketWorker 是一个全局视角的 token 计数器
-        # self._rate_limit_worker = TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
 
     def _backoff(self, attempt: int, base: int = 2, cap: int = 30) -> float:
         return min(base ** attempt, cap)
 
     def get_token_in_use(self) -> int:
-        # try:
-        #     return ray.get(self._rate_limit_worker.get_current_count.remote())
-        # except Exception:
-        #     return -1
         return 0
     
     def shutdown(self):
@@ -79,16 +76,6 @@ class _HybridHttpWorker:
             submitted = False
             while unlimited or attempt < (max_retries or 0):
                 try:
-                #     # Acquire token with timeout.
-                #     acquire_ref = self._rate_limit_worker.acquire.remote()
-                #     ready, _ = ray.wait([acquire_ref], timeout=self.acquire_timeout)
-                #     if not ready:
-                #         try:
-                #             curr = ray.get(self._rate_limit_worker.get_current_count.remote())
-                #         except Exception:
-                #             curr = -1
-                #         print(f"[HybridWorker] acquire timeout tokens_in_use={curr}")
-                #         return {"status": "failed", "error_message": "rate limiter acquire timeout"}
                     # Log once on first attempt to help debug "server did not receive request".
                     if attempt == 0:
                         print(f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}")
@@ -98,11 +85,7 @@ class _HybridHttpWorker:
                         print(f"[HybridWorker] POST /evaluate resp={resp.status_code} task_id={task_data.get('task_id','')}")
                     except Exception:
                         pass
-                    # Release token immediately after submission.
-                    # try:
-                    #     self._rate_limit_worker.release.remote()
-                    # except Exception:
-                    #     pass
+
                     if resp.status_code == 200:
                         submitted = True
                         logger.debug(f"[HybridWorker] HTTP 200 OK. errcode(reason): {json.loads(resp.content.decode('utf-8') or '{}').get('error_code',None)}")
@@ -117,20 +100,12 @@ class _HybridHttpWorker:
                     logger.warning("[HybridWorker] POST /evaluate read timeout for task_id=%s; polling existing task instead of resubmitting", task_data.get("task_id", ""))
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as e:
-                    # try:
-                    #     self._rate_limit_worker.release.remote()
-                    # except Exception:
-                    #     pass
                     if unlimited or attempt < (max_retries or 0) - 1:
                         time.sleep(self._backoff(attempt))
                         attempt += 1
                         continue
                     return {"status": "failed", "error_message": str(e)}
                 except Exception as e:
-                    # try:
-                    #     self._rate_limit_worker.release.remote()
-                    # except Exception:
-                    #     pass
                     return {"status": "failed", "error_message": str(e)}
 
             # Poll status at a fixed 1s interval.
@@ -146,10 +121,7 @@ class _HybridHttpWorker:
                         status = data.get("status", "unknown")
                         if status != last_status:
                             last_status = status
-                            try:
-                                print(f"[HybridWorker] STATUS task_id={task_id} -> {status}")
-                            except Exception:
-                                pass
+                            print(f"[HybridWorker] STATUS task_id={task_id} -> {status}")
                         if status in ("completed", "failed", "timeout", "cancelled"):
                             # TODO. 这里的 completed failed timeout cancelled 分级不正确
                             #! 我发现有许多执行失败的 被标记为 failed 但是模型并不知道哪里出错。
@@ -184,7 +156,8 @@ class KernelGymEnv(MultiTurnEnvironment):
         super().__init__(task=task, max_turns=config.max_turns)
 
         assert task is not None
-        self.session_uuid = uuid.uuid4().hex[:8]
+        # Use session_uuid from task if provided, otherwise generate random
+        self.session_uuid = str(task.get("session_uuid", uuid.uuid4().hex[:8]))
         task["task_id"] = task.get("problem_id", "undefined")
         #! 任务相关的输入
         self.problem_id = task.get("task_id")
@@ -760,7 +733,11 @@ class KernelGymEnv(MultiTurnEnvironment):
         self._last_error = None
         self._last_result = None
 
-        self.session_uuid = uuid.uuid4().hex[:8]
+        # Use session_uuid from task if provided, otherwise generate random
+        if self.task and "session_uuid" in self.task:
+            self.session_uuid = str(self.task["session_uuid"])
+        else:
+            self.session_uuid = uuid.uuid4().hex[:8]
 
         return self.task, {}
 
