@@ -18,6 +18,14 @@ from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.core_algos import agg_loss
+# W2.27 (rllm-side mid-migration bridge for compute_log_prob / update_actor):
+# verl's RayPPOTrainer._compute_old_log_prob / _compute_ref_log_prob / _update_actor
+# explicitly convert DataProto → TensorDict + left_right_2_no_padding + assign metadata
+# before calling worker (see verl ray_trainer.py:1188-1289). rllm AgentSdkTrainer
+# was missing these bridges, sending DataProto where worker expects TensorDict.
+# See plan §13.30. To be removed when verl PR #2733 part-N finishes migration.
+from verl.utils import tensordict_utils as tu
+from verl.workers.utils.padding import left_right_2_no_padding
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -415,7 +423,19 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # W2.27 bridge: mirror verl RayPPOTrainer._compute_old_log_prob (ray_trainer.py:1212-1226)
+                        batch_td = batch.to_tensordict()
+                        batch_td = left_right_2_no_padding(batch_td)
+                        calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+                        tu.assign_non_tensor(
+                            batch_td,
+                            calculate_entropy=True,
+                            calculate_sum_pi_squared=calculate_sum_pi_squared,
+                            compute_loss=False,
+                        )
+                        old_log_prob_td = self.actor_rollout_wg.compute_log_prob(batch_td)
+                        # Convert worker's TensorDict output back to DataProto for downstream rllm code
+                        old_log_prob = DataProto.from_tensordict(old_log_prob_td) if old_log_prob_td is not None else old_log_prob_td
 
                         if "entropys" in old_log_prob.batch:
                             entropys = old_log_prob.batch["entropys"]
@@ -451,10 +471,18 @@ class AgentSdkTrainer(RayPPOTrainer):
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
+                            # W2.27 bridge: mirror verl RayPPOTrainer._compute_ref_log_prob (ray_trainer.py:1188-1210)
+                            ref_batch_td = batch.to_tensordict()
+                            ref_batch_td = left_right_2_no_padding(ref_batch_td)
+                            ref_metadata = {"calculate_entropy": False, "compute_loss": False}
+                            if self.ref_in_actor:
+                                ref_metadata["no_lora_adapter"] = True
+                            tu.assign_non_tensor(ref_batch_td, **ref_metadata)
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob_td = self.ref_policy_wg.compute_ref_log_prob(ref_batch_td)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                ref_log_prob_td = self.actor_rollout_wg.compute_ref_log_prob(ref_batch_td)
+                            ref_log_prob = DataProto.from_tensordict(ref_log_prob_td) if ref_log_prob_td is not None else ref_log_prob_td
                             batch = batch.union(ref_log_prob)
 
                     # compute values
@@ -531,7 +559,28 @@ class AgentSdkTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            # W2.27 bridge: mirror verl RayPPOTrainer._update_actor (ray_trainer.py:1249-1289)
+                            rollout_cfg = self.config.actor_rollout_ref.rollout
+                            batch.meta_info["multi_turn"] = rollout_cfg.multi_turn.enable if hasattr(rollout_cfg, "multi_turn") else False
+                            batch.meta_info["temperature"] = rollout_cfg.temperature
+                            update_batch_td = batch.to_tensordict()
+                            update_batch_td = left_right_2_no_padding(update_batch_td)
+                            actor_cfg = self.config.actor_rollout_ref.actor
+                            _calc_entropy = bool(getattr(actor_cfg, "calculate_entropy", False)) or (actor_cfg.entropy_coeff != 0.0)
+                            _ppo_mini_batch_size = actor_cfg.ppo_mini_batch_size * rollout_cfg.n
+                            tu.assign_non_tensor(
+                                update_batch_td,
+                                calculate_entropy=_calc_entropy,
+                                distillation_use_topk=False,  # stage1 no distillation
+                                global_batch_size=_ppo_mini_batch_size,
+                                mini_batch_size=_ppo_mini_batch_size,
+                                epochs=actor_cfg.ppo_epochs,
+                                seed=getattr(actor_cfg, "data_loader_seed", 1),
+                                dataloader_kwargs={"shuffle": getattr(actor_cfg, "shuffle", False)},
+                                compute_loss=True,
+                            )
+                            actor_output_td = self.actor_rollout_wg.update_actor(update_batch_td)
+                            actor_output = DataProto.from_tensordict(actor_output_td) if actor_output_td is not None else actor_output_td
 
                         # save checkpoint
                         if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
