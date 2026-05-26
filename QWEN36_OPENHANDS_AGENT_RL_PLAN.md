@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.27 — W2.27 supersede W2.26：rllm 侧 `AgentSdkTrainer` 3 处补 verl 自家 3 步桥接（to_tensordict + left_right_2_no_padding + assign_non_tensor），revert verl-fork `7e30674e`。用户两轮追问推动 full audit + 第一原则重申。新增 §13.30 + audit 教训第 19 / 20 条。前置 v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.28 — W2.28 W2.27 extension：rllm `agent_sdk_trainer.py` 加 `batch.meta_info["temperature"]` 全局 set，mirror verl `fit:1395`。megatron `forward_step:841` 无 default 读此 key，W2.27 update_actor bridge 内 set 太晚。新增 §13.31 + audit 教训第 21 条。前置 v2.27 trainer 桥接, v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -716,7 +716,7 @@ stage1 不做、留到 stage2+ 处理的功能项：
   - **问题**：W2.23 `data.max_prompt_length=32768` 让 step 过滤通过，但 [agent_sdk_engine.py:624](rllm/engine/agent_sdk_engine.py:624) line 622 读 config 后 line 624 立刻硬编码覆盖 `max_prompt_length = 16384`，导致实际 PPO 只拿 16K tokens，30K - 16K = 14K 浪费。`[DEBUG format]` 打印 line 623 暴露是别人调试残留
   - **stage1 不修的理由**（用户决策 2026-05-26）：stage1 走 random reward fallback，训练信号本来就 mock，扔 14K tokens 不影响"验证 trainer 链路"目标；且当前 line 624 截到 16k 反而保护 NPU KV cache 不被 30k 拖爆。W3 真训练前必须解决
   - **修法**：删 [:624](rllm/engine/agent_sdk_engine.py:624) `max_prompt_length = 16384` 那一行，让 line 622 读到的 config 值直接生效；同步评估 NPU KV cache 余量是否撑得住 32K
-- **🟡 W2.28：把 verl-fork `85159408` worker re-export shim 移到 rllm 侧**（plan §13.11 W2.8 follow-up，用户决策推迟）：
+- **🟡 stage2 follow-up：把 verl-fork `85159408` worker re-export shim 移到 rllm 侧**（plan §13.11 W2.8 follow-up，用户决策推迟；原本预留 W2.28 编号已被 temperature fix 占用，此项无固定 W-编号，等真做时分配）：
   - **问题**：W2.8 在 verl-fork 加了 `verl/workers/megatron_workers.py` + `verl/workers/fsdp_workers.py` 两个 shim re-export `engine_workers` 内容，让 rllm `train_agent_ppo.py:99/105/122/134` 4 个老 import 工作。属"次优 side"——rllm 这 4 个 import 完全在 `rllm/trainer/verl/` 可改区
   - **stage1 不修的理由**（用户决策 2026-05-26）：W2.8 shim 功能上完全正常没引起 bug；做 W2.28 现在 = 引入未必要变动，可能踩 `AsyncActorRolloutRefWorker` vs `ActorRolloutRefWorker` 行为微妙差异
   - **修法**：rllm 4 处 import 改为 `from verl.workers.engine_workers import ActorRolloutRefWorker as AsyncActorRolloutRefWorker` 和 `from verl.workers.engine_workers import TrainingWorker as CriticWorker`（或更彻底改用新名）+ revert verl-fork `85159408`
@@ -923,6 +923,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.28 | **W2.28 W2.27 extension：rllm batch.meta_info 漏 `temperature` 字段**。L3 推进到 megatron `transformer_impl.py:841 forward_step` 报 `KeyError: temperature`。源码验证：verl 在 `fit:1394-1395` 每 ppo iter batch 构造后立刻 set，rllm `transform_results_for_verl` 路径不走 fit batch 构造 → 没 set。W2.27 update_actor bridge 内 set 了但太晚（line 534 vs compute_log_prob line 418）。修：在 rllm `agent_sdk_trainer.py` 紧贴 `batch.meta_info["global_token_num"]` 现有行后全局只设一次 `temperature` + `multi_turn`，删 W2.27 update_actor bridge 里的重复 set。新增 §13.31 + audit 教训第 21 条（port 多阶段 trainer 桥接时要 port 上游 fit-loop 层 metadata 注入，不仅是 bridge 方法内的）+ stage2 TODO 加"完整 verl fit ↔ rllm fit_agent diff 审计"避免类似漏洞。|
 | 2026-05-26 | v2.27 | **W2.27 supersede W2.26：rllm 侧补 trainer 桥接 + revert W2.26 worker-entry shim**。用户两轮追问推动重审：第一次"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 mid-#2733 加的 3 步桥接）；第二次"逐 commit 评估"催出全面 audit。结论 W2.26 是唯一"side 选错"的 commit。修：(1) rllm `agent_sdk_trainer.py` 3 处（compute_log_prob/compute_ref_log_prob/update_actor）补 5 步桥接（to_tensordict + left_right_2_no_padding + tu.assign_non_tensor + 调 worker + DataProto.from_tensordict），mirror verl `RayPPOTrainer._compute_old_log_prob/_compute_ref_log_prob/_update_actor`；(2) revert verl-fork `7e30674e`。Stage2 TODO 加 follow-up：逐字段 no_padding_2_padding 输出转换（W2.27 用 from_tensordict 整体转，未验证下游 `.batch["entropys"]` shape 期望）。新增 §13.30 + audit 教训第 19 + 20 条。W2.28 候选：W2.8 worker re-export shim 也可移到 rllm 侧（4 个 import 更新），不紧急。|
 | 2026-05-26 | v2.26 | **verl-fork shim #4：engine_workers 3 个 batch 方法入口 DataProto→TensorDict 转换（W2.26）**：W2.25 后 `infer_batch` 又挂在下面 12 行的 `data.keys()` 上（DataProto 无 .keys()）。根因 W2.25 同源扩大版：3 个 batch 方法（train_mini_batch/train_batch/infer_batch）整段都按 TensorDict 写但实际收 DataProto，`tu.assign_non_tensor` / `tu.make_iterator` / `data.shape` 全踩。修：3 方法入口加 3 行 `if not isinstance(data, TensorDict): data = data.to_tensordict()`，幂等，下游零改动。`to_tensordict()` 是 verl 上游 native API（protocol.py:1102）。verl-fork compat 累计 4 个 commit: `881a98d7` + `85159408` + `370e1148` + `7e30674e`。新增 §13.29 + audit 教训第 18 条（PR #2733 是渐进 migration，同方法连续 type error 优先怀疑同源；修在入口比逐行修 helper 更稳）。|
 | 2026-05-26 | v2.25 | **verl-fork shim #3：tu.pop 缺失 key 守卫（W2.25）**：W2.24 后 L3 重跑前 5 层全闭环（pad_sequence/step/episode/is_valid/进 PPO step），挂在 `actor_rollout_compute_log_prob` 内部：`verl/utils/tensordict_utils.py:759 tu.pop` 调 `tensordict.pop("no_lora_adapter", _sentinel)` 时，实际 `data` 是 DataProto（非 TensorDict，dispatch 默认传 DataProto），DataProto.pop 签名是 `(batch_keys, ...)` 取 list，把字符串当字符迭代，每个 char 撞 `assert key in self.batch.keys()`。tu.get 有同样守卫但 tu.pop 漏了。修：verl-fork 在 tu.pop 加 `if key not in tensordict: return default` 守卫（4 行），对齐 tu.get 行为。修在 verl-fork qwen36-rllm-compat `370e1148`，**rllm 一行不改**（沿用 W2.8/W2.14 同样模式）。新增 §13.28 + audit 教训第 17 条（verl API drift 持续暴露；helper 函数都要审 sentinel/default 处理是否对齐）。verl-fork 累计 compat 3 个：`881a98d7` agent_loop + `85159408` workers + `370e1148` tu.pop。|
@@ -2517,6 +2518,8 @@ stage1 此后 verl-fork 用 `qwen36-rllm-compat` 分支 HEAD `7e30674e`。
 
 **⚠️ W2.27 后续 supersede 此节**：W2.26 worker-entry shim 被 revert（verl-fork `9998be02`），改为在 rllm `AgentSdkTrainer` 加 3 步桥接（更架构正确），见 §13.30。
 
+**⚠️ W2.28 又补一层**：rllm batch.meta_info 漏 `temperature` 字段被 megatron forward_step 撞到，见 §13.31。
+
 ### 13.30 rllm 侧补 trainer 桥接 supersede W2.26 worker-entry shim（W2.27）
 
 **触发原因**：用户两轮深查指出我策略错。第一次问"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 trainer 在 mid-#2733 加的 3 步桥接）；第二次问"按 性价比 / 架构发展 是否应该改 rllm 侧"，我重新评估后承认 W2.26 worker-entry shim 是 **side 选错**：
@@ -2570,6 +2573,49 @@ User 第二轮提的"逐 commit 评估"逼出 4 类 commit 分布：
 
 **Audit 教训第 20 条**：**用户两轮追问（"为什么这么多问题" + "逐 commit 评估"）改变了我对策略的认识**。下次实施 shim 前先问"verl 自家 trainer 在调这个 worker 前做了什么？rllm 是不是没做？"，避免无脑选 worker-entry shim。
 
+### 13.31 `batch.meta_info["temperature"]` 漏设（W2.28，W2.27 extension）
+
+**症状**：W2.27 bridge 落地后 L3 重跑推进到 megatron forward_step，挂在：
+
+```
+File "verl/workers/engine/megatron/transformer_impl.py", line 841, in forward_step
+    temperature = batch["temperature"]
+KeyError: 'key "temperature" not found in TensorDict with keys [\'attention_mask\', ..., \'metrics\', ..., \'use_remove_padding\']'
+```
+
+TensorDict 里 43 个 key 列出来了，**没 `temperature`**。
+
+**源码验证根因**（[verl ray_trainer.py:1394-1395](verl-BryanChen408/verl/trainer/ppo/ray_trainer.py:1394) + [transformer_impl.py:841](verl-BryanChen408/verl/workers/engine/megatron/transformer_impl.py:841)）：
+
+| 位置 | 谁 set 谁 read | rllm 是否做 |
+|---|---|---|
+| verl `fit:1394-1395` | `batch = DataProto.from_single_dict(...); batch.meta_info["temperature"] = rollout_config.temperature` —— **每 ppo iter batch 构造后立刻设** | ❌ rllm `transform_results_for_verl` 不做 |
+| verl `_update_actor:1252-1253` | defensively 再设 | ✅ W2.27 做了，但 update_actor 是 line 534 调，**在 compute_log_prob (line 418) 之后** |
+| megatron `forward_step:841` | `temperature = batch["temperature"]` **无 default fallback** | — |
+
+W2.27 在 update_actor bridge 内 set 了，但 **compute_log_prob 时还没设**，megatron forward_step 第一次进入就 KeyError。
+
+**修复（W2.28）**：在 `agent_sdk_trainer.py` 全局只设一次，紧贴 `batch.meta_info["global_token_num"]` 现有那一行后：
+
+```python
+# mirror verl fit:1394-1395
+_rollout_cfg = self.config.actor_rollout_ref.rollout
+batch.meta_info["temperature"] = _rollout_cfg.temperature
+batch.meta_info["multi_turn"] = (
+    _rollout_cfg.multi_turn.enable if hasattr(_rollout_cfg, "multi_turn") else False
+)
+```
+
+并删 W2.27 update_actor bridge 里那两行重复 set（全局已设，dead write）。
+
+**关于 multi_turn**：grep verl 内部代码无 reader（只在 ray_trainer.py:1251 set），但为对齐 verl pattern 一并设（防御未来上游加 reader）。
+
+**Audit 教训第 21 条**：**porting 多阶段 trainer 桥接代码时，要把上游 fit-loop 层的 metadata 注入也一起 port**，不仅是每个 bridge 方法内的 metadata。W2.27 只 mirror 了 3 个 bridge 方法，漏掉 verl fit 主循环的 temperature 全局 set —— 这种"在外层 set 一次、所有下游受益"的 pattern 容易在按方法 mirror 时被忽略。
+
+**Audit 反思（流程层）**：连续 W2.25/26/27/28 都是"verl 自家做了 rllm 没做"的同源 bug。每次只看 traceback 直接报错那个变量，看不到完整的"verl fit loop 还做了什么、rllm fit_agent 没做"的对比。**下次进 stage1 cleanup 时应做一次完整的 verl `fit` ↔ rllm `fit_agent` 全文 diff**，把 verl 在 fit 里所有 `batch.meta_info[...]` set / `batch.non_tensor_batch[...]` set / `batch.batch[...]` modify 的位置列清单，逐个检查 rllm 等价位置是否做。**stage2 TODO 加这条"做一次性 fit-loop diff 审计"**。
+
+W2.28 后预期挂点：进入 megatron forward 计算本身（如 mp / shape / dtype 问题），就是真算法层了。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2616,7 +2662,8 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.25 verl-fork shim #3 tu.pop（在 verl-fork 仓） | 0 | （rllm 仅 plan 更新；verl-fork `370e1148`） |
 | W2.26 verl-fork shim #4 入口 DataProto→TensorDict | 0 | （rllm 仅 plan 更新；verl-fork `7e30674e`，**W2.27 revert**） |
 | W2.27 rllm AgentSdkTrainer 补 3 处桥接 + revert W2.26 | 1 | rllm `dd229d51` + verl-fork `9998be02` |
-| 最新 | — | 本轮（rllm `dd229d51` + verl-fork `9998be02`） |
+| W2.28 rllm 全局补 `batch.meta_info["temperature"]`（megatron forward_step 必读） | 1 | rllm `5eb4224f` |
+| 最新 | — | rllm `5eb4224f` + verl-fork `9998be02` |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2688,8 +2735,9 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.25 verl-fork shim #3 `tu.pop` 缺失 key 守卫：前 5 层全闭环后挂在 verl 内部 `infer_batch → DataProto.pop(str)`，4 行修在 verl-fork 不动 rllm
 - ✓ W2.26 verl-fork shim #4 engine_workers 3 batch 方法入口 DataProto→TensorDict 转换：W2.25 后 `data.keys()` 又挂，根因同源（mid-migration），修方法入口 1 行/方法 × 3 方法，下游零改动 ⚠️ **被 W2.27 supersede**
 - ✓ W2.27 rllm 侧补 trainer 桥接（3 处 mirror verl `_compute_old_log_prob/_compute_ref_log_prob/_update_actor`）+ revert W2.26 verl-fork shim：side 修正
+- ✓ W2.28 rllm 全局补 `batch.meta_info["temperature"]` + `multi_turn`，mirror verl `fit:1395`。megatron `forward_step:841` 无 default 读 temperature 撞 KeyError。删 W2.27 update_actor bridge 里重复 set
 
-**当前位置**：W2.27 完成 —— rllm `AgentSdkTrainer` 3 处补桥接（mirror verl 自家），W2.26 verl-fork shim revert。架构上 side 选对，metadata 补全（`compute_loss=False` 等显式注入）。等待 L3 重跑。**已知未验证项**（β 范围）：(a) 逐字段 `no_padding_2_padding` 输出转换没做；(b) `update_actor` 没复刻 verl 的 `rename_dict + from_single_dict` 后处理 —— 跑挂再补。verl-fork compat 累计 3 处有效（agent_loop / workers / tu.pop；W2.26 已 revert）。
+**当前位置**：W2.28 完成 —— rllm batch.meta_info 全局补 `temperature` + `multi_turn`，mirror verl `fit:1395`。megatron `forward_step:841` 撞 KeyError 解决。L3 现在应该真进 megatron forward 计算。**已知未验证项**（β 范围）：(a) 逐字段 `no_padding_2_padding` 输出转换没做；(b) `update_actor` 没复刻 verl 的 `rename_dict + from_single_dict` 后处理；(c) 可能还有其他 verl `fit` loop 设过但 rllm `fit_agent` 没设的 metadata —— 跑挂再追。verl-fork compat 仍 3 处有效（agent_loop / workers / tu.pop）。
 
 **下一步（用户该做的）**：
 
