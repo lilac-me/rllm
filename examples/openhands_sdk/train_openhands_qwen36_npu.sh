@@ -8,7 +8,7 @@
 #   §0.2  verl-script-authoritative MoE / megatron flags
 #         (vanilla_mbridge, moe_aux_loss_coeff, moe_z_loss_coeff,
 #         moe_permute_fusion, moe_grouped_gemm)
-#   §5.2  max_model_len = 32k (stage1 baseline)
+#   §5.2  max_model_len = 49k (W2.21 L3 unblock; was 32k stage1 baseline)
 #   §13.7 Safe stage1 config:
 #         - router_replay disabled (no-op on AgentPPOTrainer path anyway,
 #           see §13.3; set explicitly for clarity)
@@ -266,7 +266,7 @@ echo "  OpenHands image : ${OPENHANDS_IMAGE}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
 echo "  Tool parser     : ${TOOL_PARSER}"
 echo "  Parallelism     : TP=2 PP=1 CP=1 EP=4 ETP=1 (single-node 8-NPU)"
-echo "  max_model_len   : 32768 (stage1 baseline; raise after W3 if needed)"
+echo "  max_model_len   : 49152 (W2.21 L3 unblock; up from 32k baseline)"
 echo "  router_replay   : disabled (see plan §13.3)"
 echo "  use_kl_loss     : False (rely on PPO clip; see plan §13.7)"
 
@@ -447,8 +447,11 @@ ARGS=(
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6
-  # plan §5.2: stage1 起步 32k。W3 监控 episode 长度 P95 接近 32k 再升 64k
-  actor_rollout_ref.rollout.max_model_len=32768
+  # plan §5.2: stage1 起步 32k → W2.21 L3 unblock 升 49152。第一次 LLM call 已经 30721 tokens
+  # (OpenHands system prompt + tools + AGENTS.md heavy)，加 2048 output = 32769 越界 1 tok。
+  # 49152 给 prompt + 后续 turn 留 16k buffer；Qwen3.5/3.6 native 支持 256K，模型侧无压力。
+  # W3 还不够就升 65536。NPU KV cache 多吃一点但 batch=1 dry-step 扛得住。
+  actor_rollout_ref.rollout.max_model_len=49152
   actor_rollout_ref.rollout.max_num_seqs=4
   actor_rollout_ref.rollout.max_num_batched_tokens=8192
   actor_rollout_ref.rollout.n=${ROLLOUT_N}

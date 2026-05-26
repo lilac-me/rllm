@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.20 — W2.20 DooD workspace path alignment：L3 首跑容器空 workspace 退出，根因 `workspace_temp` 在 main container overlay 上、宿主 dockerd 看不见。修：hardcode `/home/docker/openhands_workspace` + 训练脚本加 fail-fast precheck + 用户加同路径 bind mount。新增 §13.23 + audit 教训第 12 条)
+> 修订时间：2026-05-26 (v2.21 — W2.21 L3 第一轮 LLM call context off-by-one：`30721 prompt + 2048 output = 32769 > max_model_len 32768`，越界 1 token。修：max_model_len 32768 → 49152。新增 §13.24 + audit 教训第 13 条。前置 v2.20 W2.20 DooD workspace path alignment。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -890,6 +890,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.21 | **L3 第一轮 LLM call context off-by-one（W2.21）**：W2.20 DooD fix 通过后容器跑 120 秒到 vllm tokenize 阶段，`30721 prompt + 2048 output = 32769 > max_model_len 32768`，越界 1 token。根因：OpenHands 默认 system prompt + tools + AGENTS.md 第一轮就 30k tokens（Qwen3-coder agent 重 prompt 通病，结构性解法在 OpenHands condenser，stage1 不碰）。修：[train_openhands_qwen36_npu.sh:451](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:451) `max_model_len` 32768 → 49152，给 16k buffer。不动 OpenHands max_tokens（影响生成质量）也不动 data.max_prompt_length（那是 training dataloader 过滤阈值，不限制 runtime LLM call）。Qwen3.5/3.6 native 支持 256K，49k 完全在模型能力内；NPU KV cache 多吃 50% 但 batch=1 dry-step 扛得住。W4 plan §4.5 预排的 64k 升级保留给后续"P95 接近 40k"触发。新增 §13.24 + audit 教训第 13 条：分层 mock 设计漏了"真业务 context budget"约束，下次 L2a mock_llm_server 加边界 case。|
 | 2026-05-26 | v2.20 | **L3 首跑 DooD workspace path alignment（W2.20）**：4 个 OpenHands 容器在 ~3s 内全 exit，reward=0.0，trace store 空 → pad_sequence empty list（与 L2b 同症状但根因不同）。根因：rllm 主进程跑在一个 main container 内，`workspace_temp` 写在 main container overlay 上；`openhands_agent` 用 `-v {workspace}:/opt/workspace` 起子容器，**这条 `-v` 由宿主 dockerd 解析**，看不到 main container 内的路径 → 宿主新建空目录挂到子容器 → entrypoint.py 不存在 exit 127。修复（用户决策：不引入新 env，stage1 env 已过多 + 不污染 /tmp）：(1) `openhands_agent.py:225` workspace_temp **hardcode** `/home/docker/openhands_workspace`（NPU 节点 docker user home，持久路径稳定）+ 长注释说明 DooD 约束；(2) 训练脚本顶部加 **fail-fast precheck**：`workspace_temp` + `artifact_dir` dir 不存在/不可写直接 `exit 1` 并提示 bind mount 修复指令；soft warn 不是 bind mount（用 findmnt 检测，不阻塞，因为 findmnt 不一定每个 image 都装）；(3) 用户运维侧 main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`。新增 §13.23 + audit 教训第 12 条：DooD 下任何 `-v <src>:<dst>` 的 `<src>` 必须宿主可见（在宿主 shell `ls <src>` 能看到内容才合法）。**Stage 2 演化路线**：用户决策不烤 skills 进 image（迭代成本高），多机时走 OBS 拉取（首选，Ascend 集群默认有）/ NFS / 自有 HTTP 服务（最重，非必要不引入）。stage 2 进 §9 下一阶段 TODO 跟踪。|
 
 ---
@@ -2139,6 +2140,44 @@ skills 快速迭代场景下，stage 2 不走"workspace 烤进 image"（迭代�
 | 多机共享 NFS | 节点已有共享 fs | 路径直挂，跨节点透明 |
 
 stage 1（W2.20）= 同路径 bind mount，工时 < 30 分钟。stage 2 真正切多机时再选 OBS 或 NFS，进 §9 下一阶段 TODO 跟踪。
+
+### 13.24 L3 第一轮 LLM call context off-by-one：32k → 49152（W2.21）
+
+**症状**：W2.20 DooD fix 通过后，L3 第一个 rollout 容器跑 120 秒（vs 之前 3 秒），但**vllm 端 tokenize 阶段抛 `VLLMValidationError`**：
+
+```
+This model's maximum context length is 32768 tokens. However, you requested
+2048 output tokens and your prompt contains at least 30721 input tokens,
+for a total of at least 32769 tokens.
+```
+
+`30721 + 2048 = 32769 > 32768`，**差 1 个 token 越界**。
+
+**根因**：OpenHands 默认 system prompt + 全部 tools 定义（terminal/file_editor/bash 等）+ `agent_workdir/AGENTS.md` + `INSTRUCTIONS.md`，第一轮 LLM call 就 30k tokens。Qwen3-coder agent 框架历史性的"重 system prompt"问题，不是 stage1 该结构性解决的（结构性解法在 OpenHands condenser / prompt compaction，下放到 W3/W4）。
+
+**结构性观察**：30k 只是**第一轮**就吃掉的，多 turn 会随对话历史线性增长。L3 dry-step 只跑 1 iter 所以单次 unblock 够用；W3 长跑必须有 compaction 机制或更大 context。
+
+**修复（W2.21，一行）**：[train_openhands_qwen36_npu.sh:451](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:451) `max_model_len` 32768 → **49152**。
+
+| 数 | 含义 |
+|---|---|
+| 49152 | new max_model_len（48k） |
+| 30721 | first-turn observed prompt |
+| 2048 | OpenHands LLM client 默认 output budget |
+| 49152 − 30721 − 2048 = **16383** | 给 prompt 后续增长 + output 留的 buffer |
+
+**为什么不一步升到 65536**：
+- 49152 在 NPU KV cache 上比 32k 多 50% 占用，65536 多 100%，dry-step 都扛得住但 49k 更保守；
+- W4 plan §4.5 已预排 64k 升级，留给后续以"实测 P95 接近 max_model_len"为触发条件升；
+- 49152 在 W2.21 是为了精准解决"30k+2k 越界 1"的 issue，不是为了 W3+ 长跑做容量规划。
+
+**为什么不动 OpenHands `max_tokens=2048`**：那是 OpenHands LLM client 默认，改了影响生成质量（容器内 output 被截断），权衡不如直接拉 context。
+
+**为什么不动 `data.max_prompt_length=8192`**：这是**训练数据 dataloader 阶段的过滤阈值**，不限制 OpenHands runtime LLM call。对 L3 不相关。
+
+**Audit 教训第 13 条**：分层 mock 设计时（plan §13.10）覆盖了"trainer 链路"和"OpenHands docker 链路"两条主轴，但**漏了"真业务 context budget"这条隐式约束**。下一次设计 mock 时，给 L2a mock_llm_server 加一条"返回 prompt token count > model max_model_len 的边界 case"，提前在 L2a 暴露这类越界，不让它溜到 L3。
+
+stage1 此后默认 `max_model_len=49152`。W3 监控 episode 长度 P95，超 40k 再考虑 65536。
 
 ---
 
