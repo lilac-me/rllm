@@ -2190,8 +2190,8 @@ stage1 此后默认 `max_model_len=49152`。W3 监控 episode 长度 P95，超 4
 **目标**：Qwen3.6-35B-A3B × OpenHands × Ascend NPU 跑 agentic RL（算子生成 agent）。
 **基础设施**：rllm（agent RL framework）跑在 verl-BryanChen408 fork（Ascend 适配的 verl）+ Megatron-Bridge + vllm-ascend + Megatron-LM。
 **项目阶段**：W1 全完成（cherry-pick + 适配），W2 进行中（stage1 训练 bring-up）。
-**当前位置**：L2b mock 路径已验完 setup chain（vllm/Megatron/HCCL/proxy/step 进入全 OK），准备进 **L3 真 OpenHands docker rollout**。
-**已知 limitation**：L2b 的 mock_rollout 不调 LLM，trace store 空，PPO step 验不到（plan §13.22）；L3 真 rollout 自然修复。
+**当前位置**：L3 真 rollout 已通过 vllm tokenize 阶段（W2.20 DooD path fix + W2.21 max_model_len 32k→49152），首个容器跑了 120s 真调 LLM。仍在迭代后续挂点（NPU OOM / tool call schema / PPO step 等）。
+**已知开放项**：OpenHands 第一轮 prompt 就 30k tokens（heavy system prompt），W2.21 通过 max_model_len 升 49152 给 16k buffer 让 L3 dry-step 过，但**长跑结构性解法在 OpenHands condenser**，下放 W3/W4。
 
 ### 14.2 Git refs cheatsheet
 
@@ -2213,8 +2213,11 @@ push 到:  origin/qwen36-openhands-stage1
 | W2 stage1 训练脚本 | 1 | `5082c854` |
 | W2 分层测试 | 1 | `b07a55d7` |
 | W2 vllm/megatron/HCCL/script 修复（W2.9-W2.18） | 9 | 见 `git log` |
-| 用户人工调整（路径） | 3 | `07d98394` `4dfb7dc9` `6b1f522e` |
-| 最新 | — | `8dc3ecc9` (plan §13.22 + L3 prep) |
+| 用户人工调整（路径） | 多 | `feb85471` `fdb8e236` 及之后人工 rebase |
+| W2.20 DooD workspace path alignment | 1 | `bedbb1b0` (hardcode `/home/docker/openhands_workspace` + fail-fast precheck) |
+| W2.20 precheck 放宽（findmnt -T） | 1 | `15686e0e` |
+| W2.21 max_model_len 32k→49152 unblock L3 | 1 | `e5e6c9ce` |
+| 最新 | — | `e5e6c9ce` (plan §13.24 + W2.21) |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2275,40 +2278,42 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.8-W2.18 持续修复 setup 链路（HCCL/Megatron-Bridge/vllm/mock_rollout）
 - ✓ W2.19 跳 L2b 决策（mock 天然边界，setup 已验完）
 - ✓ L1/L2a/L2b（部分） — 全部走过 setup chain
+- ✓ W2.20 DooD workspace path alignment（hardcode `/home/docker/openhands_workspace` + fail-fast precheck + findmnt -T）
+- ✓ W2.21 max_model_len 32k→49152 解决 OpenHands 30k 重 prompt 首轮越界 1 token
 
-**当前位置**：等用户在 NPU 上跑 L3。
+**当前位置**：L3 setup chain 已通到 vllm tokenize（容器 120s 真调 LLM），等待 W2.21 fix 后的 L3 重跑结果。
 
 **下一步（用户该做的）**：
 
 ```bash
-# 本地 push（如未做）
+# 本地 push
 git -C /Users/yeji/Documents/Code/Python/Qwen36/rllm push origin qwen36-openhands-stage1
-git -C /Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408 push origin qwen36-rllm-compat
+# verl-fork 上次 push 之后没动，HEAD 仍是 85159408
 
-# NPU 节点拉新
-cd /workspace/rllm-071 && git pull   # 到 8dc3ecc9
-cd /workspace/pri/verl && git pull    # 到 85159408
+# NPU 节点拉新（main container 内）
+cd /workspace/rllm-071 && git pull   # 到 e5e6c9ce
 
-# L3 前置 4 项检查（plan §13.22）
-docker info | head -5
-docker images | grep openhands-triton-env
-docker run --rm --network host openhands-triton-env:v1 \
-    curl -fsS http://localhost:5000/health
-mkdir -p /workspace/results/openhands_results && \
-    touch /workspace/results/openhands_results/test && rm $_
+# 宿主侧（main container 之外）确认 bind mount + 目录都 OK
+mkdir -p /home/docker/openhands_workspace
+# main container 启动命令需带：-v /home/docker/openhands_workspace:/home/docker/openhands_workspace
+# （或挂父目录 -v /home/docker:/home/docker）
 
-# 跑 L3
+# 跑 L3（脚本顶部 precheck 会先验 bind mount 状态）
 cd /workspace/rllm-071
 bash examples/openhands_sdk/stage1_test_layered.sh L3
-# = STAGE1_DRY_STEPS=1 bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 ```
 
-**预期 L3 挂点**（按风险递减，plan §13.22 末段）：
-1. docker image 不存在 / build 失败
-2. 容器内调 LiteLLM proxy 不通（`host.docker.internal` vs `--network host`）
-3. OpenHands 容器内 entrypoint 异常 exit
-4. 第一次 LLM 调用慢 timeout
-5. **PPO step 真挂**（如果走到这里，意味着 W2.8-W2.18 全成功，可以庆祝）
+**W2.21 后预期 L3 挂点**（按风险递减）：
+1. NPU KV cache OOM（49k context 比 32k 多 ~50% 显存；`gpu_memory_utilization=0.6` 应该够，挂的话日志在 `/tmp/ray/session_latest/logs/worker-*.err`）
+2. tool call schema 在 30k 长 prompt 下解析错乱（Qwen3-coder parser 边界）
+3. OpenHands 容器内 entrypoint 业务异常（reward 计算 / eval 脚本挂）
+4. **PPO step 真挂**（最值得期待 — 意味着 setup chain 全通了）
+
+**已解除的挂点**（W2.20/W2.21 修过，不该再出现）：
+- ~~docker image 不存在 / build 失败~~（用户已 build 过 + 用过）
+- ~~容器内调 LiteLLM proxy 不通~~（W2.20 DooD 修了路径，proxy 端 host.docker.internal + `--add-host host-gateway` 已生效）
+- ~~OpenHands 容器内 entrypoint.py 不存在~~（W2.20 修了 workspace_temp）
+- ~~vllm context length 越界~~（W2.21 升 49152）
 
 ### 14.6 已知 limitations / 历史踩坑（避免重复踩）
 
@@ -2346,9 +2351,16 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 **DooD volume path alignment**（plan §13.23，audit 教训第 12 条）：
 - rllm 主进程跑在 main container 内，`openhands_agent` 用 docker SDK 起子容器；`-v <src>:<dst>` 的 `<src>` **由宿主 dockerd 解析**，不是 main container 视角
 - 任何要给子容器看的目录（典型：`workspace_temp/`）必须落在 main container 和宿主**同路径 bind mount** 的位置
-- 当前 hardcode `/home/docker/openhands_workspace`（[openhands_agent.py:225](rllm/examples/openhands_sdk/openhands_agent.py:225)），main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
-- 训练脚本顶部已有 fail-fast precheck，dir 不存在/不可写直接退出；soft warn 不是 bind mount（findmnt 检测）
+- 当前 hardcode `/home/docker/openhands_workspace`（[openhands_agent.py:225](rllm/examples/openhands_sdk/openhands_agent.py:225)），main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`（或挂父目录 `-v /home/docker:/home/docker`）
+- 训练脚本顶部 fail-fast precheck（[train_openhands_qwen36_npu.sh:163+](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:163)）：dir 不存在/不可写直接 `exit 1`；soft warn 不是 bind mount（用 `findmnt -T` 走 mount tree，能识别父目录 bind mount）
 - 排错：在**宿主 shell**（不是 main container 内）`ls /home/docker/openhands_workspace/`，能看到 `trajectory-*` 子目录才合法
+
+**OpenHands 重 system prompt → 长 context 压力**（plan §13.24，audit 教训第 13 条）：
+- Qwen3-coder agent setup 第一轮 LLM call 就 30k tokens（system prompt + 全部 tools 定义 + AGENTS.md + INSTRUCTIONS.md），不是 bug，是 OpenHands × Qwen3-coder 的常态
+- W2.21 把 `max_model_len` 升到 49152 给 16k buffer 解决 dry-step 越界 1 token，但多 turn 长跑会线性增长，**49k 不是长跑容量**
+- 结构性解法在 OpenHands `Condenser`（LLMSummarizing / Recent / NoOp 几种），或精简 system prompt / 减 tools，**stage1 不动**
+- W3 长跑前必须监控 episode 长度 P95：超 40k 升 65536，超 60k 必须上 condenser
+- L2a `mock_llm_server` 当前没模拟"prompt > max_model_len 的边界"，下一轮 mock 设计要补
 
 **Stage1 安全训练 config**（plan §13.7）：
 - `router_replay=disabled`（stage1 AgentPPOTrainer 路径上 19983fe4 入口不生效，§13.3）
