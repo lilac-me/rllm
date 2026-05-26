@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.29 — W2.29 `use_remove_padding=True→False`：GDN linear attention 不支持 packed seq (MindSpeed `gated_delta_net.py:292`)，verl `data_format="thd"` (use_remove_padding=True) → preprocess_packed_seqs → packed_seq_params != None → GDN raise。完整 5 层源码验证。完全对齐 plan §0.1 早期警告。新增 §13.32 + audit 教训第 22 条。前置 v2.28 temperature, v2.27 trainer 桥接, v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.30 — W2.30 W2.27 bridge β-deferred 输出后处理：worker 输出 nested tensor 经 `from_tensordict` 一刀切流入 batch，下游 `select_idxs(tensor[idxs])` 撞 nested tensor `NotImplementedError`。修：3 个 bridge 补 verl 自家 `no_padding_2_padding` + key rename + from_single_dict 输出后处理。新增 §13.33 + audit 教训第 23 条。stage2 TODO follow-up #1 ✅。前置 v2.29-v2.20 全链。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -708,10 +708,10 @@ stage1 不做、留到 stage2+ 处理的功能项：
 - **legacy example 标 deprecated**：14 个 example 入口具体到 PR/commit 动作
 - **GDN bshd 模式下 multi-turn merge / response_mask 的可视化验收**（当 §0.1 实测决定走 `use_remove_padding=False` 时）
 - ✅ ~~**rllm `AgentSdkTrainer` 同步 verl `_compute_old_log_prob` 的 3 步桥接**~~ — **已 W2.27 完成**（rllm `dd229d51` + verl-fork revert `9998be02`，见 §13.30）。
-  - **W2.27 (β) 未做的 stage2 follow-up**（要等 L3 跑出真问题再决定优先级）：
-    - **逐字段 `no_padding_2_padding` 输出转换**：verl 自家 `_compute_old_log_prob:1235-1238` 对 log_probs / entropy / sum_pi_squared 各自做 `no_padding_2_padding(field, batch_td)` 还原 padded shape；W2.27 用 `DataProto.from_tensordict` 整体转，**未做逐字段重塑**。若 rllm 下游 `old_log_prob.batch["entropys"]` 期望 padded shape 但拿到 no-padding shape，跑挂时回头补
-    - **`update_actor` 输出 `rename_dict + from_single_dict` 重包**：verl 自家 `_update_actor:1283-1287` 做完整 metric 重命名 + 重包，W2.27 用 `DataProto.from_tensordict` 整体转。若 rllm `actor_output.meta_info["metrics"]` 读取格式不对，跑挂时回头补
-    - **routed_experts / teacher_logprobs 处理**：verl 自家 `_compute_old_log_prob:1230` 拿 `routed_experts`，stage1 不开 distillation 用不到，跳过
+  - **W2.27 (β) 未做的 stage2 follow-up**：
+    - ✅ ~~**逐字段 `no_padding_2_padding` 输出转换**~~ — **W2.30 完成**（commit `c4efcc07`，见 §13.33）
+    - ✅ ~~**`update_actor` 输出 `rename_dict + from_single_dict` 重包**~~ — **W2.30 完成**（同上）
+    - **routed_experts / teacher_logprobs 处理**：verl 自家 `_compute_old_log_prob:1230` 拿 `routed_experts`，stage1 不开 distillation 用不到，跳过（如 W3 开 MoE expert load balancing 监控，再补）
 - **🟡 修 `agent_sdk_engine.py:624` 硬编码 `max_prompt_length = 16384`**（plan §13.26 / W2.23 follow-up，用户决策推迟）：
   - **问题**：W2.23 `data.max_prompt_length=32768` 让 step 过滤通过，但 [agent_sdk_engine.py:624](rllm/engine/agent_sdk_engine.py:624) line 622 读 config 后 line 624 立刻硬编码覆盖 `max_prompt_length = 16384`，导致实际 PPO 只拿 16K tokens，30K - 16K = 14K 浪费。`[DEBUG format]` 打印 line 623 暴露是别人调试残留
   - **stage1 不修的理由**（用户决策 2026-05-26）：stage1 走 random reward fallback，训练信号本来就 mock，扔 14K tokens 不影响"验证 trainer 链路"目标；且当前 line 624 截到 16k 反而保护 NPU KV cache 不被 30k 拖爆。W3 真训练前必须解决
@@ -923,6 +923,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.30 | **W2.30 W2.27 bridge β-deferred 输出后处理**。W2.29 修 GDN 后 L3 推进到 advantage 阶段，挂在 `_remove_padding → batch.select_idxs → tensor[idxs_torch]` 对 nested tensor `NotImplementedError(aten.index.Tensor)`。源码验证完整 6 层因果链。这是 plan §13.30 W2.27 末段明确预测过的 β-deferred 挂点。修：3 个 bridge 都补 mirror verl 自家 `_compute_old_log_prob:1227-1246` / `_compute_ref_log_prob:1203-1208` / `_update_actor:1283-1287` 的输出后处理（extract 字段 + no_padding_2_padding + rename keys / from_single_dict）。Key rename 关键：worker 出 `log_probs`/`entropy` (singular)，rllm 读 `entropys` (plural)。新增 §13.33 + audit 教训第 23 条（包装 worker bridge 时 input prep 和 output post-processing 不可分割）。stage2 TODO 的 β-deferred follow-up #1 标 ✅。|
 | 2026-05-26 | v2.29 | **W2.29 use_remove_padding True→False：GDN 不支持 packed seq**。源码验证完整因果链（5 层：train script → engine config → data_format → preprocess_packed_seqs → Qwen3-VL → MindSpeed GDN raise）。**完全对齐 plan §0.1 早期警告**。修：train script 2 处 `True → False`，对齐 verl NPU 脚本默认。W2.27 bridge `left_right_2_no_padding` 不动（源码验证 verl 自家 `_compute_old_log_prob` 无条件调它，与 use_remove_padding=False 配合工作）。新增 §13.32 + audit 教训第 22 条（"plan §0.1 软约束应在 L3 第一次失败时强制全部重审"，stage2 TODO 加"§0.1/§0.2 软约束状态回填"工作）。|
 | 2026-05-26 | v2.28 | **W2.28 W2.27 extension：rllm batch.meta_info 漏 `temperature` 字段**。L3 推进到 megatron `transformer_impl.py:841 forward_step` 报 `KeyError: temperature`。源码验证：verl 在 `fit:1394-1395` 每 ppo iter batch 构造后立刻 set，rllm `transform_results_for_verl` 路径不走 fit batch 构造 → 没 set。W2.27 update_actor bridge 内 set 了但太晚（line 534 vs compute_log_prob line 418）。修：在 rllm `agent_sdk_trainer.py` 紧贴 `batch.meta_info["global_token_num"]` 现有行后全局只设一次 `temperature` + `multi_turn`，删 W2.27 update_actor bridge 里的重复 set。新增 §13.31 + audit 教训第 21 条（port 多阶段 trainer 桥接时要 port 上游 fit-loop 层 metadata 注入，不仅是 bridge 方法内的）+ stage2 TODO 加"完整 verl fit ↔ rllm fit_agent diff 审计"避免类似漏洞。|
 | 2026-05-26 | v2.27 | **W2.27 supersede W2.26：rllm 侧补 trainer 桥接 + revert W2.26 worker-entry shim**。用户两轮追问推动重审：第一次"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 mid-#2733 加的 3 步桥接）；第二次"逐 commit 评估"催出全面 audit。结论 W2.26 是唯一"side 选错"的 commit。修：(1) rllm `agent_sdk_trainer.py` 3 处（compute_log_prob/compute_ref_log_prob/update_actor）补 5 步桥接（to_tensordict + left_right_2_no_padding + tu.assign_non_tensor + 调 worker + DataProto.from_tensordict），mirror verl `RayPPOTrainer._compute_old_log_prob/_compute_ref_log_prob/_update_actor`；(2) revert verl-fork `7e30674e`。Stage2 TODO 加 follow-up：逐字段 no_padding_2_padding 输出转换（W2.27 用 from_tensordict 整体转，未验证下游 `.batch["entropys"]` shape 期望）。新增 §13.30 + audit 教训第 19 + 20 条。W2.28 候选：W2.8 worker re-export shim 也可移到 rllm 侧（4 个 import 更新），不紧急。|
@@ -2658,6 +2659,62 @@ NotImplementedError: GDN does not support packed sequence for now.
 
 W2.29 后预期挂点：真进 megatron 内部数值层（shape/mp/dtype），剩下要不就是 stage1 setup 闭环成功。
 
+### 13.33 W2.27 bridge β-deferred 输出后处理（W2.30）
+
+**症状**：W2.29 修 GDN 后 L3 推进到 advantage 计算阶段，挂在：
+
+```
+File "rllm/trainer/verl/agent_sdk_trainer.py:533, in fit_agent
+    batch = self._remove_padding(batch)
+File "rllm/trainer/verl/agent_sdk_trainer.py:890, in _remove_padding
+    batch = batch.select_idxs(non_pad_step_indices)
+File "verl/protocol.py:662, in select_idxs
+    source={key: tensor[idxs_torch] for ...}
+NotImplementedError: aten.index.Tensor
+```
+
+**源码验证完整因果链**：
+
+| 阶段 | 代码 | 行为 |
+|---|---|---|
+| W2.27 bridge step 2 | `left_right_2_no_padding(batch_td)` | `input_ids` / `position_ids` 变 nested tensor |
+| W2.27 bridge step 4 | `compute_log_prob(batch_td)` | worker 用 nested 输入算 log_probs, entropy |
+| W2.27 bridge step 5 | `DataProto.from_tensordict(old_log_prob_td)` 一刀切 | 保留 nested tensor 在 DataProto.batch |
+| rllm line 458 | `batch = batch.union(old_log_prob)` | nested tensor 进入 batch |
+| rllm line 533 / 890 | `batch.select_idxs(non_pad_step_indices)` → `tensor[idxs_torch]` | 对 nested tensor index |
+| torch nested_tensor.py:359 | `raise NotImplementedError(func)` | `aten.index.Tensor` 没 dispatch |
+
+**这是 plan §13.30 W2.27 末段"β-deferred follow-up #1"明确预测过的挂点**（"逐字段 `no_padding_2_padding` 输出转换没做 ... 若 rllm 下游 `old_log_prob.batch["entropys"]` 期望 padded shape 但拿到 no-padding shape，跑挂时回头补"）—— **现在补**。
+
+**修复（W2.30）**：照搬 verl `_compute_old_log_prob:1227-1246` / `_compute_ref_log_prob:1203-1208` / `_update_actor:1283-1287` 的输出后处理。
+
+```python
+# verl _compute_old_log_prob:1227-1246 mirror
+_entropy = tu.get(old_log_prob_td, "entropy")
+_log_probs = tu.get(old_log_prob_td, "log_probs")
+_entropy = no_padding_2_padding(_entropy, batch_td)       # nested → padded
+_log_probs = no_padding_2_padding(_log_probs, batch_td)
+_result = {"old_log_probs": _log_probs.float(), "entropys": _entropy.float()}  # rename！
+old_log_prob = DataProto.from_tensordict(tu.get_tensordict(_result))
+```
+
+**Key rename 关键**（grep 验证）：
+- worker 输出 `log_probs` / `entropy` (singular)
+- rllm `agent_sdk_trainer.py:454` 读 `old_log_prob.batch["entropys"]` (plural)
+- 必须 rename，否则下游 KeyError
+
+三个 bridge 都补了：
+
+| bridge | extract | no_padding_2_padding | rename / wrap |
+|---|---|---|---|
+| compute_log_prob | `entropy`, `log_probs` | 两个 tensor | → `old_log_probs`, `entropys` |
+| compute_ref_log_prob | `log_probs` | 一个 tensor | → `ref_log_prob` |
+| update_actor | `metrics` (NonTensorData) | n/a | `rename_dict("actor/")` + `perf/mfu/actor` key swap + `from_single_dict(data={}, meta_info={"metrics": ...})` |
+
+**Audit 教训第 23 条**：**包装 verl worker call 的 bridge，必须 mirror verl 自家的输入 prep + 输出 post-processing 两端**。W2.27 只 mirror 了输入 prep（to_tensordict + left_right_2_no_padding + assign_non_tensor），输出端图省事用了 `from_tensordict` 一刀切，留下 nested tensor 污染 batch 的隐 bug。预测有此问题（β-deferred），但没立刻补。下次 mirror 任何 worker bridge：**input prep + output post-processing 是一对，不可分割**，宁可一次性多写 20 行也别留 deferred 项。
+
+stage2 TODO 的 "W2.27 β-deferred follow-up #1" 已 ✅ done（本次 W2.30）。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2706,7 +2763,8 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.27 rllm AgentSdkTrainer 补 3 处桥接 + revert W2.26 | 1 | rllm `dd229d51` + verl-fork `9998be02` |
 | W2.28 rllm 全局补 `batch.meta_info["temperature"]`（megatron forward_step 必读） | 1 | rllm `5eb4224f` |
 | W2.29 train script `use_remove_padding=False` (GDN 不支持 packed) | 1 | rllm `81cb31f0` |
-| 最新 | — | rllm `81cb31f0` + verl-fork `9998be02` |
+| W2.30 W2.27 bridge 补输出后处理（no_padding_2_padding + key rename + from_single_dict） | 1 | rllm `c4efcc07` |
+| 最新 | — | rllm `c4efcc07` + verl-fork `9998be02` |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2780,8 +2838,9 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.27 rllm 侧补 trainer 桥接（3 处 mirror verl `_compute_old_log_prob/_compute_ref_log_prob/_update_actor`）+ revert W2.26 verl-fork shim：side 修正
 - ✓ W2.28 rllm 全局补 `batch.meta_info["temperature"]` + `multi_turn`，mirror verl `fit:1395`。megatron `forward_step:841` 无 default 读 temperature 撞 KeyError。删 W2.27 update_actor bridge 里重复 set
 - ✓ W2.29 `use_remove_padding` True→False：GDN packed seq 不支持 (MindSpeed `gated_delta_net.py:292`)。完整 5 层源码验证因果链，对齐 plan §0.1 早期警告 + verl NPU 脚本默认
+- ✓ W2.30 W2.27 bridge β-deferred 输出后处理：worker 输出 nested tensor 经 from_tensordict 留在 batch，select_idxs 撞 `NotImplementedError(aten.index.Tensor)`。3 bridge 补 no_padding_2_padding + key rename + from_single_dict
 
-**当前位置**：W2.29 完成 —— `use_remove_padding=True→False` 修 GDN packed seq 不支持问题。L3 现在应该走 bshd 路径，Qwen3-VL → GDN 不再撞 packed_seq_params is not None。**已知未验证项**：(a) bshd 路径上 rllm 下游 `old_log_prob.batch["entropys"]` shape 是否对；(b) `update_actor` 输出格式；(c) 可能还有 verl fit loop 漏 port 的 metadata（W2.28 audit 教训 #21 reminder）；(d) Megatron 内部 mp/shape/dtype。verl-fork compat 仍 3 处有效。
+**当前位置**：W2.30 完成 —— W2.27 bridge 输出端补 mirror verl 自家逐字段 `no_padding_2_padding` + key rename + from_single_dict 后处理。3 个 bridge（compute_log_prob/compute_ref_log_prob/update_actor）全部对齐 verl 自家行为。**β-deferred 全部完结**。**剩余未验证项**：(a) 还可能有 verl fit loop 漏 port 的 metadata（W2.28 audit #21）；(b) Megatron 内部 mp/shape/dtype；(c) NPU KV cache OOM。verl-fork compat 仍 3 处有效。
 
 **下一步（用户该做的）**：
 
