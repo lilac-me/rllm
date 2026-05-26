@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.17 — mock_rollout 返回 float 对齐真 rollout (docstring 误导)；L2b setup 链路全通；新增 §13.21)
+> 修订时间：2026-05-26 (v2.18 — L2b 跑到 mock 天然边界，setup 验证全过，跳 L3；新增 §13.22)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -888,6 +888,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.15 | **W2.15 修 HCCL 后 vllm worker 启动 exit 2（W2.16）**。继续应用 verl-self-OK 诊断原则：审 verl vllm_async_server.py:237 写死 compilation_config.setdefault cudagraph_mode=FULL_AND_PIECEWISE，无论 user 怎么配 cudagraph 默认开。verl 自己脚本不设 enforce_eager（yaml 默认 false），cudagraph 真生效跑通。我们 obs 历史脚本 enforce_eager=True # TODO 与 cudagraph 矛盾，vllm-ascend worker init 时挂。改成 env 可控默认 False，ROLLOUT_ENFORCE_EAGER=True 可 opt-out。Audit 教训第 8 条：下游覆盖上游默认时要看上游 setdefault 隐式 fill。同时让用户去 /tmp/ray/session_latest/logs/worker-*.err 拿 vllm 真 stderr 验证。|
 | 2026-05-25 | v2.16 | **W2.16 改 enforce_eager 后 vllm worker 仍 exit 2（W2.17）**。拿 ray log 看到真实 vllm error: `unrecognized arguments: --swap-space 0`。obs 历史脚本通过 `engine_kwargs.vllm.<key>=...` 给 vllm CLI 加了 3 个参数（swap_space / cpu_offload_gb / enable_prefix_caching），vllm-ascend 不识别（vllm fork lag）。verl 自己脚本不设这三个，靠 vllm 默认。注释 3 行，保留 tool_call 必需的 2 行。Audit 教训第 9 条：vllm-ascend 是 vllm fork，CLI 参数有 lag；删到只剩业务必需的。**连续 W2.15/W2.16/W2.17 都是同模式**：obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过；剩余可疑 obs env/config 暂不动，待 L2b 跑过再清理。|
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
+| 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 
 ---
 
@@ -1991,3 +1992,83 @@ L2b 设计目的（exercise rllm trainer step / Megatron / PPO 框架，不验�
 - Step 1 start
 
 也就是 W2.8/W2.9/W2.13/W2.14/W2.15/W2.16/W2.17 一连串修复**全部生效**，rllm × verl × vllm-ascend × Megatron-Bridge × NPU 链路 setup 阶段已通。剩下是 trainer 内部 mock 数据流（W2.18）+ PPO step 框架。
+
+### 13.22 L2b mock 路径天然边界 + 跳 L3 决策（W2.19）
+
+**W2.18 修 mock_rollout 返回 float 后，L2b 走得更远**：
+
+```
+Generating trajectories: 100% 4/4
+[xxx:0:1] Rollout completed with reward: 0.5
+[xxx:1:1] Rollout completed with reward: 0.5
+[xxx:2:1] Rollout completed with reward: 0.5
+[xxx:3:1] Rollout completed with reward: 0.5
+INFO: POST /admin/flush-tracer 200 OK
+Episode xxx:0:1 has no valid trajectories, dropping it from the batch
+Episode xxx:1:1 has no valid trajectories, dropping it from the batch
+Episode xxx:2:1 has no valid trajectories, dropping it from the batch
+Episode xxx:3:1 has no valid trajectories, dropping it from the batch
+RuntimeError: received an empty list of sequences
+  at agent_sdk_engine.py:614 pad_sequence(prompts)
+```
+
+**根因 — L2b mock 路径的天然边界**：
+
+`AgentSdkEngine.transform_results_for_verl` 从 trace store（LiteLLM proxy 录的 SQLite）拿真 LLM 调用记录，build `prompt_ids / completion_ids / logprobs` 喂给 PPO。**mock_rollout 只返回 reward 标量，不调 LLM**，trace store 是空的 → 4 个 episode 全 drop → batch 空 → `pad_sequence(empty_list)` 挂。
+
+PPO step 需要真 token data，mock 标量 reward 不够。要让 L2b 真跑通 PPO step，必须 mock_rollout 真调一次 LLM（哪怕通过 mock_llm_server）—— 那就和 L3 差不多了。
+
+**用户决策（2026-05-26）**：跳过 L2b 直接进 L3。L2b setup 验证使命已完成。
+
+**L2b 已验证的（W2.8-W2.18 累积成果）**：
+
+| 子系统 | 状态 |
+|---|---|
+| rllm import 链 + verl-fork shim | ✓ |
+| Megatron-Bridge PYTHONPATH | ✓ |
+| HCCL broadcast | ✓ |
+| Megatron-Bridge load Qwen3.6 | ✓ (Qwen35VLMoEBridge 转换 5916/5916) |
+| vllm-ascend Qwen3.6 server + cudagraph capture | ✓ |
+| LiteLLM proxy 启动 + admin/reload | ✓ |
+| AgentSdkTrainer.init_workers | ✓ |
+| epoch 0 step 1 进入 | ✓ |
+| rollout 函数调用（mock × 4） | ✓ (reward 0.5 × 4) |
+| AgentSdkEngine.process_task_with_retry | ✓ (W2.18 后) |
+
+**L2b 未验的（mock 天然不能验）**：
+
+| 子系统 | 状态 |
+|---|---|
+| 真 LLM 调用 + trace store filling | ❌ mock 跳过 |
+| PPO batch 构造 | ❌ 上一项依赖 |
+| actor.compute_log_prob | ❌ 同 |
+| PPO loss / backward / optimizer.step | ❌ 同 |
+| checkpoint save / load | ❌ 同 |
+
+剩余子系统**只能 L3 真 rollout 验**。
+
+### L3 准备清单
+
+L3 = `STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh`（不设 `STAGE1_MOCK_ROLLOUT`，走真 OpenHands docker 路径）。
+
+**前置检查**：
+
+| 项 | 命令 | 期待 |
+|---|---|---|
+| docker daemon 在跑 | `docker info \| head -5` | 不报错 |
+| OpenHands image 已 build | `docker images \| grep openhands-triton-env` | 有 v1 |
+| 容器能调 host | `docker run --rm --network host openhands-triton-env:v1 curl -fsS http://localhost:5000/health` | 200 OK |
+| OPENHANDS_ARTIFACT_DIR 可写 | `mkdir -p /workspace/results/openhands_results && touch $_/test && rm $_/test` | OK |
+| mock_npu_operator reward 函数能在容器内跑 | 看 openhands_agent.py `_npu_operator_reward` 是否容器内可执行 | 函数体内只用 fs，OK |
+
+**可能挂点排序（按风险递减）**：
+
+1. **docker image 不存在 / build 失败** —— FORCE_BUILD=1 重 build 看
+2. **容器内调 LiteLLM proxy 不通** —— `host.docker.internal:5000`（默认）vs `--network host` + `localhost:5000` 看 OpenHands 容器 entrypoint 怎么传 LLM_BASE_URL
+3. **OpenHands 容器内 entrypoint 异常 exit** —— 看 `OPENHANDS_ARTIFACT_DIR` 下容器 log
+4. **第一次 LLM 调用太慢导致 timeout** —— 已设 `OPENHANDS_CONTAINER_TIMEOUT=1800`（30 分钟）
+5. **PPO step 真挂**（最值得期待——意味着前面全通了）
+
+**Audit 教训补充（§13.13 第 11 条）**：
+
+11. **分层 mock 的"覆盖范围 vs 真链路依赖"边界要早画**。L2b 设计初衷"绕 docker/LLM 验 trainer"是对的，但低估了 PPO step 对真 token data 的硬依赖（标量 reward 不够）。下次设计 mock 层，先在 plan 里明确该层能验/不能验的子系统清单（这次 plan §13.10 没画清楚 PPO step 是否在 L2b 范围内）。
