@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.28 — W2.28 W2.27 extension：rllm `agent_sdk_trainer.py` 加 `batch.meta_info["temperature"]` 全局 set，mirror verl `fit:1395`。megatron `forward_step:841` 无 default 读此 key，W2.27 update_actor bridge 内 set 太晚。新增 §13.31 + audit 教训第 21 条。前置 v2.27 trainer 桥接, v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.29 — W2.29 `use_remove_padding=True→False`：GDN linear attention 不支持 packed seq (MindSpeed `gated_delta_net.py:292`)，verl `data_format="thd"` (use_remove_padding=True) → preprocess_packed_seqs → packed_seq_params != None → GDN raise。完整 5 层源码验证。完全对齐 plan §0.1 早期警告。新增 §13.32 + audit 教训第 22 条。前置 v2.28 temperature, v2.27 trainer 桥接, v2.26 worker-entry, v2.25 tu.pop, v2.24 fallback, v2.23 max_prompt_length, v2.22 MAX_ITER, v2.21 max_model_len, v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -923,6 +923,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.29 | **W2.29 use_remove_padding True→False：GDN 不支持 packed seq**。源码验证完整因果链（5 层：train script → engine config → data_format → preprocess_packed_seqs → Qwen3-VL → MindSpeed GDN raise）。**完全对齐 plan §0.1 早期警告**。修：train script 2 处 `True → False`，对齐 verl NPU 脚本默认。W2.27 bridge `left_right_2_no_padding` 不动（源码验证 verl 自家 `_compute_old_log_prob` 无条件调它，与 use_remove_padding=False 配合工作）。新增 §13.32 + audit 教训第 22 条（"plan §0.1 软约束应在 L3 第一次失败时强制全部重审"，stage2 TODO 加"§0.1/§0.2 软约束状态回填"工作）。|
 | 2026-05-26 | v2.28 | **W2.28 W2.27 extension：rllm batch.meta_info 漏 `temperature` 字段**。L3 推进到 megatron `transformer_impl.py:841 forward_step` 报 `KeyError: temperature`。源码验证：verl 在 `fit:1394-1395` 每 ppo iter batch 构造后立刻 set，rllm `transform_results_for_verl` 路径不走 fit batch 构造 → 没 set。W2.27 update_actor bridge 内 set 了但太晚（line 534 vs compute_log_prob line 418）。修：在 rllm `agent_sdk_trainer.py` 紧贴 `batch.meta_info["global_token_num"]` 现有行后全局只设一次 `temperature` + `multi_turn`，删 W2.27 update_actor bridge 里的重复 set。新增 §13.31 + audit 教训第 21 条（port 多阶段 trainer 桥接时要 port 上游 fit-loop 层 metadata 注入，不仅是 bridge 方法内的）+ stage2 TODO 加"完整 verl fit ↔ rllm fit_agent diff 审计"避免类似漏洞。|
 | 2026-05-26 | v2.27 | **W2.27 supersede W2.26：rllm 侧补 trainer 桥接 + revert W2.26 worker-entry shim**。用户两轮追问推动重审：第一次"为什么这么多问题"逼出真根因（rllm trainer 漏 verl 自家 mid-#2733 加的 3 步桥接）；第二次"逐 commit 评估"催出全面 audit。结论 W2.26 是唯一"side 选错"的 commit。修：(1) rllm `agent_sdk_trainer.py` 3 处（compute_log_prob/compute_ref_log_prob/update_actor）补 5 步桥接（to_tensordict + left_right_2_no_padding + tu.assign_non_tensor + 调 worker + DataProto.from_tensordict），mirror verl `RayPPOTrainer._compute_old_log_prob/_compute_ref_log_prob/_update_actor`；(2) revert verl-fork `7e30674e`。Stage2 TODO 加 follow-up：逐字段 no_padding_2_padding 输出转换（W2.27 用 from_tensordict 整体转，未验证下游 `.batch["entropys"]` shape 期望）。新增 §13.30 + audit 教训第 19 + 20 条。W2.28 候选：W2.8 worker re-export shim 也可移到 rllm 侧（4 个 import 更新），不紧急。|
 | 2026-05-26 | v2.26 | **verl-fork shim #4：engine_workers 3 个 batch 方法入口 DataProto→TensorDict 转换（W2.26）**：W2.25 后 `infer_batch` 又挂在下面 12 行的 `data.keys()` 上（DataProto 无 .keys()）。根因 W2.25 同源扩大版：3 个 batch 方法（train_mini_batch/train_batch/infer_batch）整段都按 TensorDict 写但实际收 DataProto，`tu.assign_non_tensor` / `tu.make_iterator` / `data.shape` 全踩。修：3 方法入口加 3 行 `if not isinstance(data, TensorDict): data = data.to_tensordict()`，幂等，下游零改动。`to_tensordict()` 是 verl 上游 native API（protocol.py:1102）。verl-fork compat 累计 4 个 commit: `881a98d7` + `85159408` + `370e1148` + `7e30674e`。新增 §13.29 + audit 教训第 18 条（PR #2733 是渐进 migration，同方法连续 type error 优先怀疑同源；修在入口比逐行修 helper 更稳）。|
@@ -2616,6 +2617,47 @@ batch.meta_info["multi_turn"] = (
 
 W2.28 后预期挂点：进入 megatron forward 计算本身（如 mp / shape / dtype 问题），就是真算法层了。
 
+### 13.32 `use_remove_padding=True` → GDN packed seq 不支持（W2.29）
+
+**症状**：W2.28 推进后 L3 跑到 megatron forward + Qwen3-VL text_model + decoder + self_attention，挂在：
+
+```
+File "/workspace/MindSpeed/mindspeed/core/ssm/gated_delta_net.py", line 292
+NotImplementedError: GDN does not support packed sequence for now.
+```
+
+**源码验证完整因果链**（**不再有"推断"环节**）：
+
+| 阶段 | 代码 | 行为 |
+|---|---|---|
+| Stage1 train script | `actor_rollout_ref.model.use_remove_padding=True` | 配置 |
+| verl engine config 注入 | `engine_workers.py:113` `self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)` | 拷到 engine config |
+| verl 决定 data_format | `transformer_impl.py:908` `data_format = "thd" if use_remove_padding else "bshd"` | True → thd |
+| verl 调 preprocess | `model_forward.py:74-80` `if data_format == "thd": packed_seq_params = preprocess_packed_seqs(...)` | 构造 packed_seq_params |
+| 传给 Qwen3-VL.forward | `model_forward.py:96` `input_args = dict(packed_seq_params=packed_seq_params, ...)` | model 收到非 None packed_seq_params |
+| Qwen3VL → text_model → decoder → transformer_layer → self_attention (GDN) | call chain | 路径深，每层都透传 |
+| **MindSpeed GDN raise** | `gated_delta_net.py:292` `if packed_seq_params is not None: raise NotImplementedError("GDN does not support packed sequence for now.")` | 撞墙 |
+
+**根因**：plan §0.1 早预警 —— Qwen3.5/3.6 用 Gated Delta Net (GDN) linear attention，MindSpeed 的 GDN 实现**不支持 THD packed**。stage1 起步注释自己写了 "可调，挂了再切 False"。**L3 跑通就是实测决定的时刻** —— 必须 False。
+
+**修复（W2.29，2 行）**：
+
+| 文件 | 改动 |
+|---|---|
+| `train_openhands_qwen36_npu.sh:346` | `actor_rollout_ref.model.use_remove_padding=True` → `=False` |
+| `train_openhands_qwen36_npu.sh:380` | `actor_rollout_ref.actor.megatron.use_remove_padding=True` → `=False` |
+
+**W2.27 bridge 不动**：源码读 verl `_compute_old_log_prob:1217` 是无条件调 `left_right_2_no_padding`，verl NPU 脚本 use_remove_padding=False 跑通，说明这两个组合 **配合工作**（engine 的 `data_format` 由 use_remove_padding 决定，bridge 的 nested 转换是独立步骤）。
+
+**Audit 教训第 22 条**：**plan §0.1 "软约束"应在 L3 第一次失败时强制重审**，而不是后续每次崩才单点修。W2.20 进入 L3 阶段时就该把 §0.1 所有 "可调/软约束" 一次性 review：
+- `use_remove_padding` ← W2.29 才修
+- `use_dynamic_bsz` ← W2.10 已对齐 verl 套（False）
+- 其他还有没有？需做完整 §0 / §0.1 / §0.2 软约束清单 vs train script 实际值的对账
+
+**Stage2 TODO 加这条 "§0.1 软约束实测后状态回填" 工作**：把所有 "可调 / 起步" 标记的 config，在 L3-L4 跑通后回到 §0.1 表 + train script 注释里换成"已实测 = X"。
+
+W2.29 后预期挂点：真进 megatron 内部数值层（shape/mp/dtype），剩下要不就是 stage1 setup 闭环成功。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2663,7 +2705,8 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.26 verl-fork shim #4 入口 DataProto→TensorDict | 0 | （rllm 仅 plan 更新；verl-fork `7e30674e`，**W2.27 revert**） |
 | W2.27 rllm AgentSdkTrainer 补 3 处桥接 + revert W2.26 | 1 | rllm `dd229d51` + verl-fork `9998be02` |
 | W2.28 rllm 全局补 `batch.meta_info["temperature"]`（megatron forward_step 必读） | 1 | rllm `5eb4224f` |
-| 最新 | — | rllm `5eb4224f` + verl-fork `9998be02` |
+| W2.29 train script `use_remove_padding=False` (GDN 不支持 packed) | 1 | rllm `81cb31f0` |
+| 最新 | — | rllm `81cb31f0` + verl-fork `9998be02` |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2736,8 +2779,9 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.26 verl-fork shim #4 engine_workers 3 batch 方法入口 DataProto→TensorDict 转换：W2.25 后 `data.keys()` 又挂，根因同源（mid-migration），修方法入口 1 行/方法 × 3 方法，下游零改动 ⚠️ **被 W2.27 supersede**
 - ✓ W2.27 rllm 侧补 trainer 桥接（3 处 mirror verl `_compute_old_log_prob/_compute_ref_log_prob/_update_actor`）+ revert W2.26 verl-fork shim：side 修正
 - ✓ W2.28 rllm 全局补 `batch.meta_info["temperature"]` + `multi_turn`，mirror verl `fit:1395`。megatron `forward_step:841` 无 default 读 temperature 撞 KeyError。删 W2.27 update_actor bridge 里重复 set
+- ✓ W2.29 `use_remove_padding` True→False：GDN packed seq 不支持 (MindSpeed `gated_delta_net.py:292`)。完整 5 层源码验证因果链，对齐 plan §0.1 早期警告 + verl NPU 脚本默认
 
-**当前位置**：W2.28 完成 —— rllm batch.meta_info 全局补 `temperature` + `multi_turn`，mirror verl `fit:1395`。megatron `forward_step:841` 撞 KeyError 解决。L3 现在应该真进 megatron forward 计算。**已知未验证项**（β 范围）：(a) 逐字段 `no_padding_2_padding` 输出转换没做；(b) `update_actor` 没复刻 verl 的 `rename_dict + from_single_dict` 后处理；(c) 可能还有其他 verl `fit` loop 设过但 rllm `fit_agent` 没设的 metadata —— 跑挂再追。verl-fork compat 仍 3 处有效（agent_loop / workers / tu.pop）。
+**当前位置**：W2.29 完成 —— `use_remove_padding=True→False` 修 GDN packed seq 不支持问题。L3 现在应该走 bshd 路径，Qwen3-VL → GDN 不再撞 packed_seq_params is not None。**已知未验证项**：(a) bshd 路径上 rllm 下游 `old_log_prob.batch["entropys"]` shape 是否对；(b) `update_actor` 输出格式；(c) 可能还有 verl fit loop 漏 port 的 metadata（W2.28 audit 教训 #21 reminder）；(d) Megatron 内部 mp/shape/dtype。verl-fork compat 仍 3 处有效。
 
 **下一步（用户该做的）**：
 
