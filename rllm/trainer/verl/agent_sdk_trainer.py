@@ -413,6 +413,19 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # W2.28: mirror verl fit:1394-1395 — set temperature on batch.meta_info
+                    # ONCE per PPO iter, before any worker call. Megatron forward_step
+                    # (verl/workers/engine/megatron/transformer_impl.py:841) reads
+                    # `batch["temperature"]` with no default — KeyError if missing.
+                    # verl trainer sets it in fit() main loop; rllm's transform_results_for_verl
+                    # path doesn't, so we mirror it here. Also set multi_turn for parity
+                    # (currently no reader in verl, but verl _update_actor:1251 sets it).
+                    _rollout_cfg = self.config.actor_rollout_ref.rollout
+                    batch.meta_info["temperature"] = _rollout_cfg.temperature
+                    batch.meta_info["multi_turn"] = (
+                        _rollout_cfg.multi_turn.enable if hasattr(_rollout_cfg, "multi_turn") else False
+                    )
                     if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                         images_seqlens_all = []
                         for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -560,9 +573,9 @@ class AgentSdkTrainer(RayPPOTrainer):
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             # W2.27 bridge: mirror verl RayPPOTrainer._update_actor (ray_trainer.py:1249-1289)
+                            # Note (W2.28): batch.meta_info["temperature"]/["multi_turn"] already set
+                            # globally above (next to global_token_num); not duplicating here.
                             rollout_cfg = self.config.actor_rollout_ref.rollout
-                            batch.meta_info["multi_turn"] = rollout_cfg.multi_turn.enable if hasattr(rollout_cfg, "multi_turn") else False
-                            batch.meta_info["temperature"] = rollout_cfg.temperature
                             update_batch_td = batch.to_tensordict()
                             update_batch_td = left_right_2_no_padding(update_batch_td)
                             actor_cfg = self.config.actor_rollout_ref.actor
