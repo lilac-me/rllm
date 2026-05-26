@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.19 — 新增 §14 新对话接手指南：TL;DR + git refs + NPU 环境 + 关键文件 + 当前位置 + audit 教训 + 常见 prompt 处理 + plan 维护规则)
+> 修订时间：2026-05-26 (v2.20 — W2.20 DooD workspace path alignment：L3 首跑容器空 workspace 退出，根因 `workspace_temp` 在 main container overlay 上、宿主 dockerd 看不见。修：hardcode `/tmp/openhands_workspace` + 用户加同路径 bind mount。新增 §13.23 + audit 教训第 12 条)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -890,6 +890,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.20 | **L3 首跑 DooD workspace path alignment（W2.20）**：4 个 OpenHands 容器在 ~3s 内全 exit，reward=0.0，trace store 空 → pad_sequence empty list（与 L2b 同症状但根因不同）。根因：rllm 主进程跑在一个 main container 内，`workspace_temp` 写在 main container overlay 上；`openhands_agent` 用 `-v {workspace}:/opt/workspace` 起子容器，**这条 `-v` 由宿主 dockerd 解析**，看不到 main container 内的路径 → 宿主新建空目录挂到子容器 → entrypoint.py 不存在 exit 127。修复（用户决策：不引入新 env，stage1 env 已过多）：(1) `openhands_agent.py:225` workspace_temp **hardcode** `/tmp/openhands_workspace` + 长注释说明 DooD 约束；(2) 训练脚本只加注释说明 main container 必须 bind mount，不加新 export；(3) 用户运维侧 main container 启动加 `-v /tmp/openhands_workspace:/tmp/openhands_workspace`。新增 §13.23 + audit 教训第 12 条：DooD 下任何 `-v <src>:<dst>` 的 `<src>` 必须宿主可见（在宿主 shell `ls <src>` 能看到内容才合法）。**Stage 2 演化路线**：用户决策不烤 skills 进 image（迭代成本高），多机时走 OBS 拉取（首选，Ascend 集群默认有）/ NFS / 自有 HTTP 服务（最重，非必要不引入）。stage 2 进 §9 下一阶段 TODO 跟踪。|
 
 ---
 
@@ -2074,6 +2075,67 @@ L3 = `STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh`（不设 `STAGE1_MO
 
 11. **分层 mock 的"覆盖范围 vs 真链路依赖"边界要早画**。L2b 设计初衷"绕 docker/LLM 验 trainer"是对的，但低估了 PPO step 对真 token data 的硬依赖（标量 reward 不够）。下次设计 mock 层，先在 plan 里明确该层能验/不能验的子系统清单（这次 plan §13.10 没画清楚 PPO step 是否在 L2b 范围内）。
 
+### 13.23 DooD workspace path alignment：workspace_temp 必须落在宿主可见路径（W2.20）
+
+**L3 第一次跑出意外快速失败**：4 个 OpenHands 容器 docker run 成功（拿到 container id），但**总耗时 2.96 秒就 4 个全部 reward=0.0 退出**，trace store 空 → 4 episode 全 drop → 同 L2b 的 `pad_sequence empty list`。容器内 entrypoint stderr 报 `/opt/workspace/entrypoint.py: No such file or directory`。
+
+**根因 — Docker-out-of-Docker volume 路径未对齐**：
+
+rllm 主进程跑在一个 "main container" 里（NPU 节点上的训练容器）。`openhands_agent.rollout` 用 docker SDK 在**宿主 dockerd 上**起子容器，emit 的 `-v {workspace}:/opt/workspace`：
+
+```
+main container 内：
+    /workspace/rllm-071/examples/openhands_sdk/workspace_temp/trajectory-XXX/   ← shutil.copytree 写在这里
+              ↓ openhands_agent emit "-v {workspace}:/opt/workspace"
+宿主 dockerd 在宿主 FS 找 /workspace/rllm-071/.../workspace_temp/trajectory-XXX
+              ↓ 找不到 → 默认行为：宿主上新建空目录
+子 OpenHands 容器看到 /opt/workspace/ 是空的 → entrypoint.py 不存在 → exit 127
+```
+
+**关键点**：`docker run -v <src>:<dst>` 的 `<src>` 始终由**执行 docker daemon 的内核**解析，永远不是调用方容器的视角。这是 DooD 拓扑的基础约束，文档里很少提，第一次踩必坑。
+
+**修复（W2.20，code + 文档）**：
+
+| 文件 | 改动 | 行号 |
+|---|---|---|
+| `examples/openhands_sdk/openhands_agent.py` | `workspace_temp` hardcode 为 `/tmp/openhands_workspace` + DooD 注释 | [:220-228](rllm/examples/openhands_sdk/openhands_agent.py:220) |
+| `examples/openhands_sdk/train_openhands_qwen36_npu.sh` | 加 DooD 约束注释（无新 env，路径在 code 里） | 紧接 `OPENHANDS_ARTIFACT_DIR` |
+
+**用户决策（2026-05-26）**：stage1 env var 已积累过多，workspace_temp 路径**不引入新 env**，直接 hardcode `/tmp/openhands_workspace`。代价：换路径要改 code；收益：脚本 env 表清爽，新人接手不用追溯一条 env 链。
+
+**用户操作（main container 启动侧）**：main container 启动命令需加同路径 bind mount（rllm 仓不管 main container 怎么起，这步在用户的运维脚本里）：
+
+```bash
+# 宿主上准备
+mkdir -p /tmp/openhands_workspace
+
+# main container 启动加 bind mount（源/目的同路径）
+docker run ... \
+    -v /tmp/openhands_workspace:/tmp/openhands_workspace \
+    ...
+# 也可以直接挂整个 /tmp（-v /tmp:/tmp），如果 main container 没有 tmpfs 隔离需求
+```
+
+**验证方式**（在宿主 shell，不是 main container 内）：rollout 跑起来后宿主上能看到 `/tmp/openhands_workspace/trajectory-*/agent_workdir/INSTRUCTIONS.md`，子容器才看得到。
+
+**为什么这个解法是"同路径 bind mount"而不是"路径翻译"**：DooD 拓扑里，**main container 内的路径 = 宿主路径 = 子容器 -v 的 source 路径**，三者必须一致。如果搞路径映射（"main container 内 X 在宿主上是 Y"），代码就要维护一张映射表，每次起容器都查表，下次接手的人很难调试。同路径 bind mount 是工业标准做法（k8s 的 hostPath、Jenkins agent 跑 docker build 都是这个套路）。
+
+**为什么 `_WORKSPACE_PKG`（模板源）不用宿主可见**：模板只在 main container 内被 `shutil.copytree` 读取，destination 才挂到子容器。所以**只有 workspace_temp 这个 destination 需要同路径 bind mount**，源模板 + rllm 源码这些都不用动。这点很重要 —— 用户可以继续在 main container 内迭代 `examples/openhands_sdk/workspace/` 模板，**改完立刻生效**（每次 rollout 重新 copytree），不需要重 build image。
+
+**Audit 教训第 12 条**：**DooD 下任何 `docker run -v <src>:<dst>` 的 `<src>` 必须是宿主可见路径**。判断方法：在宿主 shell（不是 main container 内）`ls <src>`，能看到内容才合法。代码里 emit 这种 mount 字符串的位置（[openhands_agent.py:546](rllm/examples/openhands_sdk/openhands_agent.py:546)）值得在 docstring / 注释里显式标"这里的 path 是宿主 dockerd 视角"。
+
+**Stage 2 演化路线（用户决策 2026-05-26）**：
+
+skills 快速迭代场景下，stage 2 不走"workspace 烤进 image"（迭代成本高），三个备选：
+
+| 路线 | 适用 | 评估 |
+|---|---|---|
+| OBS / S3 拉取（Ascend 集群默认有） | 模板存对象存储，节点本地缓存 | **首选**：不写自有 service，对象版本天然支持 |
+| 自有 HTTP 服务 | 需要复杂 skill 拼装逻辑或细粒度访问控制 | 多一个 critical service，部署/监控/HA 成本，非必要不引入 |
+| 多机共享 NFS | 节点已有共享 fs | 路径直挂，跨节点透明 |
+
+stage 1（W2.20）= 同路径 bind mount，工时 < 30 分钟。stage 2 真正切多机时再选 OBS 或 NFS，进 §9 下一阶段 TODO 跟踪。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2237,6 +2299,12 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 **机器特定信息不进代码**（plan §13.18，audit 教训第 7 条）：
 - `HCCL_IF_IP` / `nic_name` / 节点 IP 一律不允许硬编码
 - 现在全是 env opt-in：`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE`
+
+**DooD volume path alignment**（plan §13.23，audit 教训第 12 条）：
+- rllm 主进程跑在 main container 内，`openhands_agent` 用 docker SDK 起子容器；`-v <src>:<dst>` 的 `<src>` **由宿主 dockerd 解析**，不是 main container 视角
+- 任何要给子容器看的目录（典型：`workspace_temp/`）必须落在 main container 和宿主**同路径 bind mount** 的位置
+- 当前 hardcode `/tmp/openhands_workspace`（[openhands_agent.py:225](rllm/examples/openhands_sdk/openhands_agent.py:225)），main container 启动加 `-v /tmp/openhands_workspace:/tmp/openhands_workspace`
+- 排错：在**宿主 shell**（不是 main container 内）`ls /tmp/openhands_workspace/`，能看到 `trajectory-*` 子目录才合法
 
 **Stage1 安全训练 config**（plan §13.7）：
 - `router_replay=disabled`（stage1 AgentPPOTrainer 路径上 19983fe4 入口不生效，§13.3）

@@ -159,6 +159,9 @@ export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
 export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
+# DooD: per-trajectory workspace_temp is hardcoded to /tmp/openhands_workspace in
+# openhands_agent.py — main container startup MUST add `-v /tmp/openhands_workspace:/tmp/openhands_workspace`
+# (or `-v /tmp:/tmp`) so the sibling OpenHands container can mount it. See plan §13.23.
 
 # ------------------------------------------------------------------------------
 # Training parameters
