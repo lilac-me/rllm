@@ -159,9 +159,40 @@ export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
 export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
-# DooD: per-trajectory workspace_temp is hardcoded to /tmp/openhands_workspace in
-# openhands_agent.py — main container startup MUST add `-v /tmp/openhands_workspace:/tmp/openhands_workspace`
-# (or `-v /tmp:/tmp`) so the sibling OpenHands container can mount it. See plan §13.23.
+
+# ------------------------------------------------------------------------------
+# DooD runtime dirs precheck (plan §13.23, audit 教训第 12 条)
+# ------------------------------------------------------------------------------
+# These two dirs must exist + be writable from inside the main container.
+# OPENHANDS_WORKSPACE_TEMP_HOST_DIR is the bigger trap: it MUST be a same-path
+# bind mount from host (`-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
+# on main container startup), otherwise the sibling OpenHands container's
+# `-v {workspace}:/opt/workspace` resolves on host dockerd to an empty dir →
+# child container sees empty /opt/workspace → entrypoint.py missing → exit 127.
+OPENHANDS_WORKSPACE_TEMP_HOST_DIR="/home/docker/openhands_workspace"  # 同步 openhands_agent.py
+for _dir in "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" "${OPENHANDS_ARTIFACT_DIR}"; do
+    if [ ! -d "${_dir}" ]; then
+        echo "[stage1 precheck] ERROR: required dir does not exist: ${_dir}" >&2
+        echo "  On host: mkdir -p ${_dir}" >&2
+        echo "  Main container startup MUST add: -v ${_dir}:${_dir}" >&2
+        exit 1
+    fi
+    if ! touch "${_dir}/.stage1_precheck" 2>/dev/null; then
+        echo "[stage1 precheck] ERROR: dir not writable: ${_dir}" >&2
+        exit 1
+    fi
+    rm -f "${_dir}/.stage1_precheck"
+done
+# Soft check: workspace_temp dir SHOULD also be a real bind mount (not an
+# overlay dir created post-launch inside the main container — that defeats DooD).
+# findmnt may not be available in all images, so this is best-effort warning only.
+if command -v findmnt >/dev/null 2>&1; then
+    if ! findmnt -no SOURCE "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" >/dev/null 2>&1; then
+        echo "[stage1 precheck] WARN: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} exists but is NOT a bind mount." >&2
+        echo "  Child OpenHands containers will see empty /opt/workspace and fail." >&2
+        echo "  Fix: restart main container with -v ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}:${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" >&2
+    fi
+fi
 
 # ------------------------------------------------------------------------------
 # Training parameters

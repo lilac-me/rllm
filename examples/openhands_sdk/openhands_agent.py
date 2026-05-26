@@ -221,9 +221,9 @@ def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str
     _WORKSPACE_PKG = pwd / "workspace"
     # DooD: must be a host path also bind-mounted into the main container at the
     # SAME path, since the sibling container's `-v {workspace}:/opt/workspace` is
-    # resolved by the host dockerd. Requires `-v /tmp/openhands_workspace:/tmp/openhands_workspace`
+    # resolved by the host dockerd. Requires `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
     # on main container startup. See plan §13.23.
-    workspace_temp = Path("/tmp/openhands_workspace")
+    workspace_temp = Path("/home/docker/openhands_workspace")
     workspace_temp.mkdir(parents=True, exist_ok=True)
     workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=workspace_temp)
     op_name = task.get("op_name", "operator")
