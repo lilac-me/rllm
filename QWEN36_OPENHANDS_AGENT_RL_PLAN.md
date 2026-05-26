@@ -707,6 +707,11 @@ stage1 不做、留到 stage2+ 处理的功能项：
 - **bypass rollout / token-id 调试代码归位**：HEAD 私有提交与上游 `d09f6155` 等 patch 的去重
 - **legacy example 标 deprecated**：14 个 example 入口具体到 PR/commit 动作
 - **GDN bshd 模式下 multi-turn merge / response_mask 的可视化验收**（当 §0.1 实测决定走 `use_remove_padding=False` 时）
+- **🔴 rllm `AgentSdkTrainer` 同步 verl `_compute_old_log_prob` 的 3 步桥接**（plan §13.29 真根因，audit 教训 #18 反思）：
+  - **问题**：verl 自家 trainer 在调 `actor_rollout_wg.compute_log_prob(batch_td)` 前做了 `batch.to_tensordict() + left_right_2_no_padding + tu.assign_non_tensor(...)` 3 步桥接（[verl ray_trainer.py:1212-1226](verl-BryanChen408/verl/trainer/ppo/ray_trainer.py:1212)）；rllm `AgentSdkTrainer.fit_agent` 直接传 DataProto。W2.26 在 verl-fork worker 入口补了类型转换，但 metadata（`compute_loss=False` / `calculate_entropy` / `no_lora_adapter` 等）没补。
+  - **触发条件**：W2.26 worker 入口 shim 留下的语义偏差若导致后续路径挂（compute_loss 默认 True vs verl 自家 False 的差异）
+  - **修法**：在 rllm `agent_sdk_trainer.py:418` + `:534` 调 worker 前补 3 步桥接，照搬 verl `_compute_old_log_prob` 那段。同时可删 W2.26 verl-fork worker 入口转换（保留 W2.25 tu.pop 守卫做 generic 硬化）
+  - **触发后做**：删 verl-fork commit `7e30674e` 的入口转换 + 在 rllm trainer 补桥接 + plan §13.29 标"已修复 stageN.x"
 - **🔴 删除 stage1 random reward fallback**（plan §13.25 + §13.27，代码块在 [openhands_agent.py:717-740](rllm/examples/openhands_sdk/openhands_agent.py:717)）：
   - **触发条件（4 个必须同时满足）**：
     1. OpenHands `Condenser` 接入完成（多 turn prompt 不再线性增长）
@@ -2436,7 +2441,20 @@ AttributeError: 'DataProto' object has no attribute 'keys'
 
 修一行 W2.25 `tu.pop` 不够，整条路径都是 TensorDict 假设。
 
-**为什么 verl 自己跑不踩**：verl 的 PR #2733 是「prototype deprecate DataProto → TensorDict, part 1」。**整个 worker 抽象处在迁移中**，dispatcher 仍传 DataProto，但 worker 方法已经按 TensorDict 写好了。verl 自己跑的标准 example 可能用更老的 DataProto path（如 `verl/trainer/ppo/` 下的 trainer 直接调 DataProto-aware 方法），绕开 `engine_workers.py` 这条新抽象。stage1 借 rllm `AgentSdkTrainer` → `make_nd_compute_dataproto_dispatch_fn` → `engine_workers.compute_log_prob` 进入这条新路径，第一次撞见类型不匹配。
+**为什么 verl 自己跑不踩（深查后的真根因）**：
+
+用户追问"verl 自家 example 走老路径吗？"逼出了**真精确的分歧点**。
+
+`dispatch_lazy_compute_data_proto → BatchData(arg).chunk(...)` 是**类型保持的**（[protocol.py:1271-1289](verl-BryanChen408/verl/protocol.py:1271)）：TensorDict 切片仍是 TensorDict，DataProto 切片仍是 DataProto。dispatcher **不做类型转换**。
+
+差异在 **trainer 层**：
+
+| Trainer | 调 `compute_log_prob` 前 |
+|---|---|
+| **verl 自家 `RayPPOTrainer._compute_old_log_prob`**（[ray_trainer.py:1212-1226](verl-BryanChen408/verl/trainer/ppo/ray_trainer.py:1212)） | `batch_td = batch.to_tensordict()` + `left_right_2_no_padding(batch_td)` + `tu.assign_non_tensor(batch_td, calculate_entropy=..., compute_loss=False, ...)` → 传 TensorDict |
+| **rllm `AgentSdkTrainer`**（[agent_sdk_trainer.py:418](rllm/trainer/verl/agent_sdk_trainer.py:418)） | 直接 `self.actor_rollout_wg.compute_log_prob(batch)`，**0 步桥接** → 传 DataProto |
+
+verl 自家 trainer 的 `# TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free` 注释自己承认这是 mid-migration 的临时桥接代码。**rllm trainer 没同步搬这段桥接**。所以 rllm 链路上 worker 收到 DataProto，verl 自家链路上 worker 收到 TensorDict —— 同一个 `engine_workers.compute_log_prob`，两种入参，verl 自家不踩，rllm 路径踩。
 
 **修复（W2.26，verl-fork shim #4）**：3 个方法**入口加 3 行**类型检查 + 转换：
 
@@ -2450,10 +2468,22 @@ def train_mini_batch(self, data: TensorDict) -> TensorDict:
 
 `DataProto.to_tensordict()` 是 verl 上游已有的合法 API（[protocol.py:1102](verl-BryanChen408/verl/protocol.py:1102)），把 batch + non_tensor_batch + meta_info 合并成单个 TensorDict。**幂等**（TensorDict 入参直接跳过）。
 
-**为什么选"入口转换"而非"helper polymorphism"**：
-- 入口转换 1 处 / 1 行，下游所有 TensorDict-only 调用零改动
-- helper polymorphism（让 tu.assign_non_tensor / tu.make_iterator 都支持 DataProto）涉及 4+ 处 helpers，每处都要决定 "DataProto 时该把 key 放 batch 还是 non_tensor_batch 还是 meta_info"，语义不清晰、容易引入隐 bug
-- 入口转换跟 verl 上游 migration 方向（"完全用 TensorDict"）一致，**上游 part-N 完成迁移后我们这个 shim 可以无副作用删掉**
+**修法选择反思（真根因被揭示后）**：
+
+3 种可能修法：
+
+| 修法 | 改动面 | 缺点 |
+|---|---|---|
+| (A) **worker 入口转换**（W2.26 实施这条） | verl-fork engine_workers 3 方法 × 1 行 | **不补元数据**（compute_loss/no_lora_adapter 全靠 tu.get/tu.pop 的 default 兜底）；与 verl 自家 trainer 行为有语义差（verl 自家会显式设 compute_loss=False，rllm 路径默认 True） |
+| (B) **rllm trainer 补桥接**（照搬 verl `_compute_old_log_prob` 3 步） | rllm agent_sdk_trainer.py 多处（compute_log_prob + update_actor 都要补） | 涉及 stage1 不在乎的 metadata 语义决策（calculate_entropy 该 True 还是 False?）；rllm 改动面更大 |
+| (C) **dispatcher 端转换**（让 dispatcher 自动 DataProto→TensorDict） | verl-fork decorator 共享代码 | 最干净，但 verl 上游 #2733 part-N 才补，我们超前实施风险高（上游决定与我们不一致时回退困难） |
+
+**选 (A) 理由**：
+- "fix in verl-fork, rllm 不动" 沿用 plan §2.1 决策
+- 一处修，下游全 callers 受益（不止 rllm）
+- 上游 part-N 完成 migration 后，dispatcher 自己会做转换，我们 (A) 的 shim 变 no-op，**可以无副作用删掉**
+
+**(A) 留下的潜在语义偏差**：`compute_loss` 默认 True（rllm 路径），但 verl 自家在 _compute_old_log_prob 里显式 False。stage1 不在乎；如果某条路径后续因这个差异挂，再补 metadata 注入（要么在 rllm trainer 端，要么在 worker 入口注入 default metadata）。
 
 **为什么 W2.25 `tu.pop` 守卫保留**：W2.25 守卫硬化的是 helper 本身（"任何 caller 传缺失 key 都不该 crash"），与 W2.26 入口转换正交。W2.26 让 engine_workers 路径不再触发该守卫，但其他可能的 caller 仍受益。
 
@@ -2466,7 +2496,13 @@ def train_mini_batch(self, data: TensorDict) -> TensorDict:
 | `370e1148` (W2.25) | `tensordict_utils.py:pop` | 缺失 key 守卫（generic 硬化） |
 | `7e30674e` (W2.26) | `engine_workers.py` 3 个 batch 方法 | 入口 DataProto→TensorDict 转换 |
 
-**Audit 教训第 18 条**：**verl PR #2733 是个跨多 part 的渐进式 migration**（DataProto → TensorDict），我们 stage1 恰好踩在中间状态。模式识别：traceback 内若同一个方法连续报多个 type-related 错（W2.25 tu.pop assertion → W2.26 keys() AttributeError），**优先怀疑是同一个 mid-migration 函数的多个 TensorDict 假设**，**修在方法入口比逐行修 helper 更稳**。
+**Audit 教训第 18 条**：**verl PR #2733 是个跨多 part 的渐进式 migration**（DataProto → TensorDict），我们 stage1 恰好踩在中间状态。
+
+**精确根因（用户深查后揭示）**：不是"verl 自家走老路径"（我最初的错猜），而是 **verl 自家 trainer (`RayPPOTrainer._compute_old_log_prob`) 在 worker 调用前显式做了 `batch.to_tensordict() + left_right_2_no_padding + tu.assign_non_tensor` 3 步桥接**（verl 自己注释承认 "TODO: remove after migration done"），**rllm `AgentSdkTrainer` 没同步搬这段桥接代码**。两条链路共享同一个 worker (`engine_workers.compute_log_prob`)，但抵达 worker 的入参类型不同（TensorDict vs DataProto）。
+
+**模式识别**：traceback 内若同一个 worker 方法连续报多个 type-related 错（W2.25 tu.pop assertion → W2.26 keys() AttributeError），**优先 diff verl 自家 trainer 与 rllm trainer 调同一个 worker 方法前的 prep code**，找出"verl 做了 rllm 没做"的桥接步骤。然后选 worker 入口补 / trainer 端补 / dispatcher 补三种修法之一。
+
+**Audit 反思**：W2.20-W2.24 一连串的"独立" bug 看起来散乱，但 W2.25/W2.26 暴露真根因后回看，**全部都是同一个 migration gap 的不同表现** —— rllm trainer 没跟上 verl trainer 加的桥接，每深一层 verl worker 内部代码就触发一种 type 假设违规。**Stage2 应在 rllm 端做一次性的 trainer 桥接补全**（plan §9 stage2 TODO 加这条），与 W3 AgentFlow 迁移合并思考。
 
 stage1 此后 verl-fork 用 `qwen36-rllm-compat` 分支 HEAD `7e30674e`。
 
