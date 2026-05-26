@@ -87,37 +87,28 @@ def _fake_chat_completion() -> dict[str, Any]:
     }
 
 
-def rollout(*args: Any, **kwargs: Any) -> list[dict]:
+def rollout(*args: Any, **kwargs: Any) -> float:
     """Mock replacement for ``openhands_agent.rollout``.
 
-    Signature is intentionally ``(*args, **kwargs)`` to match the real one;
-    extra_info / metadata kwargs are accepted and ignored.
+    Signature mirrors the real one (``*args, **kwargs``); extra_info /
+    metadata kwargs are accepted and ignored.
 
-    Returns:
-        ``[{name, steps, reward, messages, chat_completions, extra_info}]``
-        — same schema as the real rollout, with a deterministic 0.5 reward.
+    Return type contract (per rllm/engine/agent_sdk_engine.py:213-223):
+        AgentSdkEngine.process_task_with_retry accepts three output forms:
+          (a) float | int | bool        → treated as scalar reward
+          (b) list[BaseTrajectory]      → trajectories (assertion-checked)
+          (c) tuple[(payload, metrics)] → wrapped payload + metrics dict
+
+    The real ``openhands_agent.rollout`` returns ``reward`` (a float, despite
+    its docstring claiming ``list[dict]``) → form (a). We do the same so
+    that L2b exercises the same trainer code path as the real rollout.
+
+    The returned float is intentionally 0.5 (positive but middling) so the
+    PPO step has non-trivial advantage signal without the noise of a uniform
+    reward distribution.
     """
     name = kwargs.get("name") or f"mock-task-{uuid.uuid4().hex[:8]}"
-    logger.info("[mock_rollout] returning fake trajectory for task=%s", name)
-
-    fake_completion = _fake_chat_completion()
-    steps = [
-        {
-            "messages": _FAKE_MESSAGES,
-            "chat_completions": [fake_completion],
-            "reward": 0.5,
-            "done": True,
-            "info": {"mock": True},
-        }
-    ]
-
-    return [
-        {
-            "name": name,
-            "steps": steps,
-            "reward": 0.5,
-            "messages": _FAKE_MESSAGES,
-            "chat_completions": [fake_completion],
-            "extra_info": {"mock_rollout": True},
-        }
-    ]
+    logger.info("[mock_rollout] returning fake reward=0.5 for task=%s", name)
+    # _FAKE_MESSAGES / _fake_chat_completion stay defined above; they're used
+    # for L2a curl smoke against mock_llm_server, not by the trainer hatch.
+    return 0.5

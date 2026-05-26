@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.16 — 删 obs 历史 vllm engine_kwargs，vllm-ascend 不识别 --swap-space 等；新增 §13.20)
+> 修订时间：2026-05-25 (v2.17 — mock_rollout 返回 float 对齐真 rollout (docstring 误导)；L2b setup 链路全通；新增 §13.21)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -887,6 +887,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.14 | **L2b 在 Megatron-Bridge load_weights_hf_to_megatron → torch.distributed.broadcast 挂 HCCL error code 6（W2.15）**。**用户关键提示**：verl 自己跑 Qwen3.6 OK，rllm 基于 verl，所以问题在 rllm 这层引入。根因：obs 历史脚本硬编码 `HCCL_IF_IP=80.48.5.88` + `nic_name=ens1f3`，当前 NPU 节点 IP 是 80.48.5.65，HCCL_IF_IP 不存在 → HcclGetRootInfo 挂。verl 自己脚本 env 段只有 3 行（`CUDA_DEVICE_MAX_CONNECTIONS` / `VLLM_USE_V1` / `VLLM_ALLREDUCE_USE_SYMM_MEM`），没设这些 HCCL/socket env，靠容器默认。修：改成 opt-in 模式，`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE` env 才生效。Audit 教训第 7 条：硬编码 IP/MAC/NIC 跨机必爆，machine-specific identifier 不允许进库代码。**Audit 策略调整**：W2.10 只对齐了 ARGS 段，env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，全是潜在地雷；W2.15 先解决最毒的 HCCL_IF_IP，其他等 L2b 跑过再清理。|
 | 2026-05-25 | v2.15 | **W2.15 修 HCCL 后 vllm worker 启动 exit 2（W2.16）**。继续应用 verl-self-OK 诊断原则：审 verl vllm_async_server.py:237 写死 compilation_config.setdefault cudagraph_mode=FULL_AND_PIECEWISE，无论 user 怎么配 cudagraph 默认开。verl 自己脚本不设 enforce_eager（yaml 默认 false），cudagraph 真生效跑通。我们 obs 历史脚本 enforce_eager=True # TODO 与 cudagraph 矛盾，vllm-ascend worker init 时挂。改成 env 可控默认 False，ROLLOUT_ENFORCE_EAGER=True 可 opt-out。Audit 教训第 8 条：下游覆盖上游默认时要看上游 setdefault 隐式 fill。同时让用户去 /tmp/ray/session_latest/logs/worker-*.err 拿 vllm 真 stderr 验证。|
 | 2026-05-25 | v2.16 | **W2.16 改 enforce_eager 后 vllm worker 仍 exit 2（W2.17）**。拿 ray log 看到真实 vllm error: `unrecognized arguments: --swap-space 0`。obs 历史脚本通过 `engine_kwargs.vllm.<key>=...` 给 vllm CLI 加了 3 个参数（swap_space / cpu_offload_gb / enable_prefix_caching），vllm-ascend 不识别（vllm fork lag）。verl 自己脚本不设这三个，靠 vllm 默认。注释 3 行，保留 tool_call 必需的 2 行。Audit 教训第 9 条：vllm-ascend 是 vllm fork，CLI 参数有 lag；删到只剩业务必需的。**连续 W2.15/W2.16/W2.17 都是同模式**：obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过；剩余可疑 obs env/config 暂不动，待 L2b 跑过再清理。|
+| 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 
 ---
 
@@ -1936,3 +1937,57 @@ W2.15 删 HCCL_IF_IP 硬编码 / W2.16 改 enforce_eager / W2.17 删 vllm engine
 - 顶部 env：`ASCEND_LAUNCH_BLOCKING=1` / `VLLM_ATTENTION_BACKEND=TORCH_SDPA` / `PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` / `VLLM_ENGINE_ITERATION_TIMEOUT_S=...` / `RAY_DEBUG_POST_MORTEM=0` / `RAY_DEDUP_LOGS=0` / `VLLM_ASCEND_ENABLE_NZ=0` / `OOM_SNAPSHOT_*`
 
 这些先不动（"非必要不改"原则），等 L2b 跑过看哪些真的是必需的，再视情况清理。
+
+### 13.21 mock_rollout 返回类型对齐真 rollout（W2.18）
+
+**触发**：L2b 走过 vllm + LiteLLM proxy 起来 + Megatron-Bridge load + actor.reset() + Qwen35VLMoEBridge 模型转换完成，到 "epoch 0, step 1 started"，然后立刻挂：
+
+```
+Error in execute_tasks: Must be a list of Trajectory, retrying...
+AssertionError: Must be a list of Trajectory
+  File "rllm/engine/agent_sdk_engine.py", line 220, in process_task_with_retry
+    assert all(isinstance(t, BaseTrajectory) for t in output)
+```
+
+**根因**：`AgentSdkEngine.process_task_with_retry` 接受 rollout 函数 3 种返回形式（agent_sdk_engine.py:213-223）：
+
+```python
+(a) float | int | bool        → 单纯 reward 标量
+(b) list[BaseTrajectory]      → trajectories (有 assertion 检查类型)
+(c) tuple[(payload, metrics)] → 带 metrics 的 payload
+```
+
+**真 `openhands_agent.rollout` 末尾返回 `reward` (float)** 走 (a)。但它的 docstring 写：
+
+```python
+"""
+Returns:
+    List with one trajectory dict: {name, steps, reward}.
+"""
+```
+
+**docstring 撒谎**——实际看代码 line 730 `return reward`。
+
+我之前写 `mock_rollout.py` 时被 docstring 误导，返回了 `list[dict]` → 走 (b) 分支但里面是 dict 不是 BaseTrajectory → assertion 挂。
+
+**修复**：mock_rollout 返回 `float` (0.5)，与真 rollout 对齐：
+
+```python
+def rollout(*args, **kwargs) -> float:
+    return 0.5
+```
+
+L2b 设计目的（exercise rllm trainer step / Megatron / PPO 框架，不验真 rollout）依然满足：scalar reward 进 trainer，trajectory 数据从 trace store 取（mock 模式下 trace store 是空的，但 trainer 框架能跑过 1 step）。
+
+**Audit 教训补充（§13.13 第 10 条）**：
+
+10. **不要相信 docstring，看 return 语句**。`openhands_agent.rollout` docstring 写 "List with one trajectory dict"，实际 `return reward` 返回 float。Mock / shim / adapter 类代码尤其要 grep `return` 实证，不能照 docstring 抄签名。
+
+**L2b 进展确认**：在挂到 W2.18 之前，L2b 已经走过：
+- vllm-ascend Qwen3.6 server 启动 + cudagraph FULL_AND_PIECEWISE capture
+- LiteLLM proxy 启动 + admin/reload 200
+- Megatron-Bridge 加载 Qwen3.6 (Qwen35VLMoEBridge converting 100%)
+- HCCL broadcast + actor.reset() 完成
+- Step 1 start
+
+也就是 W2.8/W2.9/W2.13/W2.14/W2.15/W2.16/W2.17 一连串修复**全部生效**，rllm × verl × vllm-ascend × Megatron-Bridge × NPU 链路 setup 阶段已通。剩下是 trainer 内部 mock 数据流（W2.18）+ PPO step 框架。
