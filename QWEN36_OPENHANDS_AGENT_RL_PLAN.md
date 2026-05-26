@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.23 — W2.23 `data.max_prompt_length` 8192→32768：W2.22 后 rollout 都通了 reward=0.0，但 step 因 prompt 30721 > 8192 全被 `agent_sdk_engine.py:563` 过滤掉 → batch 空。用户深查路径含 DB 诊断 + json_extract 对比 + 代码下钻。新增 §13.26 + audit 教训第 15 条 + 诊断工具 `diagnose_trace_store.py`。前置 v2.22 MAX_ITERATIONS=1，v2.21 max_model_len，v2.20 DooD。)
+> 修订时间：2026-05-26 (v2.24 — W2.24 W2.22 random fallback 漏洞修正：reward==0 是 normal return 路径（非 exception）会被覆盖，fallback 不生效 → GRPO NaN。修：try 内 `if real_reward > 0.0` 条件覆盖。新增 §13.27 + audit 教训第 16 条。前置 v2.23 max_prompt_length, v2.22 MAX_ITERATIONS=1, v2.21 max_model_len, v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -890,6 +890,7 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.24 | **W2.22 random fallback 漏洞修正（W2.24）**：用户预判 W2.23 后 4 rollout 全 reward=0.0 → GRPO `std=0` → NaN advantage → PPO 仍挂。根因：W2.22 我设的 `reward = random.random()` 初值会被 try 内 `reward = _npu_operator_reward(...)` **无条件覆盖**，return 0.0 是正常返回路径（不是 exception）会把 random 刷掉。fallback 只在 except 触发，reward=0 不触发 = W2.22 描述里没说清的逻辑漏洞。修：try 内加 `if real_reward > 0.0: reward = real_reward` 条件覆盖（3 行）。W3 transition 零摩擦：真 reward > 0 自然接管。新增 §13.27 + audit 教训第 16 条（fallback 触发条件要精确写在 docstring + 单测覆盖；test_reward_pipeline.py 未来要加 `reward != 0.0` 回归 case）。|
 | 2026-05-26 | v2.23 | **L3 `data.max_prompt_length` 过滤掉所有 step（W2.23）**：W2.22 后 4 rollout 全部 200 OK + reward=0.0 完成，但依然 `pad_sequence empty`。用户深度诊断 path：(1) 写 `diagnose_trace_store.py` 验 DB 干净 → 排除 DB；(2) `json_extract` 比对 `data.session_name` vs `metadata.session_name` 全对齐 → 排除字段错位；(3) 沿代码下查到 `agent_sdk_engine.py:563` 用 `data.max_prompt_length=8192` 过滤 step，OpenHands 真 prompt 30721 全 skip → trajectory 无 valid step → episode drop → batch 空。修：1 行，`data.max_prompt_length` 8192 → 32768 给 OpenHands 实际 prompt 留出空间。顺手发现 `agent_sdk_engine.py:624` 硬编码 `max_prompt_length=16384` 是 debug 残留（"[DEBUG format]" 打印泄露），对 stage1 反而是 KV cache 保护（padding 阶段 left-truncate 到 16K）→ 列入 stage2 cleanup 不动。新增 §13.26 + audit 教训第 15 条：分层 mock 漏覆盖"OpenHands 实际 prompt 量级 vs dataloader 阈值"。教训：调试数据流问题需 grep warning 级别日志（"Skipping step..." 被 info 淹没）。新增诊断工具 `diagnose_trace_store.py`（可复用）。|
 | 2026-05-26 | v2.22 | **L3 改换策略：MAX_ITERATIONS=1 + random fallback reward（W2.22）**：W2.21 升 max_model_len 到 49152 后第二轮 prompt 47105 又越界 1。观察：每 turn 增长 ~16k，盲升 context 不是路。用户决策 stage1 只验 trainer 链路、不在乎 reward 真假。修：(1) `OPENHANDS_MAX_ITERATIONS` 默认 1000 → 1，prompt 锁首轮 ~30k，永不超 49k；(2) rollout fallback reward `0.0` → `random.random()`，避免 GRPO `std=0` → NaN 让 PPO 跑得动；(3) 不加新 env gate（"env 已太多"）。Trade-off：纯噪声 PPO 信号，stage1 不在乎，W3 + condenser 后 real reward 接管自然 dormant。新增 §13.25 + audit 教训第 14 条（mock_rollout 该返随机 [0,1) 暴露 GRPO std=0 corner case）。|
 | 2026-05-26 | v2.21 | **L3 第一轮 LLM call context off-by-one（W2.21）**：W2.20 DooD fix 通过后容器跑 120 秒到 vllm tokenize 阶段，`30721 prompt + 2048 output = 32769 > max_model_len 32768`，越界 1 token。根因：OpenHands 默认 system prompt + tools + AGENTS.md 第一轮就 30k tokens（Qwen3-coder agent 重 prompt 通病，结构性解法在 OpenHands condenser，stage1 不碰）。修：[train_openhands_qwen36_npu.sh:451](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:451) `max_model_len` 32768 → 49152，给 16k buffer。不动 OpenHands max_tokens（影响生成质量）也不动 data.max_prompt_length（那是 training dataloader 过滤阈值，不限制 runtime LLM call）。Qwen3.5/3.6 native 支持 256K，49k 完全在模型能力内；NPU KV cache 多吃 50% 但 batch=1 dry-step 扛得住。W4 plan §4.5 预排的 64k 升级保留给后续"P95 接近 40k"触发。新增 §13.24 + audit 教训第 13 条：分层 mock 设计漏了"真业务 context budget"约束，下次 L2a mock_llm_server 加边界 case。|
@@ -2270,6 +2271,44 @@ prompts_batch = prompts_batch[:, -max_prompt_length:]    # left-truncate 到 16K
 
 stage1 此后默认 `data.max_prompt_length=32768`。W3 视 OpenHands prompt 实际增长，可能再升。
 
+### 13.27 W2.22 random fallback 漏洞修正：reward==0 也走 fallback（W2.24）
+
+**症状预判（用户提问）**：W2.23 fix 后，pad_sequence 应该不再 empty，4 个 rollout 都能进 GRPO。但用户敏锐发现：**4 个 rollout 都返回 `reward=0.0`（因为 MAX_ITERATIONS=1 → agent 没写 impl 文件 → `_npu_operator_reward` 走 "no impl file" 分支返回 0.0），GRPO `advantage = (0 - 0) / 0 = NaN`，PPO step 仍然会挂**。
+
+**根因（W2.22 漏洞）**：W2.22 把初始 `reward = 0.0` 改成 `reward = random.random()`，但 try 内 `reward = _npu_operator_reward(...)` **无条件覆盖初始值**。`_npu_operator_reward` 返回 0.0 是**正常成功路径**（不是 exception），会把 random 初值刷掉。fallback 只在 except 分支生效，正常返回 0.0 不触发。
+
+**这是 W2.22 描述里我自己埋的逻辑漏洞**（plan §13.25 末段"random fallback 永远 in 但正常时 dormant"暗示了它生效条件，但没指出"reward==0 = 正常返回 != exception"这条分支）。用户问起来才修。
+
+**修复（W2.24，3 行）**：[openhands_agent.py:717-738](rllm/examples/openhands_sdk/openhands_agent.py:717) try 分支加 `if real_reward > 0.0:` 条件覆盖：
+
+```python
+reward = random.random()  # 初始 fallback（覆盖两种 case）
+try:
+    output = _run_openhands_container(...)
+    real_reward = _npu_operator_reward(...)
+    if real_reward > 0.0:           # ← W2.24 关键：只在真信号 > 0 时覆盖
+        reward = real_reward
+    # else: 保留 random（GRPO variance）
+except Exception:
+    pass   # reward 也保留 random
+```
+
+**行为对照**：
+
+| 场景 | `_npu_operator_reward` 返回 | W2.22 行为 | W2.24 行为 |
+|---|---|---|---|
+| 容器异常 | 抛异常 | random ✓ | random ✓ |
+| MAX_ITERATIONS=1, no impl file | 0.0 | **0.0 ✗ GRPO NaN** | **random ✓** |
+| 有 impl 无 trace | 0.2 | 0.2 ✓ | 0.2 ✓ |
+| 真解出题 | 0.5/0.8/0.95 | 真值 ✓ | 真值 ✓ |
+| W3 condenser 接入 | > 0 主流 | 真值, fallback dormant | 同左，**完全一样** |
+
+**W3 transition 零摩擦**：真 reward > 0 自然接管，random fallback dormant。代码不需要 stage2 cleanup，不需要 env gate。
+
+**Audit 教训第 16 条**：**fallback 的触发条件要精确写在 docstring/comment 里 + 单测覆盖**。W2.22 我口头说"正常路径不触发"，没说"reward 在 try 内被无条件覆盖"。下次写 fallback：(a) 列出明确的触发 condition；(b) 加 unit test 覆盖所有 fallback case。
+
+`test_reward_pipeline.py`（未来要写的 fixture 测试，§13.25 提到过）应该加一个 `assert reward != 0.0` 的回归 case，保证未来代码改动不破坏这个保护。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2310,8 +2349,9 @@ push 到:  origin/qwen36-openhands-stage1
 | W2.21 max_model_len 32k→49152 unblock L3 | 1 | `e5e6c9ce` |
 | W2.21 §14 onboarding 同步 | 1 | `87f03325` |
 | W2.22 MAX_ITERATIONS=1 + random fallback reward | 1 | `2a2fdbb7` |
-| W2.23 `data.max_prompt_length` 8192→32768 + 诊断工具 | 1 | （本轮 commit） |
-| 最新 | — | 本轮（plan §13.26 + W2.23 + `diagnose_trace_store.py`） |
+| W2.23 `data.max_prompt_length` 8192→32768 + 诊断工具 | 1 | `4f941da2` |
+| W2.24 random fallback 条件覆盖修正 | 1 | （本轮 commit） |
+| 最新 | — | 本轮（plan §13.27 + W2.24） |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2376,6 +2416,7 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.21 max_model_len 32k→49152 解决 OpenHands 30k 重 prompt 首轮越界 1 token
 - ✓ W2.22 改换策略：MAX_ITERATIONS=1 + rollout fallback reward random.random()（stage1 只验 trainer 链路、不在乎 reward 真假）
 - ✓ W2.23 `data.max_prompt_length` 8192→32768 解决 `agent_sdk_engine.py:563` step 过滤把所有 trace step 全 drop 的问题；过程中诊断完 DB 链路完全干净（trace_store / session_uid / data vs metadata 字段对齐都验过）
+- ✓ W2.24 W2.22 random fallback 漏洞修正：reward==0 也走 fallback（之前只在 exception 触发，正常返回 0 直接覆盖；加 `if real_reward > 0.0` 条件覆盖）
 
 **当前位置**：W2.23 fix 后等待 L3 重跑结果。已诊断清楚 trace store / session_uid / max_prompt_length 全链路；上一次 L3 跑全部子链路通到 `transform_results_for_verl`，因 step 过滤阈值过低被全 drop。fix 后 step 应能放行，期望挂点回到 PPO step 真挂这种"上游链路全通"的位置。
 
@@ -2461,13 +2502,15 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 - W3 长跑前必须监控 episode 长度 P95：超 40k 升 65536，超 60k 必须上 condenser
 - L2a `mock_llm_server` 当前没模拟"prompt > max_model_len 的边界"，下一轮 mock 设计要补
 
-**stage1 unblock 策略：MAX_ITERATIONS=1 + random fallback reward**（plan §13.25，audit 教训第 14 条）：
+**stage1 unblock 策略：MAX_ITERATIONS=1 + random fallback reward**（plan §13.25 + §13.27，audit 教训第 14 + 16 条）：
 - stage1 不在乎 agent 真解题，只在乎 trainer 链路（rollout → trace → batch → PPO step → checkpoint）跑起来
 - `OPENHANDS_MAX_ITERATIONS=1` 锁单 turn，prompt 永远 ~30k，trace store 有真 LLM 数据 → PPO batch 能构造
-- rollout fallback reward = `random.random()` 而非 `0.0`，保证 4 个 rollout reward 有 variance，GRPO `std≠0` → PPO step 不出 NaN
-- **训练信号是 mock 的**：纯噪声 advantage，不要在 stage1 期待 reward 曲线上升 / 模型学到东西
-- 真训练前置：condenser 接入 + multi-turn agent + MAX_ITERATIONS 拉回正常值 + 真 reward 接管（自动发生，random fallback 只在异常时生效）
-- 不加 `STAGE1_MOCK_REWARD` env gate（已决策"env 太多"），随机 fallback 永远 in 但正常时 dormant
+- rollout fallback reward = `random.random()`：**两种情况都生效**（W2.24 修正）：
+  - (a) exception 路径（容器 crash / reward 函数 raise）
+  - (b) `_npu_operator_reward` 返回 0.0（"no impl file"）→ `if real_reward > 0.0` 条件不通过 → 保留 random
+- 真 reward > 0 时（W3+ condenser 接入后主流）自动接管，random 自然 dormant，**W3 transition 零摩擦**
+- **训练信号是 mock 的**：stage1 纯噪声 advantage，不要期待 reward 曲线上升 / 模型学到东西
+- 不加 `STAGE1_MOCK_REWARD` env gate（已决策"env 太多"），fallback 永远 in 但正常时 dormant
 
 **`data.max_prompt_length` vs OpenHands 真 prompt 量级**（plan §13.26，audit 教训第 15 条）：
 - OpenHands 首轮 prompt 30k+，stage1 默认 `data.max_prompt_length=32768`（W2.23 从 8192 升）必须 ≥ 实际 prompt
