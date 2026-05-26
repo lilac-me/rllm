@@ -707,11 +707,19 @@ stage1 不做、留到 stage2+ 处理的功能项：
 - **bypass rollout / token-id 调试代码归位**：HEAD 私有提交与上游 `d09f6155` 等 patch 的去重
 - **legacy example 标 deprecated**：14 个 example 入口具体到 PR/commit 动作
 - **GDN bshd 模式下 multi-turn merge / response_mask 的可视化验收**（当 §0.1 实测决定走 `use_remove_padding=False` 时）
-- **🔴 rllm `AgentSdkTrainer` 同步 verl `_compute_old_log_prob` 的 3 步桥接**（plan §13.29 真根因，audit 教训 #18 反思）：
-  - **问题**：verl 自家 trainer 在调 `actor_rollout_wg.compute_log_prob(batch_td)` 前做了 `batch.to_tensordict() + left_right_2_no_padding + tu.assign_non_tensor(...)` 3 步桥接（[verl ray_trainer.py:1212-1226](verl-BryanChen408/verl/trainer/ppo/ray_trainer.py:1212)）；rllm `AgentSdkTrainer.fit_agent` 直接传 DataProto。W2.26 在 verl-fork worker 入口补了类型转换，但 metadata（`compute_loss=False` / `calculate_entropy` / `no_lora_adapter` 等）没补。
-  - **触发条件**：W2.26 worker 入口 shim 留下的语义偏差若导致后续路径挂（compute_loss 默认 True vs verl 自家 False 的差异）
-  - **修法**：在 rllm `agent_sdk_trainer.py:418` + `:534` 调 worker 前补 3 步桥接，照搬 verl `_compute_old_log_prob` 那段。同时可删 W2.26 verl-fork worker 入口转换（保留 W2.25 tu.pop 守卫做 generic 硬化）
-  - **触发后做**：删 verl-fork commit `7e30674e` 的入口转换 + 在 rllm trainer 补桥接 + plan §13.29 标"已修复 stageN.x"
+- ✅ ~~**rllm `AgentSdkTrainer` 同步 verl `_compute_old_log_prob` 的 3 步桥接**~~ — **已 W2.27 完成**（rllm `dd229d51` + verl-fork revert `9998be02`，见 §13.30）。
+  - **W2.27 (β) 未做的 stage2 follow-up**（要等 L3 跑出真问题再决定优先级）：
+    - **逐字段 `no_padding_2_padding` 输出转换**：verl 自家 `_compute_old_log_prob:1235-1238` 对 log_probs / entropy / sum_pi_squared 各自做 `no_padding_2_padding(field, batch_td)` 还原 padded shape；W2.27 用 `DataProto.from_tensordict` 整体转，**未做逐字段重塑**。若 rllm 下游 `old_log_prob.batch["entropys"]` 期望 padded shape 但拿到 no-padding shape，跑挂时回头补
+    - **`update_actor` 输出 `rename_dict + from_single_dict` 重包**：verl 自家 `_update_actor:1283-1287` 做完整 metric 重命名 + 重包，W2.27 用 `DataProto.from_tensordict` 整体转。若 rllm `actor_output.meta_info["metrics"]` 读取格式不对，跑挂时回头补
+    - **routed_experts / teacher_logprobs 处理**：verl 自家 `_compute_old_log_prob:1230` 拿 `routed_experts`，stage1 不开 distillation 用不到，跳过
+- **🟡 修 `agent_sdk_engine.py:624` 硬编码 `max_prompt_length = 16384`**（plan §13.26 / W2.23 follow-up，用户决策推迟）：
+  - **问题**：W2.23 `data.max_prompt_length=32768` 让 step 过滤通过，但 [agent_sdk_engine.py:624](rllm/engine/agent_sdk_engine.py:624) line 622 读 config 后 line 624 立刻硬编码覆盖 `max_prompt_length = 16384`，导致实际 PPO 只拿 16K tokens，30K - 16K = 14K 浪费。`[DEBUG format]` 打印 line 623 暴露是别人调试残留
+  - **stage1 不修的理由**（用户决策 2026-05-26）：stage1 走 random reward fallback，训练信号本来就 mock，扔 14K tokens 不影响"验证 trainer 链路"目标；且当前 line 624 截到 16k 反而保护 NPU KV cache 不被 30k 拖爆。W3 真训练前必须解决
+  - **修法**：删 [:624](rllm/engine/agent_sdk_engine.py:624) `max_prompt_length = 16384` 那一行，让 line 622 读到的 config 值直接生效；同步评估 NPU KV cache 余量是否撑得住 32K
+- **🟡 W2.28：把 verl-fork `85159408` worker re-export shim 移到 rllm 侧**（plan §13.11 W2.8 follow-up，用户决策推迟）：
+  - **问题**：W2.8 在 verl-fork 加了 `verl/workers/megatron_workers.py` + `verl/workers/fsdp_workers.py` 两个 shim re-export `engine_workers` 内容，让 rllm `train_agent_ppo.py:99/105/122/134` 4 个老 import 工作。属"次优 side"——rllm 这 4 个 import 完全在 `rllm/trainer/verl/` 可改区
+  - **stage1 不修的理由**（用户决策 2026-05-26）：W2.8 shim 功能上完全正常没引起 bug；做 W2.28 现在 = 引入未必要变动，可能踩 `AsyncActorRolloutRefWorker` vs `ActorRolloutRefWorker` 行为微妙差异
+  - **修法**：rllm 4 处 import 改为 `from verl.workers.engine_workers import ActorRolloutRefWorker as AsyncActorRolloutRefWorker` 和 `from verl.workers.engine_workers import TrainingWorker as CriticWorker`（或更彻底改用新名）+ revert verl-fork `85159408`
 - **🔴 删除 stage1 random reward fallback**（plan §13.25 + §13.27，代码块在 [openhands_agent.py:717-740](rllm/examples/openhands_sdk/openhands_agent.py:717)）：
   - **触发条件（4 个必须同时满足）**：
     1. OpenHands `Condenser` 接入完成（多 turn prompt 不再线性增长）
