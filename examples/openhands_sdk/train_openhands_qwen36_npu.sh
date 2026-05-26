@@ -183,15 +183,20 @@ for _dir in "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" "${OPENHANDS_ARTIFACT_DIR}"; 
     fi
     rm -f "${_dir}/.stage1_precheck"
 done
-# Soft check: workspace_temp dir SHOULD also be a real bind mount (not an
-# overlay dir created post-launch inside the main container — that defeats DooD).
-# findmnt may not be available in all images, so this is best-effort warning only.
+# Soft check: workspace_temp dir SHOULD live under a host bind mount, NOT on the
+# main container's overlay layer (that defeats DooD — sibling container would see
+# empty /opt/workspace). `findmnt -T` walks up the mount tree, so mounting an
+# ancestor like `-v /home/docker:/home/docker` is correctly accepted here.
+# Warn only when the underlying fs is overlay/tmpfs (i.e. clearly NOT a bind mount).
+# findmnt may not be present in all images — skip silently if missing.
 if command -v findmnt >/dev/null 2>&1; then
-    if ! findmnt -no SOURCE "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" >/dev/null 2>&1; then
-        echo "[stage1 precheck] WARN: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} exists but is NOT a bind mount." >&2
-        echo "  Child OpenHands containers will see empty /opt/workspace and fail." >&2
-        echo "  Fix: restart main container with -v ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}:${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" >&2
+    _fstype=$(findmnt -no FSTYPE -T "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" 2>/dev/null || echo "")
+    if [ "${_fstype}" = "overlay" ] || [ "${_fstype}" = "tmpfs" ]; then
+        echo "[stage1 precheck] WARN: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} sits on '${_fstype}' fs (not a bind mount)." >&2
+        echo "  Child OpenHands containers will likely see empty /opt/workspace and fail." >&2
+        echo "  Fix: restart main container with -v <host_path>:<container_path>; mounting any ancestor (e.g. -v /home/docker:/home/docker) also works." >&2
     fi
+    unset _fstype
 fi
 
 # ------------------------------------------------------------------------------
