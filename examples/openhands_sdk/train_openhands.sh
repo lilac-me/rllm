@@ -23,16 +23,22 @@ set -euo pipefail
 set -x
 
 # First time
-export RLLM_UI_URL=http://127.0.0.1:3000
+# export RLLM_UI_URL=http://127.0.0.1:3000
 export FORCE_BUILD=0
 export OPENHANDS_DATASET=mock_npu
-# export MODEL_PATH=/home/g00841271/Qwen3-8B
-export MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
+export MODEL_PATH=/home/p00938733/Qwen3-8B
+# export MODEL_PATH=/home/p00938733/Qwen3-Coder-30B-A3B-Instruct
+export PROXY_PORT=5000
 
-# export ASCEND_LAUNCH_BLOCKING=1
+export ASCEND_LAUNCH_BLOCKING=0 # TODO
 
-# export RAY_DEBUG_POST_MORTEM=0
-export RAY_DEBUG_POST_MORTEM=1
+# export HCCL_INTRA_ROCE_ENABLE=1 # TODO
+# export HCCL_INTRA_PCIE_ENABLE=0 # TODO
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+
+export RAY_DEBUG_POST_MORTEM=0
+# export RAY_DEBUG_POST_MORTEM=1
 
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
@@ -51,8 +57,8 @@ export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -62,9 +68,12 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
 export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
-export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/g00841271/Qwen3-8B}"
-export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-2}"
-export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
+# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/p00938733/Qwen3-8B}"
+export OPENHANDS_MODEL_NAME=$MODEL_PATH
+export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
+export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-20}"
+export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-900}"
+export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/p00938733/openhands_results}"
 
 # ------------------------------------------------------------------------------
 # Training parameters
@@ -76,6 +85,13 @@ PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-${HOME}/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-openhands-ppo}"
+logs=/home/p00938733/verl-rllm.log
+
+if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]]; then
+    TOOL_PARSER=qwen3_coder
+else
+    TOOL_PARSER=hermes
+fi
 
 echo "=== rllm + OpenHands (container-based) ==="
 echo "  Model           : ${MODEL_PATH}"
@@ -83,6 +99,7 @@ echo "  N_GPUS (trainer) : ${N_GPUS}"
 echo "  Proxy port      : ${PROXY_PORT}"
 echo "  OpenHands image : ${OPENHANDS_IMAGE}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
+echo "  Tool parser     : ${TOOL_PARSER}"
 
 # ------------------------------------------------------------------------------
 # Build the custom rllm-openhands image from workspace/Dockerfile.
@@ -116,13 +133,13 @@ ray start --head \
 # Each rollout spawns its own OpenHands Docker container via docker run.
 # No rllm sandbox (worker_server.py) wrapper is used.
 # ------------------------------------------------------------------------------
-python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
+
+python3 /home/p00938733/rllm-071/examples/openhands_sdk/train_openhands.py \
     algorithm.adv_estimator=grpo \
-    \
     data.train_batch_size=${BATCH_SIZE} \
     data.val_batch_size=16 \
-    data.max_prompt_length=8192 \
-    data.max_response_length=8192 \
+    data.max_prompt_length=16384 \
+    data.max_response_length=16384 \
     \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.hybrid_engine=True \
@@ -147,8 +164,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=4 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
-    \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=${TOOL_PARSER} \
     actor_rollout_ref.rollout.load_format=dummy \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.load_format=dummy \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
@@ -175,7 +191,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     rllm.rejection_sample.enable=False \
     \
     trainer.critic_warmup=0 \
-    "trainer.logger=['console','wandb']" \
+    "trainer.logger=['console']" \
     trainer.project_name=${PROJECT_NAME} \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.val_before_train=False \
@@ -191,7 +207,7 @@ python3 /home/g00841271/rllm-071/examples/openhands_sdk/train_openhands.py \
     rllm.sdk.proxy.port=${PROXY_PORT} \
     rllm.sdk.proxy.mode=subprocess \
     rllm.sdk.store.path="${TRACE_DB_PATH}" \
-    rllm.workflow.n_parallel_tasks=1
+    rllm.workflow.n_parallel_tasks=4  2>&1 | tee -i $logs
 
 
 # pkill -9 -f 'ray::WorkerDict' 2>/dev/null || true

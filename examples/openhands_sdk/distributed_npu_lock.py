@@ -49,9 +49,22 @@ class FairDevicePool:
     3. 轮转扫描所有设备，避免永远偏向低编号设备
     """
 
-    def __init__(self, lock_dir: str, prefix: str, device_count: int):
-        if device_count <= 0:
-            raise ValueError("device_count must be > 0")
+    def __init__(
+        self,
+        lock_dir: str,
+        prefix: str,
+        device_count: int,
+        device_ids: Optional[List[int]] = None,
+    ):
+        if device_ids is not None:
+            if not device_ids:
+                raise ValueError("device_ids must not be empty")
+            self.device_ids = list(device_ids)
+            device_count = len(self.device_ids)
+        else:
+            if device_count <= 0:
+                raise ValueError("device_count must be > 0")
+            self.device_ids = list(range(device_count))
 
         self.lock_dir = lock_dir
         self.prefix = prefix
@@ -93,7 +106,7 @@ class FairDevicePool:
 
     def _fair_order(self, ticket: int) -> List[int]:
         start = ticket % self.device_count
-        return [(start + i) % self.device_count for i in range(self.device_count)]
+        return [self.device_ids[(start + i) % self.device_count] for i in range(self.device_count)]
 
     def _try_acquire_device(self, device_id: int, meta: dict) -> Optional[DeviceLease]:
         path = self._device_lock_path(device_id)
@@ -173,7 +186,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fair GPU/NPU wrapper based on shared filesystem locks."
     )
-    parser.add_argument("--lock-dir", os.environ.get("EVAL_LOCK_DIR"), help="共享锁目录，例如 /shared/device-locks")
+    parser.add_argument(
+        "--device-ids",
+        default=os.environ.get("EVAL_DEVICE_IDS", ""),
+        help="Comma-separated physical device ids to allocate from, e.g. 8,9,10,11",
+    )
+    parser.add_argument("--lock-dir", default=os.environ.get("EVAL_LOCK_DIR"), help="共享锁目录，例如 /shared/device-locks")
     parser.add_argument("--device-prefix", default="gpu", help="设备前缀，如 gpu / npu")
     parser.add_argument("--device-count", type=int, required=True, help="设备数量")
     parser.add_argument("--env-name", default="CUDA_VISIBLE_DEVICES", help="设置给子进程的环境变量名")
@@ -202,10 +220,15 @@ def main():
         print("ERROR: empty command after --", file=sys.stderr)
         sys.exit(2)
 
+    device_ids = None
+    if args.device_ids:
+        device_ids = [int(x.strip()) for x in args.device_ids.split(",") if x.strip()]
+
     pool = FairDevicePool(
         lock_dir=args.lock_dir,
         prefix=args.device_prefix,
         device_count=args.device_count,
+        device_ids=device_ids,
     )
 
     extra_meta = {

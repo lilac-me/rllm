@@ -132,7 +132,7 @@ _MOCK_TASKS = [
 
 def create_parquet(output_path: str) -> None:
     rows = []
-    for task in _MOCK_TASKS:
+    for task in _MOCK_TASKS+_MOCK_TASKS+_MOCK_TASKS+_MOCK_TASKS:
         instruction = task["instruction"]
         prompt = json.dumps([{"role": "user", "content": instruction}])
         extra_info = {

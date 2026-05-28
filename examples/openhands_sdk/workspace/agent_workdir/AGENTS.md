@@ -1,157 +1,167 @@
-# Triton-Ascend 算子生成 Agent — 全局约定
+# Triton-Ascend Operator Agent
 
-## 固定配置
+This workspace is for generating Ascend NPU Triton implementations from
+KernelBench-style PyTorch reference modules.
 
-- **framework**: torch  |  **dsl**: triton_ascend  |  **backend**: ascend
+The workflow is adapted for OpenHands from the Triton operator-generation
+ideas in Just-it/AscendOpGenAgent. Use `references/ascend_op_gen_agent_triton.md`
+as a compact guide when planning kernels.
 
-## 环境规则
+## Target
 
-- OpenHands SDK 运行在 **venv** 里；编译 / 验证 / 性能采集运行在 **conda 环境** 里。
-- **禁止手动 `conda activate`**——conda 操作由 `tools/` 脚本内部处理。
-- **禁止修改** `tools/` 目录。
+- Backend: Ascend NPU.
+- DSL: Triton / Triton-Ascend.
+- Reference framework: PyTorch `Model`.
+- Required output file: `src/{op_name}_triton_ascend_impl.py`.
+- Required class: `ModelNew`.
+- `ModelNew.__init__` and `ModelNew.forward` must be compatible with the
+  reference `Model` in the task.
+- `ModelNew` must subclass `torch.nn.Module` or `nn.Module`.
+- Triton kernels must be defined at module scope, not nested inside `forward`.
+- Treat executable Python code as the source of truth. In particular,
+  `forward`, `get_inputs()`, and `get_init_inputs()` override comments,
+  docstrings, and shape descriptions if they disagree.
 
-### 网络与依赖（软约束）
+## Ground Rules
 
-本环境 **不提供可用的外网**（即使执行 `apt` / `pip install` / `curl` / `wget` 也会失败或不应依赖）。你必须 **只使用工作区内已有文件与 `tools/` 管线**，通过修改 `src/` 与运行 `bash tools/operator_pipeline.sh` 完成任务。**不要**尝试安装系统包、下载 wheel、或访问外部 URL 来「修复环境」；遇到缺依赖类错误，应调整算子实现或向 `metrics.json` / 脚本输出对齐排查，而不是联网。
+- Do not modify `tools/`.
+- Do not install packages, download files, run `apt`, run `pip install`, or use
+  external network access.
+- Use only files already in this workspace.
+- Preserve correctness before optimizing speed.
+- Keep generated code self-contained in the implementation file.
+- Do not add test-only code, print spam, or `if __name__ == "__main__"` blocks
+  to the implementation file.
+- Do not add `get_inputs()` or `get_init_inputs()` to the implementation file;
+  they belong only to the mirrored reference task file.
+- Do not create skeletons, placeholders, TODO-only code, or `pass` bodies. If a
+  complete high-performance implementation is hard, still write the simplest
+  executable Triton implementation you can validate.
+- Do not inspect `tools/` or `tools/operator_pipeline.sh`; the validation
+  command is fixed in the task. Avoid whole-file replacement edits after the
+  initial create step; use targeted edits so the conversation history stays
+  compact.
+- Do not use the think tool or write private reasoning transcripts. Act with
+  file edits and validation commands directly.
+- After the initial create, never use a whole-file replacement edit. Patch the
+  smallest failing block so the conversation history stays compact.
 
-## 工作流（Phase 0/1 已在 host 侧完成）
+## Workflow
 
-| Phase | 内容 | 技能 | 迭代上限 |
-|-------|------|------|---------|
-| 2 | 算法设计（可选，简单算子可跳过）→ `src/sketch.txt` | kernel-designer | 1 |
-| 3 | 代码生成与验证（核心循环）| kernel-generator + kernel-verifier | 5 |
-| 4 | 性能优化（⚠️ **必须执行，禁止跳过**）| latency-optimizer + kernel-verifier | 3 |
+1. Read the user message. It includes the full PyTorch reference code, so you do
+   not need to inspect a separate task file before starting. Your first file
+   operation should create `src/{op_name}_triton_ascend_impl.py` unless the
+   prompt is missing code.
+2. Identify inputs, initialization inputs, tensor shapes, dtypes, reductions,
+   broadcasts, layout transforms, and fusion opportunities.
+3. Write `src/{op_name}_triton_ascend_impl.py` with module-level `@triton.jit`
+   kernels and a compatible `ModelNew(nn.Module)`.
+4. Run:
 
+   ```bash
+   bash tools/operator_pipeline.sh --op_name {op_name}
+   ```
 
-### 何时运行 pipeline
+5. Read `metrics.json` after every pipeline run, including failed runs. Use
+   `error_type` and `error` as the primary debugging signal; terminal logs may
+   be clipped. If `metrics.json` has `"error_truncated": true` or an
+   `error_file`, read that file before deciding the next code change. Fix the
+   code and rerun the pipeline.
+6. When the pipeline reports success or `metrics.json` has `"success": true`,
+   stop editing the implementation file. Low speedup after a successful
+   benchmark is still success in this rollout. Only read `metrics.json`,
+   compare speedup with any existing `metrics_best.json`, save the best
+   implementation, and finish:
 
-⚠️ **只有在 `src/{op_name}_triton_ascend_impl.py` 已写入完整可执行代码后**，才运行：
+   ```bash
+   cp src/{op_name}_triton_ascend_impl.py src/{op_name}_triton_ascend_impl_best.py
+   cp metrics.json metrics_best.json
+   ```
 
-```bash
-bash tools/operator_pipeline.sh --op_name <op_name>
-```
+## PyTorch Fallback Policy
 
-分析任务、阅读文档、设计草图、编写代码等步骤**不需要也不应该**运行 pipeline。
+Core computation in `ModelNew.forward()` should be implemented in Triton kernels.
+The static checker rejects common PyTorch fallback patterns.
 
-### 最佳版本追踪
+Avoid using these for core math in `forward`:
 
-每次 pipeline 报告 `success: true` 后，比较 `metrics.json` 中的 `speedup_vs_torch` 与已保存的最佳版本：
+- `torch.matmul`, `torch.sum`, `torch.relu`, `torch.softmax`, and similar
+  compute operators.
+- `torch.nn.functional` compute calls such as `F.linear` or `F.softmax`.
+- Tensor compute methods and operators such as `.sum()`, `.mean()`, `@`, `+`,
+  `*` when they are replacing the target operation.
+- Calling reference submodules such as `self.conv(x)` or `self.linear(x)` for
+  the optimized path.
 
-- **首次成功**或**性能更优**时，保存为最佳版本：
-  ```bash
-  cp src/{op_name}_triton_ascend_impl.py src/{op_name}_triton_ascend_impl_best.py
-  cp metrics.json metrics_best.json
-  ```
-- **任务结束时**（达到迭代上限、B/C 类终止），若当前 `metrics.json` 不是成功状态**且最佳版本存在**，回退：
-  ```bash
-  if [ -f metrics_best.json ]; then
-    cp src/{op_name}_triton_ascend_impl_best.py src/{op_name}_triton_ascend_impl.py
-    cp metrics_best.json metrics.json
-  fi
-  ```
+Allowed support operations include allocation, shape inspection, reshaping,
+contiguity conversion, and launching Triton kernels.
+When launching Triton kernels, pass tensor objects directly, for example
+`kernel[grid](A, B, C, ...)`. Do not pass `.data_ptr()` or integer pointer
+values; Triton needs tensor arguments so `tl.load` and `tl.store` receive valid
+pointers.
+For scalar outputs such as reductions or losses, the final scalar must also be
+produced by Triton kernels. Do not use PyTorch post-processing like `.sum()`,
+`.mean()`, tensor indexing plus arithmetic, or scalar division in `forward`.
 
-最终产物始终是**编译通过、精度正确、性能最优**的版本。
+## Short Kernel Rules
 
-## 禁止 PyTorch 退化（最重要的约束）
+Use these rules silently. Do not print a plan before creating the file.
 
-`ModelNew.forward()` 中**所有核心计算**必须在 `@triton.jit` kernel 中实现。
+- Elementwise/broadcast: use one vectorized tile kernel over output elements.
+  `diag(A) @ B` is `C[i, j] = A[i] * B[i, j]`; never materialize `diag(A)`.
+- Matmul/linear: use a tiled `tl.dot` kernel, tensor arguments, fp32
+  accumulation when needed, and no dtype casts unless the reference does them.
+- Reductions: reduce inside a tile; for large axes use a small first-stage
+  partial reduction plus a final reduction kernel.
+- Transpose/slice/layout ops: allocate the output and write the exact indexed
+  layout in Triton. Keep stride, shape, and dtype identical to the reference.
+- Softmax/cumsum/conv/loss: write the simplest correct Triton version first,
+  then reduce tile sizes if compilation or memory fails.
 
-### forward() 中禁止的操作
+## Error Triage
 
-- `torch.matmul / torch.relu / torch.sum` 等计算函数
-- `F.softmax / F.linear` 等 `torch.nn.functional`
-- `x.sum() / x.mean() / x @ w` 等 tensor 方法/运算符
-- `self.conv(x) / self.linear(x)` 等 nn.Module 调用
+- Syntax/import/type errors: fix the implementation file.
+- `pass`, duplicate `forward`, or nested kernel definitions: replace them with
+  a complete module-level kernel and a single valid `forward`.
+- `Unsupported ptr type ... int64 in tl.load`: remove `.data_ptr()` from the
+  launch and pass tensors directly.
+- `Mask argument cannot be block type if pointer argument is not a block`: make
+  the pointer expression block-shaped too.
+- AST fallback failures: move the rejected PyTorch compute into Triton kernels.
+- Correctness failures: compare shape, dtype, broadcasting, reduction axes, and
+  numerical tolerances with the reference.
+- Triton-Ascend compile failures with `ub overflow`: reduce tile sizes first,
+  especially `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, and `BLOCK_SIZE_K`.
+- For tiled kernels, ensure the launch grid rank matches the `tl.program_id`
+  axes used in the kernel. If the kernel uses only `tl.program_id(0)`, compute
+  all block coordinates from that single linear id. If it uses
+  `tl.program_id(1)`, launch a 2D grid.
+- Benchmark failures after correctness passed: simplify the kernel, reduce
+  memory traffic, or tune block sizes. If benchmark completed successfully,
+  do not tune for higher speedup in the same rollout.
+- Device/environment failures: do not try to repair the environment with
+  installs. Record the issue from `metrics.json` and stop if it is not code
+  fixable.
 
-### forward() 中允许的操作
+## Metrics Contract
 
-- buffer 分配：`torch.empty / torch.zeros / torch.ones`
-- 形状操作：`.view / .reshape / .permute / .transpose / .contiguous`
-- 元信息：`.shape / .dtype / .device / .numel()`
-- kernel 启动：`kernel[grid](...)`
-
-## 错误分类与迭代决策
-
-### 分类规则
-
-| 类型 | 含义 | 决策 |
-|------|------|------|
-| **A 类** | 代码逻辑/算法错误 | 可修复，继续迭代 |
-| **B 类** | 环境/基础设施错误 | 不可修复，终止 |
-| **C 类** | 同一 A 类子类型连续 ≥ 3 次 | 终止 |
-
-### A 类常见子类型
-
-| 子类型 | error 特征 |
-|--------|-----------|
-| PyTorch 退化 Type 1 | 完全无 `@triton.jit` kernel |
-| PyTorch 退化 Type 2 | 有 kernel 但 `forward()` 未调用 |
-| PyTorch 退化 Type 3 | `forward()` 调用了 kernel 但部分计算仍用 PyTorch |
-| 输出不一致 | 数值精度差异、算法实现与参考不同 |
-| 语法/类型错误 | SyntaxError、TypeError、IndentationError |
-| 形状不匹配 | Tensor shape mismatch、维度错误 |
-| Kernel 参数错误 | BLOCK_SIZE 不合理、grid 配置错误 |
-| DSL API 错误 | Triton API 参数错误、不支持的操作 |
-
-### B 类常见子类型
-
-| 子类型 | error 特征 |
-|--------|-----------|
-| 设备不可用 | NPU OOM、device not found |
-| 依赖缺失 | ModuleNotFoundError（非代码导致） |
-| 超时 | Timeout、进程被杀死 |
-
-### 迭代失败时的分析模板
-
-每次迭代失败后，按以下格式进行结构化分析再修复：
-
-```
-错误分析：
-- 类型：{A/B/C}（{子类型}）
-- 位置：{错误代码位置}
-- 具体错误：{error 字段内容}
-
-修复建议：
-1. {具体修改方向}
-
-历史提醒：
-- 第 N 轮曾因 {问题} 失败，避免重复
-```
-
-## 文件布局
-
-```
-.
-├── INSTRUCTIONS.md
-├── src/
-│   ├── {op_name}.py                       # 任务文件（host 写入）
-│   ├── {op_name}_triton_ascend_impl.py    # Agent 实现（当前版本）
-│   ├── {op_name}_triton_ascend_impl_best.py     # 最佳成功版本备份（成功过才有）
-│   └── sketch.txt                         # 可选
-├── metrics_best.json                      # 最佳成功版本的 metrics（成功过才有）
-├── tools/                                 # 只读
-│   ├── operator_pipeline.sh
-│   ├── env.sh
-│   └── scripts/{validate_triton_impl,verify,benchmark}.py
-├── metrics.json
-└── profiling_results.json
-```
-
-## metrics.json schema
+The pipeline writes `metrics.json`:
 
 ```json
 {
   "schema_version": 2,
-  "op_name": "softmax",
   "success": true,
   "ast_check_ok": true,
   "correctness_ok": true,
   "perf_data": {
     "framework_latency_ms": 1.23,
     "impl_latency_ms": 0.56,
-    "speedup_vs_torch": 2.17,
-    "peak_memory_mb": 128.0
+    "speedup_vs_torch": 2.17
   },
   "error": null
 }
 ```
+
+Failed runs may also include `error_type`, `error_file`, and `error_truncated`.
+The RL reward is computed from this file. Always run the pipeline after code
+changes so the final reward reflects the actual implementation.

@@ -27,38 +27,15 @@ set -x
 
 # First time
 # export MODEL_PATH=/home/p00938733/Qwen3-8B
-export MODEL_PATH=/home/p00938733/Qwen3-Coder-30B-A3B-Instruct
+export MODEL_PATH=/home/docker/Qwen3-Coder-30B-A3B-Instruct
 # export MODEL_PATH=/home/p00938733/cszhou_sft_weight/global_step_100
 export PROXY_PORT=5000
 export LLM_MAX_OUTPUT_TOKENS="${LLM_MAX_OUTPUT_TOKENS:-2048}"
 
 export ASCEND_LAUNCH_BLOCKING=0 # TODO
 
-# ------------------------------------------------------------------------------
-# OOM debug toggle (paired with rllm/trainer/verl/npu_mem_debug.py).
-#
-# RLLM_MEM_DEBUG=1 enables per-step NPU allocator counter prints at 5 points
-# (step_start/after_gen/after_old_logprob/after_update/step_end), plus a top-20
-# live-tensor dump on steps 1/2/3. No-op when unset.
-#
-# Pair with ASCEND_LAUNCH_BLOCKING=1 only when you need OOM error attribution
-# (otherwise the traceback can point to a downstream sync, not the actual op
-# that OOM'd). The counter readings themselves are correct without sync — the
-# allocator updates synchronously on Python alloc. Async launch only hides
-# workspace allocations from inside fused ops in the peak_a reading.
-#
-# Diagnosis flow at BS=2:
-#   step_start SETTLED Δa across consecutive steps:
-#     == 0    → no leak, BS=3 OOM is peak/fragmentation → tune
-#     >> 0    → residual tensor leak → check [LIVE r0] diff
-#   after_gen Δa vs step_start: large → vLLM sleep didn't release
-#   num_alloc_retries climbing → allocator fragmentation, try max_split_size_mb=256
-# ------------------------------------------------------------------------------
-# export RLLM_MEM_DEBUG=1
-# export ASCEND_LAUNCH_BLOCKING=1  # only when chasing OOM error attribution
-
 nic_name="ens1f3"
-export HCCL_IF_IP=80.48.5.63
+export HCCL_IF_IP=80.48.5.65
 export GLOO_SOCKET_IFNAME=$nic_name
 export TP_SOCKET_IFNAME=$nic_name
 export HCCL_SOCKET_IFNAME=$nic_name
@@ -92,12 +69,12 @@ export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:128"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
 export OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3
-export OPENHANDS_REMOTE_EVAL_URL=http://80.48.5.51:16880
-export OPENHANDS_CONTAINER_HOST_ALIAS=80.48.5.63
+export OPENHANDS_REMOTE_EVAL_URL=http://80.48.5.51:16881
+export OPENHANDS_CONTAINER_HOST_ALIAS=80.48.5.51
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_CONFIGURE_LOGGING=1
@@ -121,7 +98,7 @@ else
     export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-20}"
 fi
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
-export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/home/p00938733/openhands_results}"
+export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/op[<0;216;34M[<0;216;34menhands_results}"
 
 # Optional: reserve a separate NPU pool for OpenHands operator validation.
 # For strict isolation, remove these ids from ASCEND_RT_VISIBLE_DEVICES above.
@@ -148,7 +125,7 @@ export OPENHANDS_CONTAINER_HOST_ALIAS="${OPENHANDS_CONTAINER_HOST_ALIAS:-host.do
 export OPENHANDS_DATASET=kernelbench
 export OPENHANDS_KERNELBENCH_LEVELS=level_1
 # export OPENHANDS_KERNELBENCH_LEVELS=level_1,level_2
-export OPENHANDS_KERNELBENCH_PARQUET=/home/p00938733/rllm-071/examples/openhands_sdk/kernelbench_openhands.parquet
+export OPENHANDS_KERNELBENCH_PARQUET=/workspace/rllm-openhands/examples/openhands_sdk/kernelbench_openhands.parquet
 export OPENHANDS_KERNELBENCH_MAX_ROWS=128
 export OPENHANDS_KERNELBENCH_ARCH=ascend910b1
 export OPENHANDS_KERNELBENCH_OPERATOR_BACKEND=triton
@@ -181,14 +158,14 @@ export RLLM_DISABLE_VLLM_INSTRUMENTATION=1
 # ------------------------------------------------------------------------------
 # Training parameters
 # ------------------------------------------------------------------------------
-N_GPUS="${N_GPUS:-16}"
+N_GPUS="${N_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
-TRACE_DB_PATH="${TRACE_DB_PATH:-/home/p00938733/rllm-openhands-traces.db}"
+TRACE_DB_PATH="${TRACE_DB_PATH:-/workspace/results/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-rllm-openhands}"
-logs=/home/p00938733/verl-rllm.log
+logs=/workspace/results/verl-rllm.log
 
 # profiling configuration
 PROFILE_STEPS="[1]"
@@ -198,7 +175,7 @@ DISCRETE=False
 # PROFILE_CONTINUOUS_STEPS=True
 
 # profiling NPU options
-SAVE_PATH="/home/p00938733/profile_data/all"
+SAVE_PATH="/workspace/results/profile_data/all"
 LEVEL="level0"
 CONTENTS=['npu','cpu','memory']
 #CONTENTS=['npu','cpu','memory','module','stack']
@@ -241,7 +218,7 @@ echo "  Tool parser     : ${TOOL_PARSER}"
 #         examples/openhands_sdk/workspace
 # fi
 
-python prepare_kernelbench_openhands_data.py
+#python prepare_kernelbench_openhands_data.py
 
 echo "正在重启 Ray 集群清理 NPU 状态..."
 ray stop --force || true
@@ -324,7 +301,7 @@ ARGS=(
   +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
-  +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=3
+  +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
   +actor_rollout_ref.actor.checkpoint.save_contents="['model']"
 
   # =========================
@@ -403,7 +380,7 @@ ARGS=(
   # trainer
   # =========================
   trainer.critic_warmup=0
-  trainer.logger='["console","wandb"]'
+  trainer.logger='["console"]'
   trainer.project_name=${PROJECT_NAME}
   trainer.experiment_name=${EXPERIMENT_NAME}
   trainer.val_before_train=False
@@ -448,3 +425,4 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
     -- \
     python3 -m examples.openhands_sdk.train_open_megatron "${ARGS[@]}" \
     2>&1 | tee -i $logs
+

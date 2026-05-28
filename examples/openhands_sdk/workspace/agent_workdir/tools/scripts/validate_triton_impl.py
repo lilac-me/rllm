@@ -224,6 +224,36 @@ def check_kernel_calls_in_forward(forward_node, kernel_names, wrapper_names):
     return called
 
 
+def _contains_name_subscript(node):
+    for child in ast.walk(node):
+        if isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name):
+            return child.value.id
+    return None
+
+
+def check_invalid_structure(tree):
+    """Reject common scaffold/test artifacts before deeper Triton checks."""
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Pass):
+            violations.append({
+                "line": node.lineno,
+                "kind": "pass",
+                "reason": "`pass` is placeholder code; provide executable implementation",
+            })
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+            "get_inputs",
+            "get_init_inputs",
+        }:
+            violations.append({
+                "line": node.lineno,
+                "kind": node.name,
+                "reason": f"`{node.name}()` belongs to the reference task file, not the implementation file",
+            })
+    return violations
+
+
 def check_forbidden_torch_ops(forward_node):
     """检查 forward 中是否使用了禁止的 torch 计算操作。
 
@@ -242,6 +272,16 @@ def check_forbidden_torch_ops(forward_node):
                 "reason": "矩阵乘法 @ 运算符必须在 Triton kernel 中实现",
             })
             continue
+
+        if isinstance(node, ast.BinOp):
+            subscript_name = _contains_name_subscript(node)
+            if subscript_name is not None:
+                violations.append({
+                    "line": node.lineno,
+                    "call": f"{subscript_name}[...] arithmetic",
+                    "reason": "tensor indexing followed by arithmetic is PyTorch scalar post-processing; implement the final scalar in Triton",
+                })
+                continue
 
         if not isinstance(node, ast.Call):
             continue
@@ -318,6 +358,7 @@ def validate(code, filepath="<unknown>"):
         "valid": False,
         "filepath": filepath,
         "checks": {
+            "invalid_structure": {"passed": False, "violations": [], "error": None},
             "triton_kernel_exists": {"passed": False, "kernels": [], "error": None},
             "kernel_called_from_forward": {"passed": False, "called": [], "error": None},
             "no_forbidden_torch_ops": {"passed": False, "violations": [], "error": None},
@@ -336,6 +377,24 @@ def validate(code, filepath="<unknown>"):
         return result
 
     # --- Check 1: kernel 存在性 ---
+    structure_violations = check_invalid_structure(tree)
+    result["checks"]["invalid_structure"]["violations"] = structure_violations
+    if structure_violations:
+        result["checks"]["invalid_structure"]["error"] = (
+            f"implementation contains {len(structure_violations)} scaffold/test artifact(s)"
+        )
+        details = "; ".join(
+            f"line {v['line']}: {v['kind']}" for v in structure_violations[:5]
+        )
+        result["regression_type"] = 1
+        result["suggestion"] = (
+            f"Remove scaffold/test artifacts before validation: {details}. "
+            "The implementation file must contain complete ModelNew and module-level Triton kernels only."
+        )
+        return result
+
+    result["checks"]["invalid_structure"]["passed"] = True
+
     kernels = find_triton_kernels(tree)
     kernel_names = set(kernels.keys())
     result["checks"]["triton_kernel_exists"]["kernels"] = [
