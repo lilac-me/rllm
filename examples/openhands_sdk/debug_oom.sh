@@ -26,6 +26,20 @@ set -euo pipefail
 set -x
 
 # -----------------------------------------------------------------------------
+# Reap OpenHands containers left over from previous runs.
+#   - Normal rollouts already self-clean via the finally block in
+#     openhands_agent.py / remote_eval_worker.py (docker rm -f).
+#   - This sweep catches orphans from SIGKILLed trainers or Ray worker
+#     recycles, plus prunes the dangling-container pool that builds up over
+#     long training (each rollout = 1 new overlay2 layer).
+#   - Stuck "Created" containers from a dockerd state-machine bug usually
+#     ignore "docker rm -f" and need a daemon restart — we don't attempt that
+#     here, fail soft and continue.
+# -----------------------------------------------------------------------------
+docker ps -a --filter "name=rllm-openhands-" -q 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+docker container prune -f 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
 # Load machine/path/network config (paths, IPs, ports, image, memory tuning).
 # Override which config file is loaded with RLLM_CONFIG_FILE.
 # Variables exported from the config: MODEL_PATH, TRAIN_HOST_IP, EVAL_WORKER_IP,
@@ -85,15 +99,18 @@ export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-# export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
-export OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3
-export OPENHANDS_REMOTE_EVAL_URL="http://${EVAL_WORKER_IP}:${EVAL_WORKER_PORT}"
-# CRITICAL: must be TRAIN_HOST_IP so OpenHands containers (running on eval host)
-# can reach the LiteLLM proxy on the train host. Setting this to EVAL_WORKER_IP
-# causes Connection refused — see PQY_DEBUG_CONTEXT history.
-export OPENHANDS_CONTAINER_HOST_ALIAS="$TRAIN_HOST_IP"
+# NPU pool, remote-eval URL, and container host alias all come from config:
+#   ASCEND_RT_VISIBLE_DEVICES    trainer NPU pool (e.g. 0-7)
+#   OPENHANDS_EVAL_DEVICE_IDS    NPUs OpenHands containers may use
+#                                (e.g. 0-3 on a separate eval host;
+#                                 8-15 in single-host 16-NPU layout)
+#   OPENHANDS_REMOTE_EVAL_URL    empty -> same-machine docker-run;
+#                                http://host:port -> remote_eval_worker.py
+#   OPENHANDS_CONTAINER_HOST_ALIAS  host.docker.internal in single-host;
+#                                   train-host IP in multi-host (must reach
+#                                   the LiteLLM proxy from inside the
+#                                   OpenHands container)
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_CONFIGURE_LOGGING=1
