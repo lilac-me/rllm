@@ -58,6 +58,24 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
+# -----------------------------------------------------------------------------
+# Worker health check (fail-fast if remote_eval_worker.py isn't running).
+#   - Skipped when OPENHANDS_REMOTE_EVAL_URL is empty (legacy same-machine
+#     docker-run path; not the recommended deployment).
+#   - Worker exposes GET /health -> 200 (remote_eval_worker.py:190).
+#   - The cmd MUST be reachable BEFORE training starts, otherwise the first
+#     rollout hangs on a 2100s HTTP timeout — we'd rather die at second 3.
+# -----------------------------------------------------------------------------
+if [[ -n "${OPENHANDS_REMOTE_EVAL_URL:-}" ]]; then
+    if ! curl -sf -m 3 "${OPENHANDS_REMOTE_EVAL_URL}/health" >/dev/null 2>&1; then
+        echo "ERROR: remote_eval_worker not reachable at ${OPENHANDS_REMOTE_EVAL_URL}/health" >&2
+        echo "Start it first, e.g. on the host:" >&2
+        echo "  python3 remote_eval_worker.py --host 0.0.0.0 --port 16881 --work-dir /tmp/openhands_workspace" >&2
+        exit 1
+    fi
+    echo "[debug_oom] worker health OK: ${OPENHANDS_REMOTE_EVAL_URL}"
+fi
+
 export LLM_MAX_OUTPUT_TOKENS="${LLM_MAX_OUTPUT_TOKENS:-2048}"
 
 export ASCEND_LAUNCH_BLOCKING=0 # TODO

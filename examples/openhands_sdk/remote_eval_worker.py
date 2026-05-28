@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import glob
 import io
 import json
 import os
@@ -21,6 +22,46 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+
+# Host path used as the `-v` source for OpenHands containers' NPU file-lock
+# directory. MUST exist on the host filesystem (where the worker runs), since
+# this is what `docker run -v <here>:/shared/device-locks` will see. Hard-coded
+# to match openhands_agent.py and the container's EVAL_LOCK_DIR.
+_SHARED_NPU_LOCK_DIR = "/tmp/shared_npu_lock"
+
+# Worker-side GC window: files older than this in work-dir / lock-dir are
+# considered orphaned (worker / OpenHands container crashed without cleanup)
+# and removed at startup.
+_GC_OLDER_THAN_SEC = 3600  # 1 hour
+
+
+def _gc_stale_files(work_dir: str, older_than_sec: int = _GC_OLDER_THAN_SEC) -> None:
+    """Reap leftover per-rollout workdirs and stale NPU locks at startup.
+
+    Normal flow already self-cleans via the finally block in do_POST and the
+    OpenHands container's own exit. This sweep catches SIGKILL / OOM-killed
+    worker processes and any locks the container couldn't release.
+
+    Stuck "Created" containers from a dockerd state bug are NOT touched here —
+    those need a daemon restart and we fail soft.
+    """
+    now = time.time()
+    for path in glob.glob(os.path.join(work_dir, "openhands-remote-eval-*")):
+        try:
+            if now - os.path.getmtime(path) > older_than_sec:
+                shutil.rmtree(path, ignore_errors=True)
+                print(f"[remote-eval] gc removed stale workdir: {path}", flush=True)
+        except OSError:
+            pass
+    if os.path.isdir(_SHARED_NPU_LOCK_DIR):
+        for path in glob.glob(os.path.join(_SHARED_NPU_LOCK_DIR, "*")):
+            try:
+                if now - os.path.getmtime(path) > older_than_sec:
+                    os.remove(path)
+                    print(f"[remote-eval] gc removed stale lock: {path}", flush=True)
+            except OSError:
+                pass
 
 
 def _extract_tar_b64(encoded: str, destination: str) -> None:
@@ -271,9 +312,14 @@ def main() -> None:
     args = parser.parse_args()
 
     Path(args.work_dir).mkdir(parents=True, exist_ok=True)
+    # mkdir on the *host* side — trainer's mkdir in openhands_agent.py:719
+    # lives inside the dev container fs and isn't what `docker run -v` will see.
+    Path(_SHARED_NPU_LOCK_DIR).mkdir(parents=True, exist_ok=True)
+    _gc_stale_files(args.work_dir)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.work_dir = args.work_dir  # type: ignore[attr-defined]
     print(f"[remote-eval] listening on http://{args.host}:{args.port}", flush=True)
+    print(f"[remote-eval] work_dir={args.work_dir}  npu_lock_dir={_SHARED_NPU_LOCK_DIR}", flush=True)
     httpd.serve_forever()
 
 
