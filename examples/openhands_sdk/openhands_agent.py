@@ -68,7 +68,7 @@ def dbg(msg: str):
     rank = os.getenv("RANK", "NA")
     local_rank = os.getenv("LOCAL_RANK", "NA")
     msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
-    path = f"/home/p00938733/openhands_{socket.gethostname()}_{os.getpid()}.log"
+    path = os.path.join(os.environ.get("RLLM_LOG_DIR", "/tmp"), f"openhands_{socket.gethostname()}_{os.getpid()}.log")
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{time.time()} {msg}\n")
         f.flush()

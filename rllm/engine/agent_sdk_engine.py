@@ -2,9 +2,10 @@ import asyncio
 import functools
 import inspect
 import logging
+import os
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
@@ -37,6 +38,16 @@ if TYPE_CHECKING:
     from rllm.sdk.tracers import TracerProtocol
 
 logger = logging.getLogger(__name__)
+
+# Gate noisy format/padding debug output behind an env var so production logs
+# stay clean. Set RLLM_ENGINE_DEBUG=1 to surface the prints used during the
+# pqy BS=3 OOM investigation.
+_ENGINE_DEBUG = bool(os.environ.get("RLLM_ENGINE_DEBUG"))
+
+
+def _dprint(*args, **kwargs):
+    if _ENGINE_DEBUG:
+        print(*args, **kwargs)
 
 
 class AgentSdkEngine:
@@ -564,7 +575,8 @@ class AgentSdkEngine:
                             logger.warning(f"Skipping step {step_idx} of trajectory {trajectory_id}: prompt length {len(prompt_ids)} > max_prompt_length {max_prompt_length}")
                             continue
                         else:
-                            logger.warning(f"Including step {step_idx} of trajectory {trajectory_id}: prompt length {len(prompt_ids)} <= max_prompt_length {max_prompt_length}")
+                            if _ENGINE_DEBUG:
+                                logger.warning(f"Including step {step_idx} of trajectory {trajectory_id}: prompt length {len(prompt_ids)} <= max_prompt_length {max_prompt_length}")
 
                         prompts.append(prompt_ids)
 
@@ -617,13 +629,13 @@ class AgentSdkEngine:
             padding_value=self.rollout_engine.tokenizer.pad_token_id,
         ).flip(dims=[1])
 
-        print("[DEBUG format] padded prompt lengths:", [len(p) for p in prompts_batch])
+        _dprint("[DEBUG format] padded prompt lengths:", [len(p) for p in prompts_batch])
 
         max_prompt_length = self.config.data.max_prompt_length
         prompts_batch = pad_sequence_to_length(prompts_batch, max_prompt_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=True)
         prompts_batch = prompts_batch[:, -max_prompt_length:]  # truncate if necessary
         
-        print("[DEBUG format] padded to max prompt lengths:", [len(p) for p in prompts_batch])
+        _dprint("[DEBUG format] padded to max prompt lengths:", [len(p) for p in prompts_batch])
 
         response_batch = torch.nn.utils.rnn.pad_sequence(
             responses,
@@ -631,13 +643,13 @@ class AgentSdkEngine:
             padding_value=self.rollout_engine.tokenizer.pad_token_id,
         )
 
-        print("[DEBUG format] padded response lengths:", [len(r) for r in response_batch])
+        _dprint("[DEBUG format] padded response lengths:", [len(r) for r in response_batch])
 
         max_response_length = self.config.data.max_response_length
         response_batch = pad_sequence_to_length(response_batch, max_response_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=False)
         response_batch = response_batch[:, :max_response_length]  # truncate if necessary
         
-        print("[DEBUG format] padded to max response lengths:", [len(r) for r in response_batch])
+        _dprint("[DEBUG format] padded to max response lengths:", [len(r) for r in response_batch])
 
         input_ids = torch.concat([prompts_batch, response_batch], dim=1)
 
@@ -702,33 +714,31 @@ class AgentSdkEngine:
             tensors_dict["rollout_log_probs"] = rollout_logprobs_batch
 
 
-        from collections import Counter
+        _dprint("=" * 80)
+        _dprint("[DEBUG format] num episodes:", len(episodes))
+        _dprint("[DEBUG format] len(prompts):", len(prompts))
+        _dprint("[DEBUG format] prompt_lengths:", prompt_lengths)
+        _dprint("[DEBUG format] max_prompt_length:", max_prompt_length)
+        _dprint("[DEBUG format] len(responses):", len(responses))
+        _dprint("[DEBUG format] response_lengths:", response_lengths)
+        _dprint("[DEBUG format] max_response_length:", max_response_length)
+        _dprint("[DEBUG format] len(episode_ids):", len(episode_ids))
+        _dprint("[DEBUG format] len(trajectory_ids):", len(trajectory_ids))
+        _dprint("[DEBUG format] len(step_ids):", len(step_ids))
+        _dprint("[DEBUG format] repeat_counts:", repeat_counts)
+        _dprint("[DEBUG format] sum repeat_counts:", sum(repeat_counts))
 
-        print("=" * 80)
-        print("[DEBUG format] num episodes:", len(episodes))
-        print("[DEBUG format] len(prompts):", len(prompts))
-        print("[DEBUG format] prompt_lengths:", prompt_lengths)
-        print("[DEBUG format] max_prompt_length:", max_prompt_length)
-        print("[DEBUG format] len(responses):", len(responses))
-        print("[DEBUG format] response_lengths:", response_lengths)
-        print("[DEBUG format] max_response_length:", max_response_length)
-        print("[DEBUG format] len(episode_ids):", len(episode_ids))
-        print("[DEBUG format] len(trajectory_ids):", len(trajectory_ids))
-        print("[DEBUG format] len(step_ids):", len(step_ids))
-        print("[DEBUG format] repeat_counts:", repeat_counts)
-        print("[DEBUG format] sum repeat_counts:", sum(repeat_counts))
+        _dprint("[DEBUG format] unique episode_ids:", len(set(episode_ids)))
+        _dprint("[DEBUG format] unique trajectory_ids:", len(set(trajectory_ids)))
+        _dprint("[DEBUG format] unique step_ids:", len(set(step_ids)))
+        _dprint("[DEBUG format] step_nums hist:", Counter(step_nums))
+        _dprint("[DEBUG format] termination_reasons:", Counter([x.value for x in termination_reasons]))
+        _dprint("[DEBUG format] is_valid:", Counter(is_valid))
 
-        print("[DEBUG format] unique episode_ids:", len(set(episode_ids)))
-        print("[DEBUG format] unique trajectory_ids:", len(set(trajectory_ids)))
-        print("[DEBUG format] unique step_ids:", len(set(step_ids)))
-        print("[DEBUG format] step_nums hist:", Counter(step_nums))
-        print("[DEBUG format] termination_reasons:", Counter([x.value for x in termination_reasons]))
-        print("[DEBUG format] is_valid:", Counter(is_valid))
-
-        print("[DEBUG format] first episode_ids:", episode_ids[:30])
-        print("[DEBUG format] first trajectory_ids:", trajectory_ids[:30])
-        print("[DEBUG format] first step_ids:", step_ids[:30])
-        print("=" * 80)
+        _dprint("[DEBUG format] first episode_ids:", episode_ids[:30])
+        _dprint("[DEBUG format] first trajectory_ids:", trajectory_ids[:30])
+        _dprint("[DEBUG format] first step_ids:", step_ids[:30])
+        _dprint("=" * 80)
 
         return DataProto.from_dict(
             tensors=tensors_dict,

@@ -285,7 +285,13 @@ def main() -> int:
     parser.add_argument("--work-dir", default=str(_script_dir() / "baseline_runs"))
     parser.add_argument("--prepare", action="store_true", help="Create/overwrite the parquet before running")
     parser.add_argument("--levels", default=os.environ.get("OPENHANDS_KERNELBENCH_LEVELS", "level_1"))
-    parser.add_argument("--hf-dataset", default=os.environ.get("OPENHANDS_KERNELBENCH_DATASET", "/home/p00938733/datasets/kernelbench"))
+    parser.add_argument(
+        "--hf-dataset",
+        default=os.environ.get(
+            "OPENHANDS_KERNELBENCH_DATASET",
+            os.path.expanduser("~/.cache/huggingface/datasets/kernelbench"),
+        ),
+    )
     parser.add_argument(
         "--filter-mode",
         default=os.environ.get("OPENHANDS_KERNELBENCH_FILTER_MODE", "all"),

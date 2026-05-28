@@ -25,17 +25,31 @@ pkill -9 torchrun
 set -euo pipefail
 set -x
 
-# First time
-# export MODEL_PATH=/home/p00938733/Qwen3-8B
-export MODEL_PATH=/home/docker/Qwen3-Coder-30B-A3B-Instruct
-# export MODEL_PATH=/home/p00938733/cszhou_sft_weight/global_step_100
-export PROXY_PORT=5000
+# -----------------------------------------------------------------------------
+# Load machine/path/network config (paths, IPs, ports, image, memory tuning).
+# Override which config file is loaded with RLLM_CONFIG_FILE.
+# Variables exported from the config: MODEL_PATH, TRAIN_HOST_IP, EVAL_WORKER_IP,
+# PROXY_PORT, EVAL_WORKER_PORT, NIC_NAME, OPENHANDS_IMAGE, RLLM_LOG_DIR,
+# TRACE_DB_PATH, OPENHANDS_ARTIFACT_DIR, PROFILE_SAVE_PATH,
+# OPENHANDS_KERNELBENCH_PARQUET, PYTORCH_NPU_ALLOC_CONF, HCCL_BUFFSIZE.
+# See config/.env.example for the full template.
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${RLLM_CONFIG_FILE:-$SCRIPT_DIR/config/qwen30b.env}"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: config file not found: $CONFIG_FILE" >&2
+    echo "Copy $SCRIPT_DIR/config/.env.example to config/qwen30b.env (or set RLLM_CONFIG_FILE)." >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
 export LLM_MAX_OUTPUT_TOKENS="${LLM_MAX_OUTPUT_TOKENS:-2048}"
 
 export ASCEND_LAUNCH_BLOCKING=0 # TODO
 
-nic_name="ens1f3"
-export HCCL_IF_IP=80.48.5.65
+nic_name="$NIC_NAME"
+export HCCL_IF_IP="$TRAIN_HOST_IP"
 export GLOO_SOCKET_IFNAME=$nic_name
 export TP_SOCKET_IFNAME=$nic_name
 export HCCL_SOCKET_IFNAME=$nic_name
@@ -45,7 +59,7 @@ export HCCL_INTRA_PCIE_ENABLE=0 # TODO
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 # export HCCL_CONNECT_TIMEOUT=300
-export HCCL_BUFFSIZE=64
+# HCCL_BUFFSIZE comes from config
 
 export RAY_DEBUG_POST_MORTEM=0
 export RAY_DEDUP_LOGS=0
@@ -54,7 +68,7 @@ export VLLM_ASCEND_ENABLE_NZ=0
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 export PYTHONPATH=$PYTHONPATH:$RLLM_DIR
 
-export OPENHANDS_IMAGE=openhands-triton-env:v1
+# OPENHANDS_IMAGE comes from config
 
 export HYDRA_FULL_ERROR=1
 
@@ -65,7 +79,9 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:128"
+# PYTORCH_NPU_ALLOC_CONF comes from config (max_split_size_mb:2048 — BS=3 OOM fix)
+# DO NOT add expandable_segments:True — conflicts with vLLM sleep mode
+#   (vllm-ascend/vllm_ascend/device_allocator/camem.py:151 has an assert)
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
@@ -73,8 +89,11 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 
 export OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3
-export OPENHANDS_REMOTE_EVAL_URL=http://80.48.5.51:16881
-export OPENHANDS_CONTAINER_HOST_ALIAS=80.48.5.51
+export OPENHANDS_REMOTE_EVAL_URL="http://${EVAL_WORKER_IP}:${EVAL_WORKER_PORT}"
+# CRITICAL: must be TRAIN_HOST_IP so OpenHands containers (running on eval host)
+# can reach the LiteLLM proxy on the train host. Setting this to EVAL_WORKER_IP
+# causes Connection refused — see PQY_DEBUG_CONTEXT history.
+export OPENHANDS_CONTAINER_HOST_ALIAS="$TRAIN_HOST_IP"
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_CONFIGURE_LOGGING=1
@@ -88,17 +107,16 @@ export HYDRA_FULL_ERROR=1
 # Custom rllm-openhands image (built from workspace/Dockerfile).
 # This image extends the official OpenHands image with workspace/entrypoint.py
 # which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
-export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
-# export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/p00938733/Qwen3-8B}"
+# OPENHANDS_IMAGE already exported from config — no override here.
 export OPENHANDS_MODEL_NAME=$MODEL_PATH
-export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
+export OPENHANDS_BASE_URL_PORT=${PROXY_PORT}
 if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]]; then
     export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-10}"
 else
     export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-20}"
 fi
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
-export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/op[<0;216;34M[<0;216;34menhands_results}"
+# OPENHANDS_ARTIFACT_DIR already exported from config
 
 # Optional: reserve a separate NPU pool for OpenHands operator validation.
 # For strict isolation, remove these ids from ASCEND_RT_VISIBLE_DEVICES above.
@@ -125,7 +143,7 @@ export OPENHANDS_CONTAINER_HOST_ALIAS="${OPENHANDS_CONTAINER_HOST_ALIAS:-host.do
 export OPENHANDS_DATASET=kernelbench
 export OPENHANDS_KERNELBENCH_LEVELS=level_1
 # export OPENHANDS_KERNELBENCH_LEVELS=level_1,level_2
-export OPENHANDS_KERNELBENCH_PARQUET=/workspace/rllm-openhands/examples/openhands_sdk/kernelbench_openhands.parquet
+# OPENHANDS_KERNELBENCH_PARQUET comes from config
 export OPENHANDS_KERNELBENCH_MAX_ROWS=128
 export OPENHANDS_KERNELBENCH_ARCH=ascend910b1
 export OPENHANDS_KERNELBENCH_OPERATOR_BACKEND=triton
@@ -162,10 +180,10 @@ N_GPUS="${N_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
-TRACE_DB_PATH="${TRACE_DB_PATH:-/workspace/results/rllm-openhands-traces.db}"
+# TRACE_DB_PATH comes from config
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-rllm-openhands}"
-logs=/workspace/results/verl-rllm.log
+logs="${RLLM_LOG_DIR}/verl-rllm.log"
 
 # profiling configuration
 PROFILE_STEPS="[1]"
@@ -175,7 +193,7 @@ DISCRETE=False
 # PROFILE_CONTINUOUS_STEPS=True
 
 # profiling NPU options
-SAVE_PATH="/workspace/results/profile_data/all"
+SAVE_PATH="${PROFILE_SAVE_PATH}"
 LEVEL="level0"
 CONTENTS=['npu','cpu','memory']
 #CONTENTS=['npu','cpu','memory','module','stack']

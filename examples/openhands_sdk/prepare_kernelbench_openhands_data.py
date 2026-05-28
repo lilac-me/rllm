@@ -19,7 +19,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-_HF_DATASET = "/home/p00938733/datasets/kernelbench"
+_HF_DATASET = os.environ.get(
+    "OPENHANDS_KERNELBENCH_DATASET",
+    os.path.expanduser("~/.cache/huggingface/datasets/kernelbench"),
+)
 _DEFAULT_LEVELS = ("level_1", "level_2")
 _DEFAULT_ARCH = "ascend910b1"
 _WARMUP_EXCLUDE_KEYWORDS = (
