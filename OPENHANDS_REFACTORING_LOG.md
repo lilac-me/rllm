@@ -27,9 +27,27 @@ Branch base: `5daa24c0` (offload buffer, last common ancestor with stage1).
 
 The legacy "same-machine docker run" branch in [openhands_agent.py:626-627](examples/openhands_sdk/openhands_agent.py:626) (`_run_openhands_container`) is **dead code** in any DooD deployment. Kept for backwards compat with non-DooD setups; can be deleted once we're sure no one needs it.
 
-### D2. Worker GC at startup (no cron, no daemon)
+### D2. Worker GC at startup + per-trainer-restart lock reset
 
-`remote_eval_worker.py` reaps `openhands-remote-eval-*` workdirs and stale `/tmp/shared_npu_lock/*` lockfiles older than 1 hour at startup. Normal flow self-cleans via the `finally` block in `do_POST`. This catches SIGKILL / OOM / worker-restart cases. Stuck `Created` containers (dockerd state-machine bug) need a daemon restart — we fail soft.
+Two cleanup mechanisms with different policies:
+
+**Workdir GC (mtime-based, conservative)**: `_gc_stale_workdirs()` removes
+`openhands-remote-eval-*` workdirs older than 1 hour at worker startup. Older
+than 1h almost certainly means SIGKILL / OOM. Newer workdirs are kept so
+`OPENHANDS_REMOTE_KEEP_WORKDIR=1` debug runs are not silently wiped.
+
+**NPU lock clear (unconditional, aggressive)**: `_clear_npu_locks()` removes
+*all* files under `/tmp/shared_npu_lock/`. Triggered:
+  1. At worker startup (worker starting = no rollouts in flight)
+  2. On `POST /admin/reset-locks` (called by `debug_oom.sh` after worker health
+     check passes — this gives the trainer-restart-without-worker-restart case
+     a way to clean stale locks)
+
+Per-rollout cleanup of *one* lock is the OpenHands container's job. These two
+mechanisms are the cross-rollout / cross-trainer-restart safety nets.
+
+Stuck `Created` containers (dockerd state-machine bug) need a daemon restart —
+we fail soft, see KU2.
 
 ### D3. Worker health check in `debug_oom.sh`, fail-fast
 

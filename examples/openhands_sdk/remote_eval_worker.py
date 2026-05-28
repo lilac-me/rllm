@@ -36,32 +36,48 @@ _SHARED_NPU_LOCK_DIR = "/tmp/shared_npu_lock"
 _GC_OLDER_THAN_SEC = 3600  # 1 hour
 
 
-def _gc_stale_files(work_dir: str, older_than_sec: int = _GC_OLDER_THAN_SEC) -> None:
-    """Reap leftover per-rollout workdirs and stale NPU locks at startup.
+def _gc_stale_workdirs(work_dir: str, older_than_sec: int = _GC_OLDER_THAN_SEC) -> int:
+    """Reap leftover per-rollout workdirs older than `older_than_sec`.
 
-    Normal flow already self-cleans via the finally block in do_POST and the
-    OpenHands container's own exit. This sweep catches SIGKILL / OOM-killed
-    worker processes and any locks the container couldn't release.
-
-    Stuck "Created" containers from a dockerd state bug are NOT touched here —
-    those need a daemon restart and we fail soft.
+    Normal flow self-cleans via the finally block in do_POST. This sweep
+    catches SIGKILL / OOM-killed worker processes that didn't reach finally.
+    Recent workdirs are kept so an OPENHANDS_REMOTE_KEEP_WORKDIR=1 debug run
+    is not silently wiped.
     """
     now = time.time()
+    removed = 0
     for path in glob.glob(os.path.join(work_dir, "openhands-remote-eval-*")):
         try:
             if now - os.path.getmtime(path) > older_than_sec:
                 shutil.rmtree(path, ignore_errors=True)
                 print(f"[remote-eval] gc removed stale workdir: {path}", flush=True)
+                removed += 1
         except OSError:
             pass
+    return removed
+
+
+def _clear_npu_locks() -> int:
+    """Unconditionally clear *all* NPU lock files.
+
+    Rationale: a lock file's existence means "an OpenHands container is
+    currently using this NPU". When this is called, no rollout container is
+    in flight (either because the worker just started, or because the trainer
+    just restarted and asked us to reset). So every lock file is stale.
+
+    Per-rollout cleanup of *one* lock is the OpenHands container's job; this
+    function is the cross-rollout / cross-trainer-restart safety net.
+    """
+    removed = 0
     if os.path.isdir(_SHARED_NPU_LOCK_DIR):
         for path in glob.glob(os.path.join(_SHARED_NPU_LOCK_DIR, "*")):
             try:
-                if now - os.path.getmtime(path) > older_than_sec:
-                    os.remove(path)
-                    print(f"[remote-eval] gc removed stale lock: {path}", flush=True)
+                os.remove(path)
+                print(f"[remote-eval] cleared NPU lock: {path}", flush=True)
+                removed += 1
             except OSError:
                 pass
+    return removed
 
 
 def _extract_tar_b64(encoded: str, destination: str) -> None:
@@ -234,6 +250,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self.path == "/admin/reset-locks":
+            # Called by debug_oom.sh after worker health check passes.
+            # Lets the trainer guarantee a clean NPU lock dir on every
+            # training restart without restarting the worker.
+            removed = _clear_npu_locks()
+            self._json_response(200, {"ok": True, "locks_removed": removed})
+            return
         if self.path != "/run":
             self._json_response(404, {"error": "not found"})
             return
@@ -315,7 +338,9 @@ def main() -> None:
     # mkdir on the *host* side — trainer's mkdir in openhands_agent.py:719
     # lives inside the dev container fs and isn't what `docker run -v` will see.
     Path(_SHARED_NPU_LOCK_DIR).mkdir(parents=True, exist_ok=True)
-    _gc_stale_files(args.work_dir)
+    _gc_stale_workdirs(args.work_dir)
+    # Worker startup = clean slate, no rollouts in flight, so every lock is stale.
+    _clear_npu_locks()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.work_dir = args.work_dir  # type: ignore[attr-defined]
     print(f"[remote-eval] listening on http://{args.host}:{args.port}", flush=True)

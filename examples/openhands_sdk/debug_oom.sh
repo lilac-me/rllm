@@ -74,6 +74,12 @@ if [[ -n "${OPENHANDS_REMOTE_EVAL_URL:-}" ]]; then
         exit 1
     fi
     echo "[debug_oom] worker health OK: ${OPENHANDS_REMOTE_EVAL_URL}"
+    # Ask worker to clear all NPU locks. Lock files persist on the host fs across
+    # trainer restarts; if the previous trainer was SIGKILLed mid-rollout the
+    # OpenHands container may not have released its lock. This is the trainer-
+    # restart counterpart to the worker's own startup-time _clear_npu_locks().
+    reset_resp=$(curl -sf -m 5 -X POST "${OPENHANDS_REMOTE_EVAL_URL}/admin/reset-locks" 2>&1 || true)
+    echo "[debug_oom] reset-locks: $reset_resp"
 fi
 
 export LLM_MAX_OUTPUT_TOKENS="${LLM_MAX_OUTPUT_TOKENS:-2048}"
