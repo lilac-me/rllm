@@ -37,12 +37,12 @@
 
 | 约束 | 原因 | 设置 | 强度 |
 |---|---|---|---|
-| Qwen3.5/3.6 用 Gated Delta Net (GDN) linear attention，Megatron-LM 对 GDN 的 packed sequences (THD) 支持不完整 | 上游 verl 脚本 NPU 分支默认关闭 remove padding | `model.use_remove_padding=False`<br>`actor.megatron.use_remove_padding=False`<br>`actor.use_dynamic_bsz=False` | **可调**：以 W2 实测为准。当前 obs/openhands_ascend 分支训练脚本仍是 `True`，若实测能跑通且性能可接受则保留，否则切回 `False`。**不作为硬性强制项。** |
+| Qwen3.5/3.6 用 Gated Delta Net (GDN) linear attention，Megatron-LM 对 GDN 的 packed sequences (THD) 支持不完整 | 上游 verl 脚本 NPU 分支默认关闭 remove padding | `model.use_remove_padding=False`<br>`actor.megatron.use_remove_padding=False`<br>`actor.use_dynamic_bsz=False` | **已实测 = False**（W2.29 + W2.10 + audit lesson #22）：MindSpeed GDN (`gated_delta_net.py:292`) 对 `packed_seq_params != None` 直接 raise，所以 `use_remove_padding=True` 无法跑通；`use_dynamic_bsz=True` 同样依赖 packed seq，必须 False。已固化为 stage1 lock，见 §14.5。 |
 | CUDA_DEVICE_MAX_CONNECTIONS=1 | Megatron 通信顺序保证 | `export CUDA_DEVICE_MAX_CONNECTIONS=1` | **必须** |
 | vLLM V1 engine + 禁用 symm mem allreduce | vllm-ascend 兼容性 | `export VLLM_USE_V1=1`<br>`export VLLM_ALLREDUCE_USE_SYMM_MEM=0` | **必须** |
 | DEVICE 自动检测 | `python3 -c 'import torch_npu'` 检测 NPU | 脚本默认行为，无需手工 | 默认 |
 
-> ⚠️ swe 配方 `MODEL_USE_REMOVE_PADDING=true` 与 verl 脚本 NPU 分支默认值相反。两条路径都可能在 NPU 上跑通，本 plan 不预先选边——W2 单节点训练时实测决定。
+> ⚠️ swe 配方 `MODEL_USE_REMOVE_PADDING=true` 与 verl 脚本 NPU 分支默认值相反。**W2.29 实测决定 NPU 路径必须 `False`**（GDN 不支持 packed seq）；swe 那条 GPU 路径不适用于本计划。
 
 ### 0.2 verl 脚本的并行/训练参数（NPU 路径，参数权威）
 
@@ -65,7 +65,7 @@ actor_rollout_ref.actor.optim.lr=1e-6
 actor_rollout_ref.actor.ppo_mini_batch_size=32
 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
 actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096
-actor_rollout_ref.actor.use_dynamic_bsz=False              # GDN 默认值（W2 可调）
+actor_rollout_ref.actor.use_dynamic_bsz=False              # W2.10 已实测保持 False（GDN bshd 模式显存压力）
 actor_rollout_ref.actor.use_kl_loss=True
 actor_rollout_ref.actor.kl_loss_coef=0.01
 actor_rollout_ref.actor.kl_loss_type=low_var_kl
@@ -86,7 +86,7 @@ actor_rollout_ref.actor.entropy_coeff=0
 #       case override。W2.9 (v2.8) 修正。
 actor_rollout_ref.actor.megatron.use_mbridge=True
 actor_rollout_ref.actor.megatron.vanilla_mbridge=False    # NPU 必须 False
-actor_rollout_ref.actor.megatron.use_remove_padding=False  # GDN 默认值（W2 可调）
+actor_rollout_ref.actor.megatron.use_remove_padding=False  # W2.29 已实测：必须 False（MindSpeed GDN 不支持 packed_seq_params）
 actor_rollout_ref.actor.megatron.dtype=bfloat16
 actor_rollout_ref.actor.megatron.param_offload=True
 actor_rollout_ref.actor.megatron.optimizer_offload=True
@@ -118,6 +118,8 @@ actor_rollout_ref.rollout.dtype=bfloat16
 ```
 
 > **本计划下所有训练脚本以上述参数为基线，OpenHands 接入只改 dataset/agent_run_func 入口，不动并行/MoE/优化器参数。**
+>
+> ⚠️ **§0.2 是 verl 脚本 NPU 分支的"权威基线值"，不是 stage1 实际运行值。** stage1 W2.x 实测有意调整了部分参数（OpenHands 重 prompt + GDN 约束 + 单节点资源），实际锁定值见 **§14.5 stage1-locked configs**。具体偏离项（非穷举）：`data.max_prompt_length` 1024→32768 (W2.23)、`data.max_response_length` 2048→4096 (§13.13)、`actor.use_kl_loss` True→False (§13.7)、单节点并行 `TP=2 PP=2 EP=8` → `TP=2 PP=1 EP=4`（§13.13，对应单节点 8-NPU 而非 §0.2 假设的 1 节点 16 卡）。**读 stage1/2 真实配置请走 §14.5**。
 
 ---
 
@@ -2365,17 +2367,25 @@ push 到:  origin/qwen36-rllm-compat
 
 ### 14.5 当前进度 + 下一步
 
-**已完成**：
-- ✓ W1 全部 (cherry-pick + verl-fork shim + RolloutCorrectionConfig 修复)
-- ✓ W2.0 分层测试基础设施
-- ✓ W2.1-W2.2 训练脚本 + OpenHands LLM 配置
-- ✓ W2.8-W2.18 持续修复 setup 链路（HCCL/Megatron-Bridge/vllm/mock_rollout）
-- ✓ W2.19 跳 L2b 决策（mock 天然边界，setup 已验完）
-- ✓ L1/L2a/L2b（部分） — 全部走过 setup chain
-- ✓ W2.20 DooD workspace path alignment（hardcode `/home/docker/openhands_workspace` + fail-fast precheck + findmnt -T）
-- ✓ W2.21 max_model_len 32k→49152 解决 OpenHands 30k 重 prompt 首轮越界 1 token
-- ✓ W2.22 改换策略：MAX_ITERATIONS=1 + rollout fallback reward random.random()（stage1 只验 trainer 链路、不在乎 reward 真假）
-- ✓ W2.23 `data.max_prompt_length` 8192→32768 解决 `agent_sdk_engine.py:563` step 过滤把所有 trace step 全 drop 的问题；过程中诊断完 DB 链路完全干净（trace_store / session_uid / data vs metadata 字段对齐都验过）
+| Config | Value | 锁定 W# | 不能改的根本原因 |
+|---|---|---|---|
+| `actor_rollout_ref.model.use_remove_padding` | **`False`** | W2.29 | GDN linear attention 不支持 packed seq（MindSpeed `gated_delta_net.py:292` 无 default raise） |
+| `actor_rollout_ref.actor.megatron.use_remove_padding` | **`False`** | W2.29 | 必须与 model.use_remove_padding 同步 |
+| `actor_rollout_ref.actor.megatron.vanilla_mbridge` | **`False`** | W2.9 (§13.12) | NPU 必须用 NVIDIA-NeMo/Megatron-Bridge（pypi mbridge 0.15.1 不支持 qwen3_5_moe） |
+| `OPENHANDS_MAX_ITERATIONS` | **`1`** | W2.22 | OpenHands 首轮 prompt 30k+，每 turn 增长 ~16k；MAX_ITER>1 会撞 max_model_len。**stage2 condenser 接入后改回 30+** |
+| `data.max_prompt_length` | **`32768`** | W2.23 | OpenHands 首轮 prompt 30k+，`agent_sdk_engine.py:563` 过滤阈值低于此则全 step 被 skip |
+| `actor_rollout_ref.rollout.max_model_len` | **`49152`** | W2.21 | 32k 不够 OpenHands 重 prompt，49k 给 16k buffer |
+| `actor_rollout_ref.rollout.calculate_log_probs` | **`True`** | §13.7 | 监控 rollout_probs_diff / pg_clipfrac / approx_kl 必需 |
+| `rllm.algorithm.router_replay` | **`disabled`** | §13.3 + §13.7 + stage2 audit D2 | stage1 走 AgentPPOTrainer，19983fe4 R2/R3 入口不生效；显式 disable 防误开；rllm `_compute_old_log_prob` 后处理不读 `routed_experts`，开了漏 post-process |
+| `actor.use_kl_loss` | **`False`** | §13.7 | stage1 靠 PPO clip，不开 KL term |
+| Workspace path | hardcode **`/home/docker/openhands_workspace`** | W2.20 | DooD 要求 host-visible same-path bind mount |
+| `actor.use_dynamic_bsz` | **`False`** | W2.10 + §0.1 | GDN bshd 模式下显存压力，verl NPU 默认 |
+| MAX_ITERATIONS=1 时的 rollout fallback reward | **`random.random()`** (per-rollout) → **`std=0 兜底`** (stage2 重构后) | W2.22 + W2.24 | GRPO advantage = (r - mean)/std；MAX_ITER=1 下 reward 全 0 std=0 NaN。**stage2 改造**：真 reward 优先，全组 std=0 时才注入 random，避免无脑覆盖真信号 |
+| `data.max_response_length` | `4096` | §13.13 | verl NPU 套权威；OpenHands LLM client 默认 max_tokens=2048 也不超 |
+| 单节点并行 | TP=2 PP=1 CP=1 EP=4 ETP=1，rollout TP=8 | §13.13 用户决策 | TP×EP=8 一节点 8 NPU |
+| `use_critic` (trainer-level) | **`False`** | stage2 audit F1/F2 | GRPO 路径不用 critic；rllm `_compute_values`/`_update_critic` 无 bridge（直接传 DataProto 给 critic_wg，缺 `to_tensordict`/`left_right_2_no_padding`/`assign_non_tensor`/`no_padding_2_padding`/`rename_dict` 全套），开了立即崩 |
+| `actor.calculate_sum_pi_squared` | **`False`** | stage1 默认 + stage2 audit F3 | 开了 worker 返 nested tensor，但 rllm `agent_sdk_trainer.py:459-465` 只读 `entropy`+`log_probs`，缺 sum_pi_squared post-process → 下游 `select_idxs` 撞 `NotImplementedError(aten.index.Tensor)` |
+| `rllm.rejection_sample.enable` | **`False`** | stage2 audit F3 + D-rejection | 单 turn 真 reward `is_correct=False` 概率高（agent 没时间写实现）；开了整 batch drop → step skip 饿死；真训练验过 reward 信号稳定（is_correct=True 比例 > drop 阈值）后才能考虑解锁 |
 
 **当前位置**：W2.23 fix 后等待 L3 重跑结果。已诊断清楚 trace store / session_uid / max_prompt_length 全链路；上一次 L3 跑全部子链路通到 `transform_results_for_verl`，因 step 过滤阈值过低被全 drop。fix 后 step 应能放行，期望挂点回到 PPO step 真挂这种"上游链路全通"的位置。
 
