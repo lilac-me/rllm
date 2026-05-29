@@ -129,6 +129,71 @@ If workspace ever balloons to GB scale (e.g. embedded model weights), revisit.
 
 **Mitigation**: user verifies `npu-smi info` before launch (operator runbook).
 
+### KU7. dynamic batch alignment (FIXED via padding, not truncation)
+
+verl asserts `batch.batch_size[0] % mini_batch_size == 0` at
+[verl/protocol.py:815](https://github.com/volcengine/verl/blob/main/verl/protocol.py#L815)
+for megatron data-parallel rank alignment. Under rllm's
+`stepwise_advantage.enable=True`, the batch row count is
+`sum(valid_steps over trajectories)` — `valid_steps` varies independently
+per trajectory (OpenHands agents finish early / hit MAX_ITERATIONS /
+get filtered by overlong prompts at the per-step level).
+
+So **even `train_batch_size % ppo_mini_batch_size == 0` is NOT enough**.
+
+This is **rllm upstream issue #350** (open, no comments, no fix as of
+2026-05): https://github.com/rllm-org/rllm/issues/350
+
+**Observed failures**:
+- `train=2 ppo_mini=4 rollout_n=8`: 144 % 32 != 0 (avg_steps=9)
+- `train=4 ppo_mini=4 rollout_n=8`: 296 % 32 != 0 (varied step counts)
+
+**Fix landed in this branch (padding, not truncation)**:
+The existing `_pad_dataproto_to_world_size` in
+[`agent_sdk_trainer.py:720`](rllm/trainer/verl/agent_sdk_trainer.py) already
+pads to DP `world_size` via `pad_dataproto_to_divisor`, with the padded
+rows tagged `is_pad_step=True` / `is_last_step=False` / `is_valid=False`.
+We just fold the effective verl `mini_batch_size = ppo_mini_batch_size *
+rollout.n` into the LCM so a single padding call satisfies both
+constraints. One added line:
+
+```python
+world_sizes.append(self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                   * self.config.actor_rollout_ref.rollout.n)
+world_size = reduce(math.lcm, world_sizes)
+```
+
+**Why padding instead of truncation (first attempt was wrong)**:
+- Sparse reward setting (KernelBench tasks): most trajectories have
+  reward=0; truncating trailing rows risks dropping the few valuable
+  reward>0 step rows. `for episode in enumerate(episodes)` is
+  deterministic order, so truncation has systematic bias toward dropping
+  the same tail tasks. Hurts both data efficiency and GRPO group-mean/std
+  advantage normalization.
+- The framework already wires `is_pad_step` masking through the trainer
+  (verl_backend.py / agent_workflow_trainer.py / agent_ppo_trainer.py
+  / agent_sdk_trainer.py all call `_remove_padding` before
+  advantage compute), so padded rows don't pollute gradients in
+  `stepwise_advantage.mode=broadcast`.
+
+**Provenance of the fix**:
+- AgentPPOTrainer got the same fix on this fork's
+  `openhands-observability` branch (commit `f3763717`, by ZhihaoSun,
+  2026-04-30). We mirrored it here for AgentSdkTrainer; AgentPPOTrainer
+  on this branch is not touched (no need yet).
+- Upstream rllm PR #506 fixes the same class of bug but only in
+  `rllm/experimental/verl/verl_backend.py` (fully-async path), not
+  AgentSdkTrainer/AgentPPOTrainer.
+
+**Verify after long run**: pad rows in PPO loss should contribute zero
+gradient (advantage tensor zero-padded by `pad_dataproto_to_divisor`).
+If reward/loss curve looks off after 50+ steps, double-check that pad
+rows in the `advantages` tensor are indeed zero (not copy-of-last-row).
+
+**Upstream contribution opportunity**: open a PR to rllm-org/rllm
+mirroring `openhands-observability`'s AgentPPOTrainer fix +
+AgentSdkTrainer fix, referencing issue #350.
+
 ### KU6. `OPENHANDS_REMOTE_KEEP_WORKDIR` debug toggle
 
 [remote_eval_worker.py:261](examples/openhands_sdk/remote_eval_worker.py:261) checks this env to skip the per-rollout `rmtree`. Useful for postmortem inspection of failed rollouts. Documented here, no automated lifecycle.

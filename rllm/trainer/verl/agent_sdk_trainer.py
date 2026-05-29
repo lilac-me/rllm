@@ -737,6 +737,22 @@ class AgentSdkTrainer(RayPPOTrainer):
         if not world_sizes:
             return batch
 
+        # verl/protocol.py:815 asserts batch_size % mini_batch_size == 0 in
+        # addition to the DP world_size alignment. Fold the effective verl
+        # mini_batch_size into the LCM so a single pad_dataproto_to_divisor
+        # call satisfies both constraints.
+        #
+        # Same fix exists on openhands-observability (commit f3763717) for
+        # AgentPPOTrainer; mirrored here for AgentSdkTrainer. rllm upstream
+        # issue #350: https://github.com/rllm-org/rllm/issues/350
+        # Related upstream PR #506 fixes the same class of bug in
+        # experimental/verl/verl_backend.py only — not on this trainer path.
+        actual_ppo_mini_batch_size = (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            * self.config.actor_rollout_ref.rollout.n
+        )
+        world_sizes.append(actual_ppo_mini_batch_size)
+
         world_size = reduce(math.lcm, world_sizes)
 
         batch = self._remove_padding(batch)  # Remove any padded steps from the batch (just in case)

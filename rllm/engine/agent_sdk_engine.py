@@ -619,9 +619,10 @@ class AgentSdkEngine:
             termination_reasons.extend([episode.termination_reason if episode.termination_reason is not None else TerminationReason.UNKNOWN] * total_steps)
             metrics.extend([episode.metrics] * total_steps)
             repeat_counts.append(total_steps)
-            
-        # if self.config.rllm.stepwise_advantage.enable: # TODO
-        # self.config.actor_rollout_ref.actor.ppo_mini_batch_size = len(episode_ids)
+
+        # Note: batch_size alignment to mini_batch_size happens in
+        # agent_sdk_trainer.py:_pad_dataproto_to_world_size (via padding,
+        # not truncation here). See rllm upstream issue #350.
 
         prompts_batch = torch.nn.utils.rnn.pad_sequence(
             [torch.flip(i, dims=[0]) for i in prompts],
