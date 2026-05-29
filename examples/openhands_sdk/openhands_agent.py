@@ -56,7 +56,6 @@ from rllm.sdk.proxy.metadata_slug import assemble_routing_metadata, build_proxie
 import os
 import sys
 import time
-import socket
 import traceback
 import faulthandler
 import sys
@@ -68,20 +67,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 faulthandler.enable(all_threads=True)
-
-
-def dbg(msg: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    host = socket.gethostname()
-    pid = os.getpid()
-    rank = os.getenv("RANK", "NA")
-    local_rank = os.getenv("LOCAL_RANK", "NA")
-    msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
-    path = f"/workspace/results/rllm_{socket.gethostname()}_{os.getpid()}.log"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{time.time()} {msg}\n")
-        f.flush()
-    
 # ---------------------------------------------------------------------------
 # NPU operator mock (align with openhands-npu bring-up)
 # ---------------------------------------------------------------------------
@@ -304,7 +289,7 @@ def _has_metrics(path: str) -> dict[str, Any] | None:
             with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
-            dbg("[openhands-npu] bad metrics.json: %s, %s", exc, path) # TODO
+            logger.warning("[openhands-npu] bad metrics.json at %s: %s", path, exc)
     return None
 
 
@@ -569,12 +554,8 @@ def _run_openhands_container(
     ]
     cmd.extend([_OPENHANDS_IMAGE,])
     
-    dbg(
-        f"[openhands] Launching container {container_name} (proxied_url={proxied_url[:70]}...)"
-    )
     import shlex
     print("DEBUG CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
-    dbg(" ".join(shlex.quote(c) for c in cmd))
     try:
         # docker run -d returns immediately with the container ID, so no
         # timeout needed here. The long wait happens at `docker wait` below.
@@ -601,7 +582,6 @@ def _run_openhands_container(
             timeout=_CONTAINER_TIMEOUT,
         )
 
-        dbg(f"wait_result={wait_result}, {wait_result.stdout.decode().strip()}")
         try:
             exit_code = int(wait_result.stdout.decode().strip())
         except Exception as e: # TODO

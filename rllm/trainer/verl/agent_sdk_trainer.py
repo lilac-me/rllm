@@ -52,7 +52,6 @@ from rllm.workflows.workflow import TerminationReason
 import os
 import sys
 import time
-import socket
 import traceback
 import faulthandler
 import sys
@@ -65,20 +64,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 faulthandler.enable(all_threads=True)
-
-
-def dbg(msg: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    host = socket.gethostname()
-    pid = os.getpid()
-    rank = os.getenv("RANK", "NA")
-    local_rank = os.getenv("LOCAL_RANK", "NA")
-    msg=f"[{ts}] [host={host}] [pid={pid}] [rank={rank}] [local_rank={local_rank}] {msg}"
-    path = f"/workspace/results/rllm_{socket.gethostname()}_{os.getpid()}.log"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{time.time()} {msg}\n")
-        f.flush()
-    
 
 class AgentSdkTrainer(RayPPOTrainer):
     """PPO trainer for agent workflows with stepwise advantage and rejection sampling."""
@@ -276,7 +261,6 @@ class AgentSdkTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
-            dbg(f"epoch {epoch}, step {self.global_steps} started")
             for batch_dict in self.train_dataloader:
                 # do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.get("profile_steps") is not None else False
                 with marked_timer("start_profile", timing_raw):
@@ -730,9 +714,7 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
-                            dbg(f"into checkpoint_manager")
                             self.checkpoint_manager.update_weights(self.global_steps)
-                            dbg(f"out checkpoint_manager")
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

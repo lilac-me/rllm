@@ -2,13 +2,13 @@
 # ==============================================================================
 # Stage1 training: Qwen3.6-35B-A3B × OpenHands × Ascend NPU
 #
-# Per QWEN36_OPENHANDS_AGENT_RL_PLAN.md (v2.4):
+# Per QWEN36_OPENHANDS_AGENT_RL_PLAN.md key sections:
 #   §0.1  Required NPU env: CUDA_DEVICE_MAX_CONNECTIONS=1,
 #         VLLM_USE_V1=1, VLLM_ALLREDUCE_USE_SYMM_MEM=0
 #   §0.2  verl-script-authoritative MoE / megatron flags
 #         (vanilla_mbridge, moe_aux_loss_coeff, moe_z_loss_coeff,
 #         moe_permute_fusion, moe_grouped_gemm)
-#   §5.2  max_model_len = 49k (W2.21 L3 unblock; was 32k stage1 baseline)
+#   §5.2  max_model_len = 49k (OpenHands first-turn prompt cap)
 #   §13.7 Safe stage1 config:
 #         - router_replay disabled (no-op on AgentPPOTrainer path anyway,
 #           see §13.3; set explicitly for clarity)
