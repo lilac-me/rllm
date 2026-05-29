@@ -187,20 +187,45 @@ for _dir in "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" "${OPENHANDS_ARTIFACT_DIR}"; 
     fi
     rm -f "${_dir}/.stage1_precheck"
 done
-# Soft check: workspace_temp dir SHOULD live under a host bind mount, NOT on the
+# Hard check: workspace_temp dir MUST live under a host bind mount, NOT on the
 # main container's overlay layer (that defeats DooD — sibling container would see
-# empty /opt/workspace). `findmnt -T` walks up the mount tree, so mounting an
-# ancestor like `-v /home/docker:/home/docker` is correctly accepted here.
-# Warn only when the underlying fs is overlay/tmpfs (i.e. clearly NOT a bind mount).
+# empty /opt/workspace and fail with exit 127). `findmnt -T` walks up the mount
+# tree, so mounting an ancestor like `-v /home/docker:/home/docker` (or `/home`)
+# is correctly accepted here.
+# Was WARN-only before; promoted to FATAL because overlay/tmpfs guarantees the
+# DooD child container fails on every rollout → 100% trajectory drop, no useful
+# work happens. Better to fail at startup with a clear message than to spend
+# debug rounds on "rollout always drops".
 # findmnt may not be present in all images — skip silently if missing.
 if command -v findmnt >/dev/null 2>&1; then
     _fstype=$(findmnt -no FSTYPE -T "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" 2>/dev/null || echo "")
     if [ "${_fstype}" = "overlay" ] || [ "${_fstype}" = "tmpfs" ]; then
-        echo "[stage1 precheck] WARN: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} sits on '${_fstype}' fs (not a bind mount)." >&2
-        echo "  Child OpenHands containers will likely see empty /opt/workspace and fail." >&2
-        echo "  Fix: restart main container with -v <host_path>:<container_path>; mounting any ancestor (e.g. -v /home/docker:/home/docker) also works." >&2
+        echo "[stage1 precheck] FATAL: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} sits on '${_fstype}' fs (not a bind mount)." >&2
+        echo "  Child OpenHands containers will see empty /opt/workspace and fail (exit 127), causing 100% trajectory drop." >&2
+        echo "  Fix: restart main container with -v <host_path>:<container_path>; mounting any ancestor (e.g. -v /home/docker:/home/docker or -v /home:/home) also works." >&2
+        exit 1
     fi
     unset _fstype
+fi
+
+# Hard check: DooD itself is wired up. main container needs the host docker
+# daemon socket mounted (-v /var/run/docker.sock:/var/run/docker.sock) so the
+# `docker run` inside _run_openhands_container can reach the host dockerd.
+# Without this, every rollout's `docker run` returns "Cannot connect to the
+# Docker daemon" non-zero exit → empty trajectory → 100% drop, same symptom as
+# the overlay-workspace trap. Train script entered rollout phase fine because
+# ray/vllm don't need docker; the failure only surfaces at first rollout.
+# Sanity-checked here so the failure mode is "fail-fast at startup", not "all
+# trajectories drop after model load". Lesson from container migration debug
+# 2026-05-28: missing docker.sock was the actual root cause after several
+# wrong-direction hypotheses.
+if ! docker ps >/dev/null 2>&1; then
+    echo "[stage1 precheck] FATAL: docker CLI cannot reach a daemon from inside this container." >&2
+    echo "  Likely cause: missing '-v /var/run/docker.sock:/var/run/docker.sock' on main container startup." >&2
+    echo "  DooD (Docker-outside-of-Docker) will not work — every rollout's docker run will fail with" >&2
+    echo "  'Cannot connect to the Docker daemon' and the trajectory will be empty → 100% drop." >&2
+    echo "  Fix: restart main container with the docker.sock bind mount above." >&2
+    exit 1
 fi
 
 # ------------------------------------------------------------------------------
