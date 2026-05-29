@@ -8,7 +8,7 @@
 #   §0.2  verl-script-authoritative MoE / megatron flags
 #         (vanilla_mbridge, moe_aux_loss_coeff, moe_z_loss_coeff,
 #         moe_permute_fusion, moe_grouped_gemm)
-#   §5.2  max_model_len = 32k (stage1 baseline)
+#   §5.2  max_model_len = 49k (W2.21 L3 unblock; was 32k stage1 baseline)
 #   §13.7 Safe stage1 config:
 #         - router_replay disabled (no-op on AgentPPOTrainer path anyway,
 #           see §13.3; set explicitly for clarity)
@@ -156,7 +156,11 @@ export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-openhands-triton-env:v1}"
 # proxy 里用的是 actor_rollout_ref.model.path，即完整路径
 export OPENHANDS_MODEL_NAME="${MODEL_PATH}"
 export OPENHANDS_BASE_URL_PORT=${PROXY_PORT:-4000}
-export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1000}"
+# Stage1 unblock (W2.22): default 1 to lock LLM prompt at first-turn ~30k tokens.
+# Each turn adds ~16k of tool-result history → with default 1000 the prompt
+# blows max_model_len within 2-3 turns. Override only after OpenHands condenser
+# (W3/W4) is in place or max_model_len is raised significantly.
+export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
 export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
 
@@ -263,10 +267,10 @@ echo "  Model           : ${MODEL_PATH}"
 echo "  N_GPUS (trainer) : ${N_GPUS}"
 echo "  Proxy port      : ${PROXY_PORT}"
 echo "  OpenHands image : ${OPENHANDS_IMAGE}"
-echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
+echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS} (W2.22 stage1 unblock; raise after condenser)"
 echo "  Tool parser     : ${TOOL_PARSER}"
 echo "  Parallelism     : TP=2 PP=1 CP=1 EP=4 ETP=1 (single-node 8-NPU)"
-echo "  max_model_len   : 32768 (stage1 baseline; raise after W3 if needed)"
+echo "  max_model_len   : 49152 (W2.21 L3 unblock; up from 32k baseline)"
 echo "  router_replay   : disabled (see plan §13.3)"
 echo "  use_kl_loss     : False (rely on PPO clip; see plan §13.7)"
 
@@ -304,10 +308,15 @@ ARGS=(
   # =========================
   data.train_batch_size=${BATCH_SIZE}
   data.val_batch_size=16
-  data.max_prompt_length=8192       # 8K
-  data.max_response_length=4096     # 4K (8K + 4K = 12K ≤ max_model_len 32K)
+  data.max_prompt_length=32768      # 32K (W2.23 L3 unblock; OpenHands 首轮 prompt 30k+)
+  # 上面 8192 → 32768 的根因：agent_sdk_engine.py:563 用 data.max_prompt_length 过滤 step。
+  # OpenHands 首轮真 prompt = 30721 tokens, 8K 阈值会把所有 step 过滤掉 → pad_sequence empty。
+  # NOTE: agent_sdk_engine.py:624 硬编码 max_prompt_length=16384 做 padding/truncation，
+  # 所以 PPO 实际拿到的 prompt 会被 left-truncate 到 16K（保留后 16K tokens），不会爆显存。
+  # 那一行是独立 issue（应读 config），stage1 不动。
+  data.max_response_length=4096     # 4K (verl 权威默认；OpenHands LLM client 默认 max_tokens=2048 也不超)
   data.truncation='error'                                # plan §0.2 verl 权威：超长 prompt 直接报错
-  data.filter_overlong_prompts=True                      # plan §0.2 verl 权威：dataloader 阶段过滤超长
+  data.filter_overlong_prompts=True                      # plan §0.2 verl 权威：dataloader 阶段过滤超长 (dataset 端 task instruction 远小于 32k，不受影响)
 
   # =========================
   # actor_rollout_ref - common
@@ -315,9 +324,13 @@ ARGS=(
   actor_rollout_ref.hybrid_engine=True
   actor_rollout_ref.model.path=${MODEL_PATH}
   actor_rollout_ref.model.trust_remote_code=True   # plan §0.2 verl MODEL 权威：Qwen3.6 自定义 arch 需要
-  # plan §0.1 软约束：use_remove_padding 视实测决定。stage1 起步沿用 True
-  # （现有 NPU 训练脚本验证过可跑），W2 若挂或 OOM 再切 False
-  actor_rollout_ref.model.use_remove_padding=True
+  # plan §0.1 + W2.29 实测：必须 False。GDN linear attention 不支持 packed
+  # sequence (MindSpeed/mindspeed/core/ssm/gated_delta_net.py:292 raise
+  # NotImplementedError if packed_seq_params is not None)。verl
+  # transformer_impl.py:908 用 `data_format = "thd" if use_remove_padding
+  # else "bshd"`，True 触发 thd → packed_seq → GDN raise。verl NPU 脚本
+  # 默认 False。
+  actor_rollout_ref.model.use_remove_padding=False
 
   # =========================
   # actor - optimization / PPO (plan §13.7 + verl NPU 套：use_dynamic_bsz=False)
@@ -351,7 +364,7 @@ ARGS=(
   # 与 verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh NPU case override 一致。
   actor_rollout_ref.actor.megatron.vanilla_mbridge=False
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
-  actor_rollout_ref.actor.megatron.use_remove_padding=True   # 与 model.use_remove_padding 同步；plan §0.1 软约束
+  actor_rollout_ref.actor.megatron.use_remove_padding=False  # 与 model.use_remove_padding 同步 (W2.29 GDN 不支持 packed seq)
   actor_rollout_ref.actor.megatron.dtype=bfloat16            # plan §0.2 verl ACTOR 权威：显式 bf16
   actor_rollout_ref.actor.checkpoint.strict=False            # plan §0.2 verl NPU case：ckpt key 不严格匹配
 
@@ -430,8 +443,11 @@ ARGS=(
   actor_rollout_ref.rollout.temperature=1.0
   actor_rollout_ref.rollout.top_p=1.0
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6
-  # plan §5.2: stage1 起步 32k。W3 监控 episode 长度 P95 接近 32k 再升 64k
-  actor_rollout_ref.rollout.max_model_len=32768
+  # plan §5.2: stage1 起步 32k → W2.21 L3 unblock 升 49152。第一次 LLM call 已经 30721 tokens
+  # (OpenHands system prompt + tools + AGENTS.md heavy)，加 2048 output = 32769 越界 1 tok。
+  # 49152 给 prompt + 后续 turn 留 16k buffer；Qwen3.5/3.6 native 支持 256K，模型侧无压力。
+  # W3 还不够就升 65536。NPU KV cache 多吃一点但 batch=1 dry-step 扛得住。
+  actor_rollout_ref.rollout.max_model_len=49152
   actor_rollout_ref.rollout.max_num_seqs=4
   actor_rollout_ref.rollout.max_num_batched_tokens=8192
   actor_rollout_ref.rollout.n=${ROLLOUT_N}

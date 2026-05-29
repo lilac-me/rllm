@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-26 (v2.20 — W2.20 DooD workspace path alignment：L3 首跑容器空 workspace 退出，根因 `workspace_temp` 在 main container overlay 上、宿主 dockerd 看不见。修：hardcode `/home/docker/openhands_workspace` + 训练脚本加 fail-fast precheck + 用户加同路径 bind mount。新增 §13.23 + audit 教训第 12 条)
+> 修订时间：2026-05-26 (v2.23 — W2.23 `data.max_prompt_length` 8192→32768：W2.22 后 rollout 都通了 reward=0.0，但 step 因 prompt 30721 > 8192 全被 `agent_sdk_engine.py:563` 过滤掉 → batch 空。用户深查路径含 DB 诊断 + json_extract 对比 + 代码下钻。新增 §13.26 + audit 教训第 15 条 + 诊断工具 `diagnose_trace_store.py`。前置 v2.22 MAX_ITERATIONS=1，v2.21 max_model_len，v2.20 DooD。)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -890,6 +890,9 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
 | 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
 | 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.23 | **L3 `data.max_prompt_length` 过滤掉所有 step（W2.23）**：W2.22 后 4 rollout 全部 200 OK + reward=0.0 完成，但依然 `pad_sequence empty`。用户深度诊断 path：(1) 写 `diagnose_trace_store.py` 验 DB 干净 → 排除 DB；(2) `json_extract` 比对 `data.session_name` vs `metadata.session_name` 全对齐 → 排除字段错位；(3) 沿代码下查到 `agent_sdk_engine.py:563` 用 `data.max_prompt_length=8192` 过滤 step，OpenHands 真 prompt 30721 全 skip → trajectory 无 valid step → episode drop → batch 空。修：1 行，`data.max_prompt_length` 8192 → 32768 给 OpenHands 实际 prompt 留出空间。顺手发现 `agent_sdk_engine.py:624` 硬编码 `max_prompt_length=16384` 是 debug 残留（"[DEBUG format]" 打印泄露），对 stage1 反而是 KV cache 保护（padding 阶段 left-truncate 到 16K）→ 列入 stage2 cleanup 不动。新增 §13.26 + audit 教训第 15 条：分层 mock 漏覆盖"OpenHands 实际 prompt 量级 vs dataloader 阈值"。教训：调试数据流问题需 grep warning 级别日志（"Skipping step..." 被 info 淹没）。新增诊断工具 `diagnose_trace_store.py`（可复用）。|
+| 2026-05-26 | v2.22 | **L3 改换策略：MAX_ITERATIONS=1 + random fallback reward（W2.22）**：W2.21 升 max_model_len 到 49152 后第二轮 prompt 47105 又越界 1。观察：每 turn 增长 ~16k，盲升 context 不是路。用户决策 stage1 只验 trainer 链路、不在乎 reward 真假。修：(1) `OPENHANDS_MAX_ITERATIONS` 默认 1000 → 1，prompt 锁首轮 ~30k，永不超 49k；(2) rollout fallback reward `0.0` → `random.random()`，避免 GRPO `std=0` → NaN 让 PPO 跑得动；(3) 不加新 env gate（"env 已太多"）。Trade-off：纯噪声 PPO 信号，stage1 不在乎，W3 + condenser 后 real reward 接管自然 dormant。新增 §13.25 + audit 教训第 14 条（mock_rollout 该返随机 [0,1) 暴露 GRPO std=0 corner case）。|
+| 2026-05-26 | v2.21 | **L3 第一轮 LLM call context off-by-one（W2.21）**：W2.20 DooD fix 通过后容器跑 120 秒到 vllm tokenize 阶段，`30721 prompt + 2048 output = 32769 > max_model_len 32768`，越界 1 token。根因：OpenHands 默认 system prompt + tools + AGENTS.md 第一轮就 30k tokens（Qwen3-coder agent 重 prompt 通病，结构性解法在 OpenHands condenser，stage1 不碰）。修：[train_openhands_qwen36_npu.sh:451](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:451) `max_model_len` 32768 → 49152，给 16k buffer。不动 OpenHands max_tokens（影响生成质量）也不动 data.max_prompt_length（那是 training dataloader 过滤阈值，不限制 runtime LLM call）。Qwen3.5/3.6 native 支持 256K，49k 完全在模型能力内；NPU KV cache 多吃 50% 但 batch=1 dry-step 扛得住。W4 plan §4.5 预排的 64k 升级保留给后续"P95 接近 40k"触发。新增 §13.24 + audit 教训第 13 条：分层 mock 设计漏了"真业务 context budget"约束，下次 L2a mock_llm_server 加边界 case。|
 | 2026-05-26 | v2.20 | **L3 首跑 DooD workspace path alignment（W2.20）**：4 个 OpenHands 容器在 ~3s 内全 exit，reward=0.0，trace store 空 → pad_sequence empty list（与 L2b 同症状但根因不同）。根因：rllm 主进程跑在一个 main container 内，`workspace_temp` 写在 main container overlay 上；`openhands_agent` 用 `-v {workspace}:/opt/workspace` 起子容器，**这条 `-v` 由宿主 dockerd 解析**，看不到 main container 内的路径 → 宿主新建空目录挂到子容器 → entrypoint.py 不存在 exit 127。修复（用户决策：不引入新 env，stage1 env 已过多 + 不污染 /tmp）：(1) `openhands_agent.py:225` workspace_temp **hardcode** `/home/docker/openhands_workspace`（NPU 节点 docker user home，持久路径稳定）+ 长注释说明 DooD 约束；(2) 训练脚本顶部加 **fail-fast precheck**：`workspace_temp` + `artifact_dir` dir 不存在/不可写直接 `exit 1` 并提示 bind mount 修复指令；soft warn 不是 bind mount（用 findmnt 检测，不阻塞，因为 findmnt 不一定每个 image 都装）；(3) 用户运维侧 main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`。新增 §13.23 + audit 教训第 12 条：DooD 下任何 `-v <src>:<dst>` 的 `<src>` 必须宿主可见（在宿主 shell `ls <src>` 能看到内容才合法）。**Stage 2 演化路线**：用户决策不烤 skills 进 image（迭代成本高），多机时走 OBS 拉取（首选，Ascend 集群默认有）/ NFS / 自有 HTTP 服务（最重，非必要不引入）。stage 2 进 §9 下一阶段 TODO 跟踪。|
 
 ---
@@ -2140,6 +2143,133 @@ skills 快速迭代场景下，stage 2 不走"workspace 烤进 image"（迭代�
 
 stage 1（W2.20）= 同路径 bind mount，工时 < 30 分钟。stage 2 真正切多机时再选 OBS 或 NFS，进 §9 下一阶段 TODO 跟踪。
 
+### 13.24 L3 第一轮 LLM call context off-by-one：32k → 49152（W2.21）
+
+**症状**：W2.20 DooD fix 通过后，L3 第一个 rollout 容器跑 120 秒（vs 之前 3 秒），但**vllm 端 tokenize 阶段抛 `VLLMValidationError`**：
+
+```
+This model's maximum context length is 32768 tokens. However, you requested
+2048 output tokens and your prompt contains at least 30721 input tokens,
+for a total of at least 32769 tokens.
+```
+
+`30721 + 2048 = 32769 > 32768`，**差 1 个 token 越界**。
+
+**根因**：OpenHands 默认 system prompt + 全部 tools 定义（terminal/file_editor/bash 等）+ `agent_workdir/AGENTS.md` + `INSTRUCTIONS.md`，第一轮 LLM call 就 30k tokens。Qwen3-coder agent 框架历史性的"重 system prompt"问题，不是 stage1 该结构性解决的（结构性解法在 OpenHands condenser / prompt compaction，下放到 W3/W4）。
+
+**结构性观察**：30k 只是**第一轮**就吃掉的，多 turn 会随对话历史线性增长。L3 dry-step 只跑 1 iter 所以单次 unblock 够用；W3 长跑必须有 compaction 机制或更大 context。
+
+**修复（W2.21，一行）**：[train_openhands_qwen36_npu.sh:451](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:451) `max_model_len` 32768 → **49152**。
+
+| 数 | 含义 |
+|---|---|
+| 49152 | new max_model_len（48k） |
+| 30721 | first-turn observed prompt |
+| 2048 | OpenHands LLM client 默认 output budget |
+| 49152 − 30721 − 2048 = **16383** | 给 prompt 后续增长 + output 留的 buffer |
+
+**为什么不一步升到 65536**：
+- 49152 在 NPU KV cache 上比 32k 多 50% 占用，65536 多 100%，dry-step 都扛得住但 49k 更保守；
+- W4 plan §4.5 已预排 64k 升级，留给后续以"实测 P95 接近 max_model_len"为触发条件升；
+- 49152 在 W2.21 是为了精准解决"30k+2k 越界 1"的 issue，不是为了 W3+ 长跑做容量规划。
+
+**为什么不动 OpenHands `max_tokens=2048`**：那是 OpenHands LLM client 默认，改了影响生成质量（容器内 output 被截断），权衡不如直接拉 context。
+
+**为什么不动 `data.max_prompt_length=8192`**：这是**训练数据 dataloader 阶段的过滤阈值**，不限制 OpenHands runtime LLM call。对 L3 不相关。
+
+**Audit 教训第 13 条**：分层 mock 设计时（plan §13.10）覆盖了"trainer 链路"和"OpenHands docker 链路"两条主轴，但**漏了"真业务 context budget"这条隐式约束**。下一次设计 mock 时，给 L2a mock_llm_server 加一条"返回 prompt token count > model max_model_len 的边界 case"，提前在 L2a 暴露这类越界，不让它溜到 L3。
+
+stage1 此后默认 `max_model_len=49152`。W3 监控 episode 长度 P95，超 40k 再考虑 65536。
+
+### 13.25 改换策略：MAX_ITERATIONS=1 + random fallback reward（W2.22）
+
+**症状**：W2.21 升 max_model_len 到 49152 后，L3 重跑 — **第二轮 LLM call 47105 tokens + 2048 output = 49153 又越界 1**：
+
+```
+This model's maximum context length is 49152 tokens. However, you requested
+2048 output tokens and your prompt contains at least 47105 input tokens,
+for a total of at least 49153 tokens.
+```
+
+**观察**：每个 turn prompt 增长 ~16k（=LLM 响应 + 上一轮 tool 执行结果），盲目升 context 走不通 —— 65k 也只多撑 1 轮。
+
+**用户决策（2026-05-26）**：stage1 不是为了让 agent 真解算子题，**只为了让 trainer 链路（rollout → trace → batch → PPO step → checkpoint）跑起来**。reward 用随机数 mock 都可以接受。
+
+**修复（W2.22，两改动）**：
+
+| 文件 | 改动 | 行号 |
+|---|---|---|
+| `train_openhands_qwen36_npu.sh` | `OPENHANDS_MAX_ITERATIONS` 默认 1000 → **1** | [:159](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:159) |
+| `openhands_agent.py` rollout | `reward = 0.0` 初始值 → **`reward = random.random()`**（fallback uniform [0,1)） + 加 `import random` | [:717](rllm/examples/openhands_sdk/openhands_agent.py:717) |
+
+**为什么 MAX_ITERATIONS=1**：
+- 1 个 turn = 1 次 LLM call，prompt 锁定在首轮 baseline ~30k tokens，永远不会增长到 49k
+- 仍然产生真实 LLM 调用 → trace store 有数据 → PPO batch 能构造
+- 副作用：agent 没机会执行 tool / 写代码 / 跑评测，reward 函数大概率拿不到有效 output → 0 分
+
+**为什么 fallback reward = `random.random()` 而不是 `0.0`**：
+- GRPO advantage = `(r - mean_r) / std_r`
+- 如果 4 个 rollout reward 全 0（W2.22 后大概率发生，因为 MAX_ITERATIONS=1），std=0，advantage 算出 NaN → PPO step 挂
+- random uniform [0,1) 保证 4 个 rollout 之间有 variance，PPO step 跑得动
+- 真 reward 成功时（`_npu_operator_reward` 返回正常值）会覆盖随机初值，不影响真训练信号
+
+**信号保真度权衡**：random fallback 是**纯噪声 PPO 信号**，训练不出来真模型 —— 但 stage1 不在乎，目的是验证 trainer 链路。W3 + condenser 后，agent 能真 multi-turn 工作，real reward 接管，random fallback 自然 dormant（不发生异常就不用）。
+
+**为什么不加新 env gate `STAGE1_MOCK_REWARD=1`**：用户决策"env 已经太多"。当前实现：fallback 只在异常分支生效，正常 reward 计算成功就用真的，不需要 env 控制。
+
+**Audit 教训第 14 条**：分层测试理论上能验"trainer 跑得动"，但真业务 reward 全 0 这种 corner case 在 mock 里没暴露过（mock_rollout 写死 0.5 有 variance；真业务可能 4 个 rollout 同 0）。下次 mock 设计时 mock_rollout 应该返回**随机 [0,1)** 而非常数 0.5，提前在 L2b 暴露 GRPO 在 std=0 时的行为（虽然 mock_rollout 现在用不上了，但作为 mock 设计规范保留）。
+
+stage1 此后默认 `MAX_ITERATIONS=1` + random fallback reward。L3 跑通 → 提 W3 时同步评估"何时把 MAX_ITERATIONS 加回 + condenser 接入"。
+
+### 13.26 `data.max_prompt_length` 卡 step 过滤 → pad_sequence empty（W2.23）
+
+**症状**：W2.22 fix 后 L3 重跑，4 个 rollout 全 `reward=0.0` 完成（不是 random fallback，是真 reward 函数返回 0），但**依旧 `RuntimeError: received an empty list of sequences`** 在 `transform_results_for_verl` line 614 `pad_sequence(prompts, ...)`。
+
+**用户排查路径**（耗时但极有价值）：
+
+1. **怀疑 DB 写入失败** → 写诊断脚本 `diagnose_trace_store.py` 一次性查 traces/trace_sessions/metadata/slug 解码 → **结论：DB 完全干净**（4 个 rollout 全有 trace，session_uid 完全对齐，session_name 在 data 和 metadata 列都存在且一致）
+2. **怀疑 `trace.data.session_name` vs `metadata.session_name` 字段错位** → SQL `json_extract(data, '$.session_name')` vs `json_extract(metadata, '$.session_name')` 比对 → **结论：两边都对，完全一致**
+3. **沿着代码继续往下查** → 找到 `agent_sdk_engine.py:563`：
+
+```python
+max_prompt_length = self.config.data.max_prompt_length  # = 8192
+for step_idx, step in enumerate(trajectory.steps):
+    prompt_ids = ...
+    if len(prompt_ids) > max_prompt_length:    # ← 30721 > 8192，全 skip
+        logger.warning(f"Skipping step {step_idx} ... prompt length {len(prompt_ids)} > max_prompt_length {max_prompt_length}")
+        continue
+    prompts.append(prompt_ids)
+# ...
+if n_steps == 0:                              # ← skip 完所有 step
+    logger.warning(f"Trajectory ... has no valid steps after filtering overlong prompts, skipping")
+    continue
+# 最后 prompts 列表空 → line 614 pad_sequence([]) 炸
+```
+
+**根因**：OpenHands 首轮 prompt 30721 tokens > stage1 默认 `data.max_prompt_length=8192`，所有 step 被过滤 → 所有 trajectory 无 valid step → episode 全 drop → batch 空。
+
+**和之前几条都不相关**：不是 W2.20 DooD、不是 W2.21 max_model_len、不是 W2.22 MAX_ITERATIONS，是**纯粹的 dataloader 过滤阈值与 OpenHands 实际 prompt 大小不匹配**。
+
+**修复（W2.23，1 行）**：[train_openhands_qwen36_npu.sh:328](rllm/examples/openhands_sdk/train_openhands_qwen36_npu.sh:328) `data.max_prompt_length` 8192 → **32768**（盖住 30721 + buffer）。
+
+**顺手发现的独立 issue**（不在本节修）：[agent_sdk_engine.py:622-626](rllm/engine/agent_sdk_engine.py:622) padding/truncation 阶段**硬编码** `max_prompt_length = 16384`：
+
+```python
+max_prompt_length = self.config.data.max_prompt_length  # line 622
+print("[DEBUG format] max prompt length:", max_prompt_length)
+max_prompt_length = 16384                                # ← line 624 硬编码覆盖
+prompts_batch = pad_sequence_to_length(prompts_batch, max_prompt_length, ...)
+prompts_batch = prompts_batch[:, -max_prompt_length:]    # left-truncate 到 16K
+```
+
+是别人留的 debug 代码（"[DEBUG format]" 打印是 dead giveaway）。**对 stage1 反而是好事**：过滤层放行 32k prompt 后，padding 阶段会自动 left-truncate 到 16K（保留尾部 16K tokens），PPO 不会因为单 sequence 30k 而爆显存。该硬编码长期应该改成读 config，列入 stage2 cleanup。
+
+**Audit 教训第 15 条**：分层 mock 设计时（plan §13.10）覆盖了"链路连通"和"功能字段对齐"，但**漏了"OpenHands 真实 prompt 量级 vs stage1 dataloader 过滤阈值"这条约束**。下次 mock 设计时 mock_rollout 应该构造一条 prompt > config 限制的 trajectory，提前在 L2b 暴露这条过滤。
+
+**为什么这条这么难找**：日志线索都是 `warning` 级别（"Skipping step..." / "Trajectory has no valid steps after filtering overlong prompts"），用户看的是 traceback / `Generating trajectories: 100%` / `Rollout completed with reward: 0.0` 这些 info 级别消息，warning 被 info 淹没。**调试 stage1 数据流问题时建议 grep warning**（`grep WARNING ray_log_*.err`）。
+
+stage1 此后默认 `data.max_prompt_length=32768`。W3 视 OpenHands prompt 实际增长，可能再升。
+
 ---
 
 ## 14. 新对话接手指南（Onboarding）
@@ -2151,8 +2281,8 @@ stage 1（W2.20）= 同路径 bind mount，工时 < 30 分钟。stage 2 真正�
 **目标**：Qwen3.6-35B-A3B × OpenHands × Ascend NPU 跑 agentic RL（算子生成 agent）。
 **基础设施**：rllm（agent RL framework）跑在 verl-BryanChen408 fork（Ascend 适配的 verl）+ Megatron-Bridge + vllm-ascend + Megatron-LM。
 **项目阶段**：W1 全完成（cherry-pick + 适配），W2 进行中（stage1 训练 bring-up）。
-**当前位置**：L2b mock 路径已验完 setup chain（vllm/Megatron/HCCL/proxy/step 进入全 OK），准备进 **L3 真 OpenHands docker rollout**。
-**已知 limitation**：L2b 的 mock_rollout 不调 LLM，trace store 空，PPO step 验不到（plan §13.22）；L3 真 rollout 自然修复。
+**当前位置**：W2.22 切换 stage1 策略：`MAX_ITERATIONS=1`（锁 prompt 首轮 ~30k 永不超 49k）+ rollout fallback reward `random.random()`（防 GRPO std=0 NaN）。L3 等待此 fix 后重跑验证 trainer 链路。
+**已知开放项**：stage1 走"轻链路验证"路线 — agent 单 turn 不解题、reward 噪声 → 训练信号是 mock 的，目的只是让 PPO step 跑起来。**真训练**需要 OpenHands condenser（长 context 压缩）+ 多 turn agent，下放 W3/W4。
 
 ### 14.2 Git refs cheatsheet
 
@@ -2174,8 +2304,14 @@ push 到:  origin/qwen36-openhands-stage1
 | W2 stage1 训练脚本 | 1 | `5082c854` |
 | W2 分层测试 | 1 | `b07a55d7` |
 | W2 vllm/megatron/HCCL/script 修复（W2.9-W2.18） | 9 | 见 `git log` |
-| 用户人工调整（路径） | 3 | `07d98394` `4dfb7dc9` `6b1f522e` |
-| 最新 | — | `8dc3ecc9` (plan §13.22 + L3 prep) |
+| 用户人工调整（路径） | 多 | `feb85471` `fdb8e236` 及之后人工 rebase |
+| W2.20 DooD workspace path alignment | 1 | `bedbb1b0` (hardcode `/home/docker/openhands_workspace` + fail-fast precheck) |
+| W2.20 precheck 放宽（findmnt -T） | 1 | `15686e0e` |
+| W2.21 max_model_len 32k→49152 unblock L3 | 1 | `e5e6c9ce` |
+| W2.21 §14 onboarding 同步 | 1 | `87f03325` |
+| W2.22 MAX_ITERATIONS=1 + random fallback reward | 1 | `2a2fdbb7` |
+| W2.23 `data.max_prompt_length` 8192→32768 + 诊断工具 | 1 | （本轮 commit） |
+| 最新 | — | 本轮（plan §13.26 + W2.23 + `diagnose_trace_store.py`） |
 
 **verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
 
@@ -2236,8 +2372,12 @@ push 到:  origin/qwen36-rllm-compat
 - ✓ W2.8-W2.18 持续修复 setup 链路（HCCL/Megatron-Bridge/vllm/mock_rollout）
 - ✓ W2.19 跳 L2b 决策（mock 天然边界，setup 已验完）
 - ✓ L1/L2a/L2b（部分） — 全部走过 setup chain
+- ✓ W2.20 DooD workspace path alignment（hardcode `/home/docker/openhands_workspace` + fail-fast precheck + findmnt -T）
+- ✓ W2.21 max_model_len 32k→49152 解决 OpenHands 30k 重 prompt 首轮越界 1 token
+- ✓ W2.22 改换策略：MAX_ITERATIONS=1 + rollout fallback reward random.random()（stage1 只验 trainer 链路、不在乎 reward 真假）
+- ✓ W2.23 `data.max_prompt_length` 8192→32768 解决 `agent_sdk_engine.py:563` step 过滤把所有 trace step 全 drop 的问题；过程中诊断完 DB 链路完全干净（trace_store / session_uid / data vs metadata 字段对齐都验过）
 
-**当前位置**：等用户在 NPU 上跑 L3。
+**当前位置**：W2.23 fix 后等待 L3 重跑结果。已诊断清楚 trace store / session_uid / max_prompt_length 全链路；上一次 L3 跑全部子链路通到 `transform_results_for_verl`，因 step 过滤阈值过低被全 drop。fix 后 step 应能放行，期望挂点回到 PPO step 真挂这种"上游链路全通"的位置。
 
 **下一步（用户该做的）**：
 
@@ -2264,12 +2404,19 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 # = STAGE1_DRY_STEPS=1 bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 ```
 
-**预期 L3 挂点**（按风险递减，plan §13.22 末段）：
-1. docker image 不存在 / build 失败
-2. 容器内调 LiteLLM proxy 不通（`host.docker.internal` vs `--network host`）
-3. OpenHands 容器内 entrypoint 异常 exit
-4. 第一次 LLM 调用慢 timeout
-5. **PPO step 真挂**（如果走到这里，意味着 W2.8-W2.18 全成功，可以庆祝）
+**W2.22 后预期 L3 挂点**（按风险递减）：
+1. NPU KV cache OOM（49k context 比 32k 多 ~50% 显存；`gpu_memory_utilization=0.6` 应该够，挂的话日志在 `/tmp/ray/session_latest/logs/worker-*.err`）
+2. tool call schema 在 30k 长 prompt 下解析错乱（Qwen3-coder parser 边界）
+3. OpenHands 容器内 entrypoint 业务异常（reward 计算 / eval 脚本挂；现在 rollout fallback 兜底，应该不至于让 episode 飞掉）
+4. **PPO step 真挂**（最值得期待 — 意味着 setup chain 全通了）
+
+**已解除的挂点**（W2.20/W2.21/W2.22 修过，不该再出现）：
+- ~~docker image 不存在 / build 失败~~（用户已 build 过 + 用过）
+- ~~容器内调 LiteLLM proxy 不通~~（W2.20 DooD 修了路径，proxy 端 host.docker.internal + `--add-host host-gateway` 已生效）
+- ~~OpenHands 容器内 entrypoint.py 不存在~~（W2.20 修了 workspace_temp）
+- ~~vllm context length 越界~~（W2.21 升 49152 + W2.22 MAX_ITERATIONS=1 锁 prompt ~30k）
+- ~~GRPO std=0 NaN~~（W2.22 random fallback 兜底 reward variance）
+- ~~episode 全 drop（trace store 空）~~（MAX_ITERATIONS=1 仍产生 1 次真 LLM call，trace store 有数据）
 
 ### 14.6 已知 limitations / 历史踩坑（避免重复踩）
 
@@ -2310,6 +2457,29 @@ bash examples/openhands_sdk/stage1_test_layered.sh L3
 - 当前 hardcode `/home/docker/openhands_workspace`（[openhands_agent.py:225](rllm/examples/openhands_sdk/openhands_agent.py:225)），main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
 - 训练脚本顶部已有 fail-fast precheck，dir 不存在/不可写直接退出；soft warn 不是 bind mount（findmnt 检测）
 - 排错：在**宿主 shell**（不是 main container 内）`ls /home/docker/openhands_workspace/`，能看到 `trajectory-*` 子目录才合法
+
+**OpenHands 重 system prompt → 长 context 压力**（plan §13.24，audit 教训第 13 条）：
+- Qwen3-coder agent setup 第一轮 LLM call 就 30k tokens（system prompt + 全部 tools 定义 + AGENTS.md + INSTRUCTIONS.md），不是 bug，是 OpenHands × Qwen3-coder 的常态
+- W2.21 把 `max_model_len` 升到 49152 给 16k buffer 解决 dry-step 越界 1 token，但多 turn 长跑会线性增长（每 turn 加 ~16k tool result），**49k 不是长跑容量**
+- W2.22 用 `MAX_ITERATIONS=1` 锁单 turn 绕开此问题（stage1 只验链路），不是结构解
+- 结构性解法在 OpenHands `Condenser`（LLMSummarizing / Recent / NoOp 几种），或精简 system prompt / 减 tools，**stage1 不动**
+- W3 长跑前必须监控 episode 长度 P95：超 40k 升 65536，超 60k 必须上 condenser
+- L2a `mock_llm_server` 当前没模拟"prompt > max_model_len 的边界"，下一轮 mock 设计要补
+
+**stage1 unblock 策略：MAX_ITERATIONS=1 + random fallback reward**（plan §13.25，audit 教训第 14 条）：
+- stage1 不在乎 agent 真解题，只在乎 trainer 链路（rollout → trace → batch → PPO step → checkpoint）跑起来
+- `OPENHANDS_MAX_ITERATIONS=1` 锁单 turn，prompt 永远 ~30k，trace store 有真 LLM 数据 → PPO batch 能构造
+- rollout fallback reward = `random.random()` 而非 `0.0`，保证 4 个 rollout reward 有 variance，GRPO `std≠0` → PPO step 不出 NaN
+- **训练信号是 mock 的**：纯噪声 advantage，不要在 stage1 期待 reward 曲线上升 / 模型学到东西
+- 真训练前置：condenser 接入 + multi-turn agent + MAX_ITERATIONS 拉回正常值 + 真 reward 接管（自动发生，random fallback 只在异常时生效）
+- 不加 `STAGE1_MOCK_REWARD` env gate（已决策"env 太多"），随机 fallback 永远 in 但正常时 dormant
+
+**`data.max_prompt_length` vs OpenHands 真 prompt 量级**（plan §13.26，audit 教训第 15 条）：
+- OpenHands 首轮 prompt 30k+，stage1 默认 `data.max_prompt_length=32768`（W2.23 从 8192 升）必须 ≥ 实际 prompt
+- `agent_sdk_engine.py:563` 用此值过滤 step → 过低则所有 step 被 skip → trajectory 无 valid step → episode drop → pad_sequence 空
+- 诊断 trick：**调试数据流问题先 grep WARNING**，"Skipping step..." / "Trajectory has no valid steps after filtering overlong prompts" 这些被 info 级别淹没
+- 旁注：`agent_sdk_engine.py:624` 硬编码 `max_prompt_length = 16384` 做 padding/truncation 是 debug 残留（"[DEBUG format]" 打印泄露），对 stage1 反而是 KV cache 保护 → stage2 cleanup
+- 诊断工具：`examples/openhands_sdk/diagnose_trace_store.py` — 一键检查 DB 完整性 + session_uid 对齐 + slug 解码，未来 trace store 问题第一时间用
 
 **Stage1 安全训练 config**（plan §13.7）：
 - `router_replay=disabled`（stage1 AgentPPOTrainer 路径上 19983fe4 入口不生效，§13.3）
