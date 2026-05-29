@@ -136,7 +136,7 @@ stage1 用的那个 `verl_engine.py`（`rllm/engine/rollout/verl_engine.py`）�
 
 ## W2 Setup + Debug Round 1 Review (16 commits → 1 squash commit)
 
-**最终决策**：全部 11 个必要 commit squash 成单 commit `feat(stage1): training script for Qwen3.6-35B-A3B × OpenHands × NPU` (`d810e758`)，每个 fix 的技术决策保留在脚本 inline 注释里。5 个剔除 (`c1ff82e3` + 4 个 mock/test infra)。
+**最终决策**：全部 11 个必要 commit squash 成单 commit `feat(stage1): training script for Qwen3.6-35B-A3B × OpenHands × NPU` (`82499320`)，每个 fix 的技术决策保留在脚本 inline 注释里。5 个剔除 (`c1ff82e3` + 4 个 mock/test infra)。
 
 ### 各 commit 一句话回顾
 
@@ -282,10 +282,10 @@ Trade-off：W3 阶段整合分支多 2 个 commit（从 1 个变 3 个），换�
 
 **实施步骤**：
 
-1. `git reset --hard 505859d5`（回 W3 log 之后，丢弃初版 squash）
-2. Group 1: `git cherry-pick --no-commit -X theirs feb85471 bedbb1b0 15686e0e e2ff129f` → commit `7893663a`
-3. Group 2: 同上 `e5e6c9ce 2a2fdbb7 4f941da2 81cb31f0` → manual edit `openhands_agent.py` 撤回 W2.22 random fallback + 删 `import random` → commit `31f0529f`
-4. Group 3: 同上 `dd229d51 5eb4224f c4efcc07` → commit `ab5efdc2`
+1. `git reset --hard 0e4dd7e9`（回 W3 log 之后，丢弃初版 squash）
+2. Group 1: `git cherry-pick --no-commit -X theirs feb85471 bedbb1b0 15686e0e e2ff129f` → commit `34cfe866`
+3. Group 2: 同上 `e5e6c9ce 2a2fdbb7 4f941da2 81cb31f0` → manual edit `openhands_agent.py` 撤回 W2.22 random fallback + 删 `import random` → commit `ff7dc3f2`
+4. Group 3: 同上 `dd229d51 5eb4224f c4efcc07` → commit `35f12439`
 
 最终 W3 阶段贡献 4 commits：1 log + 3 squash commits。
 
