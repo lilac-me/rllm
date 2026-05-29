@@ -6,6 +6,66 @@
 
 ---
 
+# 🚀 Pre-context for new conversation（30 秒回到上下文）
+
+**新对话从这里开始读**。整合工作已完成 cherry-pick + squash 阶段，处于待环境验证 + cleanup 收尾状态。
+
+## TL;DR
+
+| Quick fact | Value |
+|---|---|
+| 整合分支 | `verl-main` (本地分支，未 push) |
+| 当前 HEAD | `f8845ff3` "docs: Stage2 review + squash decision (5 commits)" |
+| 起点 | `b2538771` "fix time" (obs 分支 cherry-pick 之一) |
+| ahead | **18 commits ahead of b2538771** |
+| 已完成 | W1 cherry-pick / W2 squash / W3 squash (拆 3) / Stage2 squash (拆 5) / commit message rewrite / 整合分支用户接手指南 / Layer A 静态验证 |
+| 待做 | (1) stage3+ cleanup commit (不需要环境) / (2) Layer B 启动验证 (需 NPU) / (3) Layer C 训练验证 (需 NPU + 真实数据) |
+| 关键源仓 | rllm 本地 `/Users/yeji/Documents/Code/Python/Qwen36/rllm` |
+| 关键 log 文档 | 本文件 `STAGE_INTEGRATION_LOG.md` + `STAGE2_FIT_LOOP_AUDIT.md` + `QWEN36_OPENHANDS_AGENT_RL_PLAN.md` |
+
+## verl-main 当前 commit 列表（按时间倒序，新 → 旧）
+
+```
+f8845ff3 docs: Stage2 review + squash decision (5 commits)
+fa750e61 fix(train-script): DooD precheck FATAL
+50bc9f96 feat(stage1): Dr.GRPO + std0 metric (drop random fallback)
+2e1886ad fix(openhands): container/workspace cleanup + docker wait timeout
+f258836b fix: stage2 audit findings + observability metrics
+e35c4c65 docs: stage2 fit-loop audit + plan config locks
+96c98f05 docs: update stale SHAs after commit message rewrite
+de6038aa docs: W3 squash 拆分决策记录（初版 1 commit → 拆 3 commit）
+35f12439 fix(trainer): AgentSdkTrainer DataProto→TensorDict bridge  ← 核心架构 fix
+ff7dc3f2 fix(stage1): L3 unblock — context/iter/padding configs
+34cfe866 fix(openhands): DooD workspace alignment + diag tool
+0e4dd7e9 docs: W3 review + 整合分支用户接手指南
+0d2888d1 docs: W2 squash decision + 注释下放 + dbg cleanup deferred
+82499320 feat(stage1): training script for Qwen3.6-35B-A3B × OpenHands × NPU  ← 训练脚本主体
+6ac64baf docs(plan): snapshot stage1 plan v2.2 (pre-implementation)
+50ab196d Fix rollout_probs_diff masking to respect response_mask in Verl trainers (#503)
+a52de00a fix(parser): Qwen3.5 chat template support + simple_math example (#504)
+34c3ee68 docs: stage integration review log — W1 done (verl-main baseline)
+----- b2538771 起点 -----
+```
+
+## 关键决策（已锁定，不要再讨论）
+
+1. **整合分支专项**：只覆盖 AgentSDK 路径 (`AgentSdkTrainer` / `AgentSdkEngine` / `rllm.engine.rollout.verl_engine`)，**不**带 `VerlBackend` / `experimental/*` / `AgentPPOTrainer` 路径
+2. **mock/test 工具不进 baseline**：所有 mock LLM / mock rollout / preflight / `prepare_npu_operator_data` 工具 cherry-pick 时剔除
+3. **commit messages 无 stage1 日志绑定**：W2.X / plan §13.x / audit lesson #X 全部已 rewrite 移除（用 `git filter-branch --msg-filter` 实施）
+4. **dbg() helper 推迟到 stage3+ cleanup commit**：W2/W3 squash 时都把 dbg() 函数 + 调用站点保留，等整合完成后一次性清理
+5. **3 个 stage2 临时 default 一起保留 + 一起解锁**：`OPENHANDS_MAX_ITERATIONS=1` + `rejection_sample.enable=False` + `norm_adv_by_std_in_grpo=False` (Dr.GRPO) — 接 condenser + reward 稳定后 stage3 解锁
+6. **整合分支 Squash 粒度**：W2 squash 1 个 (训练脚本搭建是同一 feature)；W3 squash 拆 3 个 (跨 OpenHands runtime / config / Trainer 架构 3 个子系统)；Stage2 squash 拆 5 个 (跨 audit / runtime / 算法 / precheck 等子系统)
+
+## 当前 working tree 状态
+
+clean（最新 commit `f8845ff3` 之后无未提交改动）。
+
+## 下一步快速决策
+
+新对话开始时直接读 §"接下来的工作（按优先级）" 章节（见本文件末尾）。**最高优先**是 stage3+ cleanup commit（不需要环境，~30 分钟内完成）。
+
+---
+
 ## 范围声明
 
 **只保留**对以下路径有效的改动：
@@ -523,3 +583,172 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 | 2026-05-29 | W3 squash 拆分（初版 1 commit → 拆 3 commit） | W2 squash 合理是因为 11 个 commits 是同一 feature 演进；W3 11 个 commits 跨 OpenHands runtime / 训练脚本 config / Trainer 核心架构 bridge 三个完全不同子系统，1 commit 让 trainer bridge 这种核心架构修复在 git log 不可见；拆 3 个 commit 每个 logical scope 单一 |
 | 2026-05-29 | Commit message rewrite — 6 个 commits 移除 stage1 日志绑定（W2.X / plan §13.x） | 用户校准要求整合分支独立于 stage1 工作日志；用 git filter-branch --msg-filter 一次性重写，commit content 不变；只更新过期 SHA 在 log 文档里的引用 |
 | 2026-05-29 | Stage2 squash 拆 5 commit | 继承 W3 拆分精神——8 个 input commits 跨 audit/observability / runtime / 算法决策 / precheck 4-5 个子系统；按 logical sub-theme 拆 5 个 commit 让每个 scope 单一；audit + observability 合并 1 commit 因为三者性质强相关（都是 audit 主线产物）|
+
+---
+
+## 接下来的工作（按优先级）
+
+整合工作的 cherry-pick + squash + commit message rewrite 已完成。剩下 3 项 follow-up，**新对话应该按下面优先级顺序做**。
+
+### 🔴 优先级 1：Stage3+ cleanup commit（**不需要环境**，~30 分钟）
+
+把整合工作彻底收尾，做一个 cleanup commit 处理之前 W2 / W3 / Stage2 squash 时显式 defer 的项。
+
+**包含 2 项**：
+
+#### 1.1 删除 `dbg()` helper 函数 + 所有调用站点
+
+**当前状态**：`dbg(msg: str)` 函数定义在两处文件，调用散布在多个位置（debug 期手撸的 logger，path standardized 但 helper 本身留着）。
+
+**位置**：
+- `rllm/trainer/verl/agent_sdk_trainer.py` 第 64-71 行附近（函数定义）+ 文件内多处调用
+- `examples/openhands_sdk/openhands_agent.py` 第 64-75 行附近（函数定义）+ 文件内多处调用
+
+**改法**（选项 A 推荐）：完全删除 `dbg(...)` 调用 + 删 dbg 函数定义；生产代码靠现有 `logger.info(...)` 已经够。
+
+**实施**：
+
+```bash
+# 1. grep 所有 dbg() 调用站点
+grep -rn "^[^#\"]*dbg(" rllm/trainer/verl/agent_sdk_trainer.py examples/openhands_sdk/openhands_agent.py
+
+# 2. 用 Edit 删除每个 dbg(...) 调用行（注意是行级删除，整行 dbg(...) 都删）
+# 不要 sed 因为 Python 缩进容易破坏
+
+# 3. 删 dbg() 函数定义本身（2 处，每处 ~7-10 行）
+
+# 4. python3 -c "import ast; ast.parse(...)" 验证语法 OK
+
+# 5. grep -rn "dbg(" 确认 0 残留（应该只剩字符串内 / 注释内）
+```
+
+#### 1.2 reconcile plan markdown 版本引用
+
+**位置**：`examples/openhands_sdk/train_openhands_qwen36_npu.sh:5` 写：
+```
+# Per QWEN36_OPENHANDS_AGENT_RL_PLAN.md (v2.4):
+```
+
+但脚本里实际配置已经超出 v2.4 baseline（W3 / Stage2 改动都进来了）。
+
+**改法**：去掉版本号，只引用 plan 章节名。例如：
+```
+# Per QWEN36_OPENHANDS_AGENT_RL_PLAN.md key sections:
+#   §0.1 / §0.2  Required NPU env + verl-script MoE flags
+#   §5.2         max_model_len baseline
+#   §14.5        stage1-locked configs (must not flip without re-audit)
+```
+
+#### Cleanup commit message 建议
+
+```
+chore: stage3+ cleanup — remove dbg() helper + reconcile plan reference
+
+W2/W3/Stage2 squash 时为了避免每阶段 cherry-pick 撞冲突，dbg() helper
+函数 + 调用站点都保留，约定整合结束后单独清理。本 commit 实施。
+
+Changes:
+  - examples/openhands_sdk/openhands_agent.py
+    - remove dbg() helper definition
+    - remove all dbg(...) call sites (~N occurrences)
+  - rllm/trainer/verl/agent_sdk_trainer.py
+    - same
+
+  - examples/openhands_sdk/train_openhands_qwen36_npu.sh
+    - header reference "(v2.4)" replaced with chapter names only,
+      so the comment doesn't go stale as plan evolves
+```
+
+---
+
+### 🟡 优先级 2：Layer A 静态验证（**不需要环境**，~5 分钟）
+
+✅ **已完成**（2026-05-29 本对话内）。结果如下：
+
+| 子项 | 结果 |
+|---|---|
+| Python syntax (558 文件) | ✅ 0 fail |
+| Bash syntax (82 文件) | ✅ 0 fail |
+| Import smoke (rllm 顶层 OK；深层 `AgentSdkTrainer` 等缺 torch/verl/rllm[train] — Mac 上 expected) | ✅ |
+| Train script precheck（在 Mac 上正确 fail-fast on `/home/docker/openhands_workspace` 不存在）| ✅ |
+
+A.4 关键验证：4 处整合 fix 都在 train script 启动序列里**实际生效**：Megatron-Bridge 3-路 dispatch / OPENHANDS_MAX_ITERATIONS=1 / 路径标准化 / DooD precheck FATAL。
+
+**做 cleanup commit (优先级 1) 之后应该再跑一次** Layer A.1 / A.2 确认没引入语法错误。
+
+---
+
+### ⏸ 优先级 3：Layer B 启动验证（**需要 NPU 环境**）
+
+在 NPU container 内跑完整 train script，看启动序列是否完整。**不需要真实算子数据集**——预期挂在 dataloader（找不到 parquet）。
+
+**前置**：参考 STAGE_INTEGRATION_LOG.md "整合分支用户接手指南" 的 Step 0 mount 列表。NPU container 启动时挂好 5 个关键 bind mount。
+
+**操作**：
+
+```bash
+# 在 NPU container 内（main container）
+cd <path-to-verl-main-checkout>
+bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
+```
+
+**期望观察**（按顺序）：
+
+| 阶段 | 期望 |
+|---|---|
+| Top precheck | docker.sock check + workspace bind mount check + Megatron-Bridge dispatch — 全过 |
+| Ray cluster | `ray start --head` 起来 |
+| vllm worker (slowest) | 加载 Qwen3.6-35B-A3B 完成（~5-10 min 模型加载）|
+| LiteLLM proxy | subprocess 起来 + 监听 PROXY_PORT |
+| dataloader | **挂在"找不到 parquet"** ← 这是 expected PASS 标志 |
+
+挂在 dataloader = Layer B PASS（说明 train script 启动序列完整）。
+
+**如果中途挂在别的地方**：
+- precheck 挂 → 看具体哪个 mount 缺
+- Ray 挂 → 看 NPU 占用 + 端口
+- vllm 挂 → 看 vllm-ascend log（compilation/cudagraph/enforce_eager 问题）
+- LiteLLM 挂 → 看 PROXY_PORT 是否被占
+
+---
+
+### ⏸ 优先级 4：Layer C 训练验证（**需要 NPU + 真实算子数据集**）
+
+按 STAGE_INTEGRATION_LOG.md "整合分支用户接手指南" Step 1 走：
+
+1. 准备真实算子任务 parquet（schema 跟 `_MockNPUOperatorParquetDataset` 期望对齐，含 `prompt`/`instruction`/`op_name`/`arch`/`extra_info`）
+2. 在 `train_openhands_qwen36_npu.py:60` 改 `_MOCK_NPU_PARQUET` 路径指向你的 parquet
+3. 跑 1-2 step 训练（默认 `total_training_steps=1` 或显式设 `STAGE1_DRY_STEPS=1`... wait, STAGE1_DRY_STEPS 已经剔除了，所以要在 train_openhands_qwen36_npu.sh 或 hydra override 里改 `trainer.total_training_steps=1`）
+4. 观察 stage2 D 加的诊断 metric
+
+**期望 metric 值（健康状态）**：
+
+| Metric | 期望 |
+|---|---|
+| `adv/has_nan` | = 0（Dr.GRPO 下必 0；sustained > 0 = NaN 来自 KL/ratio/log_prob 别处）|
+| `adv/has_inf` | = 0 |
+| `batch/skipped_all_drop` | 接近 0（如果高 = real reward 启动初期 is_correct 频繁 False）|
+| `rollout/log_probs_fill_rate` | 接近 1.0（< 1.0 = rollout logprobs 跟 response 长度对不齐）|
+| `prompt_length/raw_p95` | < 32768（OpenHands real prompt < max_prompt_length cap）|
+| `rollout/std0_rate` | 看实际值；如果接近 1.0 = 组内 reward 全同（reward 函数有 variance 问题）|
+
+看到 `Saved checkpoint` log = Layer C PASS。
+
+---
+
+## Reference：整合分支用户接手指南 → 见上文 §"整合分支用户接手指南"
+
+新对话不需要重写这个章节，直接 reference。
+
+---
+
+## 如何 push verl-main
+
+整合分支目前**未 push**。本地完成 stage3+ cleanup + Layer A 复检后，可以 push 给协作者：
+
+```bash
+git push -u origin verl-main
+```
+
+如果协作者也用 git filter-branch 或 force rewrite 过 verl-main 远端版本，需要 `--force-with-lease`。一般情况第一次 push 直接 `-u origin verl-main` 即可。
+
