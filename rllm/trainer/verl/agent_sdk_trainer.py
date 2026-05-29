@@ -264,6 +264,11 @@ class AgentSdkTrainer(RayPPOTrainer):
         solve_all = 0
         solve_partial = 0
         num_tasks = 0
+        # stage2 audit F3: count of batches where every uid was dropped before
+        # building `batch`. Without this guard the downstream union/balance_batch/
+        # old_log_prob crashes on an empty DataProto. Reset at the end of each
+        # successful step alongside solve_*/num_tasks below.
+        skipped_all_drop = 0
         termination_counts = Counter()
         workflow_metrics = defaultdict(list)
         metrics = {}
@@ -299,8 +304,36 @@ class AgentSdkTrainer(RayPPOTrainer):
                             
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
+                    # stage2 audit F5: drain rollout_log_probs alignment stats
+                    # before union (meta_info on the right side of union may not
+                    # propagate reliably). Default fill_rate=1.0 keeps old
+                    # behavior visible when no logprobs were returned.
+                    metrics["rollout/log_probs_fill_rate"] = float(
+                        final_gen_batch_output.meta_info.get("rollout_log_probs_fill_rate", 1.0)
+                    )
+                    metrics["rollout/log_probs_mismatched"] = int(
+                        final_gen_batch_output.meta_info.get("rollout_log_probs_mismatched", 0)
+                    )
+                    # stage2 D: drain raw prompt length distribution from
+                    # transform_results_for_verl. Numpy quantiles handle empty
+                    # list with explicit guard.
+                    _prompt_lens_raw = final_gen_batch_output.meta_info.get("prompt_lengths_raw", []) or []
+                    _prompt_filtered = int(final_gen_batch_output.meta_info.get("prompt_filtered_count", 0))
+                    if _prompt_lens_raw:
+                        _arr = np.asarray(_prompt_lens_raw, dtype=np.float64)
+                        metrics["prompt_length/raw_p50"] = float(np.percentile(_arr, 50))
+                        metrics["prompt_length/raw_p95"] = float(np.percentile(_arr, 95))
+                        metrics["prompt_length/raw_max"] = float(_arr.max())
+                        metrics["prompt_length/raw_mean"] = float(_arr.mean())
+                        metrics["prompt_length/filtered_rate"] = _prompt_filtered / len(_prompt_lens_raw)
+                    metrics["prompt_length/filtered_count"] = _prompt_filtered
                     new_batch = new_batch.sample_level_repeat(repeat_counts)
                     final_gen_batch_output.meta_info.pop("repeat_counts", None)  # no longer needed after this
+                    final_gen_batch_output.meta_info.pop("rollout_log_probs_fill_rate", None)
+                    final_gen_batch_output.meta_info.pop("rollout_log_probs_mismatched", None)
+                    final_gen_batch_output.meta_info.pop("rollout_log_probs_total", None)
+                    final_gen_batch_output.meta_info.pop("prompt_lengths_raw", None)
+                    final_gen_batch_output.meta_info.pop("prompt_filtered_count", None)
                     new_batch = new_batch.union(final_gen_batch_output)
 
                     # rejection sampling
@@ -347,10 +380,23 @@ class AgentSdkTrainer(RayPPOTrainer):
                     termination_reasons = episode_unique_batch.non_tensor_batch["termination_reasons"]
                     termination_counts.update(termination_reasons)
 
-                    # If no valid samples remain, skip this batch and get a new one
-                    # if len(drop_uids) == len(unique_uids):
-                    #     print("No valid samples remain, skipping batch")
-                    #     continue
+                    # stage2 audit F3: skip this batch if every uid was dropped (or
+                    # repeat_counts came back all-zero so unique_uids is empty).
+                    # Without this guard, the downstream union/balance_batch/
+                    # old_log_prob path crashes on an empty DataProto. Real-reward
+                    # start-up is the common trigger: agent doesn't write an impl
+                    # file → is_correct=False for every rollout → drop_uids covers
+                    # the whole batch. Continue without bumping global_steps so
+                    # this attempt isn't counted as a training step.
+                    if len(drop_uids) == len(unique_uids):
+                        skipped_all_drop += 1
+                        print(
+                            f"[fit_agent] step={self.global_steps}: all "
+                            f"{len(unique_uids)} uids dropped "
+                            f"(is_correct=False or repeat_counts=0); "
+                            f"skipping batch (cumulative skipped={skipped_all_drop})"
+                        )
+                        continue
 
                     if not self.config.rllm.rejection_sample.enable:
                         batch = new_batch
@@ -457,6 +503,12 @@ class AgentSdkTrainer(RayPPOTrainer):
                         # "entropys"). Without this, select_idxs hits NotImplementedError(aten.index.Tensor)
                         # on the nested tensor.
                         if old_log_prob_td is not None:
+                            # stage2 audit F6: extract worker mfu (mirror verl
+                            # ray_trainer.py:1233 → metric "perf/mfu/actor_infer"
+                            # at line 1518). tu.get with a default keeps stage1
+                            # behavior when worker output omits "metrics".
+                            _worker_metrics = tu.get(old_log_prob_td, "metrics") or {}
+                            _mfu = _worker_metrics.get("mfu", 0.0) if isinstance(_worker_metrics, dict) else 0.0
                             _entropy = tu.get(old_log_prob_td, "entropy")
                             _log_probs = tu.get(old_log_prob_td, "log_probs")
                             _entropy = no_padding_2_padding(_entropy, batch_td)
@@ -465,6 +517,7 @@ class AgentSdkTrainer(RayPPOTrainer):
                             old_log_prob = DataProto.from_tensordict(tu.get_tensordict(_result))
                         else:
                             old_log_prob = None
+                            _mfu = 0.0
 
                         if "entropys" in old_log_prob.batch:
                             entropys = old_log_prob.batch["entropys"]
@@ -475,11 +528,14 @@ class AgentSdkTrainer(RayPPOTrainer):
                                 loss_mask=response_masks,
                                 loss_agg_mode=loss_agg_mode,
                             )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item(),
+                                "perf/mfu/actor_infer": _mfu,
+                            }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                         else:
-                            metrics.update({"actor/entropy": 0.0})
+                            metrics.update({"actor/entropy": 0.0, "perf/mfu/actor_infer": _mfu})
                         
                         batch = batch.union(old_log_prob)
 
@@ -557,6 +613,41 @@ class AgentSdkTrainer(RayPPOTrainer):
                         else:
                             batch = self._remove_padding(batch)  # compute advantages over non-padded steps only
 
+                        # stage2 A (方案 0+) observability: count groups whose
+                        # per-rollout reward collapses to a single value (std=0).
+                        # With Dr.GRPO (norm_adv_by_std_in_grpo=False, see plan
+                        # §14.5) std=0 groups produce zero advantage instead of
+                        # NaN — but PPO still can't learn from them. Sustained
+                        # > 0 signals real reward isn't producing intra-group
+                        # variance (e.g. condenser hasn't unlocked enough
+                        # is_correct=True diversity yet, or task design needs
+                        # tuning). Replaces the rollout-side random fallback
+                        # that was removed in stage2 A.
+                        if "uid" in batch.non_tensor_batch:
+                            _uids = batch.non_tensor_batch["uid"]
+                            _per_rollout_reward = (
+                                batch.batch["token_level_rewards"] * batch.batch["response_mask"]
+                            ).sum(dim=-1)  # (bsz,) scalar reward per row
+                            _unique_uids = np.unique(_uids)
+                            _std0_groups = 0
+                            for _uid in _unique_uids:
+                                _idxs = np.where(_uids == _uid)[0]
+                                if len(_idxs) > 1 and torch.std(_per_rollout_reward[_idxs]).item() < 1e-8:
+                                    _std0_groups += 1
+                            metrics["rollout/std0_groups"] = _std0_groups
+                            metrics["rollout/std0_rate"] = _std0_groups / max(1, len(_unique_uids))
+                            # stage2 D: reward distribution (per-rollout
+                            # scalars). zero_rate is the fraction of rollouts
+                            # with reward == 0 (e.g. agent wrote no impl file
+                            # under _npu_operator_reward); reward range is
+                            # bounded [0, 1] by _npu_operator_reward design.
+                            metrics["reward/mean"] = float(_per_rollout_reward.mean().item())
+                            metrics["reward/std"] = float(_per_rollout_reward.std().item())
+                            metrics["reward/max"] = float(_per_rollout_reward.max().item())
+                            metrics["reward/zero_rate"] = float(
+                                (_per_rollout_reward.abs() < 1e-8).sum().item()
+                            ) / max(1, _per_rollout_reward.numel())
+
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(
                             batch,
@@ -567,6 +658,19 @@ class AgentSdkTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=self.config.algorithm.norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # stage2 D defense-in-depth: catch any NaN/Inf in
+                        # advantage tensor before it propagates into PPO loss.
+                        # With Dr.GRPO + verl epsilon guard, expected count is
+                        # 0; sustained > 0 means stage1's "std=0 → NaN" theory
+                        # is wrong somewhere else (KL? ratio? log_prob?) and
+                        # needs targeted root-cause investigation rather than
+                        # silent NaN propagation.
+                        if "advantages" in batch.batch:
+                            _adv = batch.batch["advantages"]
+                            metrics["adv/has_nan"] = int(torch.isnan(_adv).any().item())
+                            metrics["adv/has_inf"] = int(torch.isinf(_adv).any().item())
+                            metrics["adv/abs_max"] = float(_adv.abs().max().item())
 
                         if self.config.rllm.stepwise_advantage.enable and self.config.rllm.stepwise_advantage.mode == "broadcast":
                             # Merging the separated out steps using the advantage from last steps
@@ -691,6 +795,12 @@ class AgentSdkTrainer(RayPPOTrainer):
                 metrics["batch/solve_none"] = solve_none / num_tasks
                 metrics["batch/solve_all"] = solve_all / num_tasks
                 metrics["batch/solve_partial"] = solve_partial / num_tasks
+                # stage2 audit F3: emit count of batches skipped since last
+                # successful step. Steady-state should be ~0; sustained > 0
+                # signals real-reward is producing too few is_correct=True
+                # episodes (or transform_results_for_verl returning all-zero
+                # repeat_counts) — either way training is starving.
+                metrics["batch/skipped_all_drop"] = skipped_all_drop
 
                 for key, value in workflow_metrics.items():
                     metrics[f"batch/{key}"] = np.mean(value)
@@ -710,6 +820,7 @@ class AgentSdkTrainer(RayPPOTrainer):
                 solve_all = 0
                 solve_partial = 0
                 num_tasks = 0
+                skipped_all_drop = 0
                 termination_counts = Counter()
                 workflow_metrics = defaultdict(list)
                 metrics = {}

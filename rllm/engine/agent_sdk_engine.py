@@ -491,6 +491,13 @@ class AgentSdkEngine:
         traj_mask = []
         termination_reasons = []
         metrics = []
+        # stage2 D observability: collect raw prompt lengths (before the
+        # max_prompt_length filter at line ~563) so the trainer can emit
+        # `prompt_length/raw_p50/p95/max` + `prompt_length/filtered_rate`.
+        # Lets us see what OpenHands actually produces vs what we keep,
+        # without grepping the per-step warning logs.
+        all_prompt_lengths_raw: list[int] = []
+        prompt_filtered_count = 0
 
         for i, episode in enumerate(episodes):
             total_steps = 0
@@ -558,9 +565,14 @@ class AgentSdkEngine:
                     if isinstance(step.model_output, ModelOutput):
                         prompt_ids = torch.tensor(step.model_output.prompt_ids, dtype=torch.long)
 
+                        # stage2 D: record raw length before the filter for
+                        # observability (both kept and dropped steps counted).
+                        all_prompt_lengths_raw.append(int(len(prompt_ids)))
+
                         # Skip steps with overlong prompts to avoid OOD (train/inference mismatch)
                         # During rollout, model saw full prompt; truncating would create OOD data
                         if len(prompt_ids) > max_prompt_length:
+                            prompt_filtered_count += 1
                             logger.warning(f"Skipping step {step_idx} of trajectory {trajectory_id}: prompt length {len(prompt_ids)} > max_prompt_length {max_prompt_length}")
                             continue
                         else:
@@ -617,15 +629,14 @@ class AgentSdkEngine:
             padding_value=self.rollout_engine.tokenizer.pad_token_id,
         ).flip(dims=[1])
 
-        print("[DEBUG format] 1 padded prompt lengths:", [len(p) for p in prompts_batch])
-
+        # stage2 audit P0-3 (was W2.23 follow-up): use config value directly.
+        # Previously this line was followed by `max_prompt_length = 16384`
+        # which silently truncated training to 16k even when config set 32k
+        # (e.g. W2.23 bumped to 32768 so step filtering passed, but training
+        # still only saw 16k → 14k tokens silently discarded). Removed in stage2.
         max_prompt_length = self.config.data.max_prompt_length
-        print("[DEBUG format] max prompt length:", max_prompt_length)
-        max_prompt_length = 16384
         prompts_batch = pad_sequence_to_length(prompts_batch, max_prompt_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=True)
         prompts_batch = prompts_batch[:, -max_prompt_length:]  # truncate if necessary
-        
-        print("[DEBUG format] 2 padded prompt lengths:", [len(p) for p in prompts_batch])
 
         response_batch = torch.nn.utils.rnn.pad_sequence(
             responses,
@@ -633,14 +644,9 @@ class AgentSdkEngine:
             padding_value=self.rollout_engine.tokenizer.pad_token_id,
         )
 
-        print("[DEBUG format] 1 padded response lengths:", [len(r) for r in response_batch])
-
         max_response_length = self.config.data.max_response_length
         response_batch = pad_sequence_to_length(response_batch, max_response_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=False)
         response_batch = response_batch[:, :max_response_length]  # truncate if necessary
-        
-        print("[DEBUG format] 2 padded response lengths:", [len(r) for r in response_batch])
-        print("[DEBUG format] max response length:", max_response_length)
 
         input_ids = torch.concat([prompts_batch, response_batch], dim=1)
 
@@ -659,17 +665,41 @@ class AgentSdkEngine:
         traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
         traj_mask = traj_mask[:, :max_response_length]  # truncate if necessary
 
-        # Pad rollout_logprobs to match response_batch shape
+        # Pad rollout_logprobs to match response_batch shape.
+        # stage2 audit F5: track fill-rate explicitly instead of silently
+        # dropping the whole field on any mismatch. Downstream (fit_agent) emits
+        # `rollout/log_probs_fill_rate` so a regression in vllm-ascend logprob
+        # alignment is visible instead of silently disabling rollout_correction
+        # / calculate_debug_metrics_compat.
         rollout_logprobs_batch = None
-        if rollout_logprobs and all(len(logprobs) == len(response) for logprobs, response in zip(rollout_logprobs, responses, strict=False)):
-            rollout_logprobs_batch = torch.nn.utils.rnn.pad_sequence(
-                rollout_logprobs,
-                batch_first=True,
-                padding_value=-100.0,
+        rollout_logprobs_total = len(responses)
+        rollout_logprobs_mismatched = 0
+        if rollout_logprobs:
+            rollout_logprobs_mismatched = sum(
+                1 for lp, r in zip(rollout_logprobs, responses, strict=False) if len(lp) != len(r)
             )
-            rollout_logprobs_batch = pad_sequence_to_length(rollout_logprobs_batch, max_response_length, -100.0, left_pad=False)
-            rollout_logprobs_batch = rollout_logprobs_batch[:, :max_response_length]  # truncate if necessary
-            rollout_logprobs_batch = rollout_logprobs_batch.to(torch.float32)
+            if rollout_logprobs_mismatched == 0:
+                rollout_logprobs_batch = torch.nn.utils.rnn.pad_sequence(
+                    rollout_logprobs,
+                    batch_first=True,
+                    padding_value=-100.0,
+                )
+                rollout_logprobs_batch = pad_sequence_to_length(rollout_logprobs_batch, max_response_length, -100.0, left_pad=False)
+                rollout_logprobs_batch = rollout_logprobs_batch[:, :max_response_length]  # truncate if necessary
+                rollout_logprobs_batch = rollout_logprobs_batch.to(torch.float32)
+            else:
+                logger.warning(
+                    "[transform_results_for_verl] rollout_log_probs shape mismatch: "
+                    "%d/%d steps; dropping rollout_log_probs for this batch "
+                    "(rollout_correction/debug_metrics will be skipped)",
+                    rollout_logprobs_mismatched, rollout_logprobs_total,
+                )
+        # fill_rate: 1.0 when no mismatch (or no logprobs at all → N/A treated as 1.0);
+        # 0.0 when every step mismatches. Used by fit_agent to emit metric.
+        rollout_logprobs_fill_rate = (
+            (rollout_logprobs_total - rollout_logprobs_mismatched) / rollout_logprobs_total
+            if rollout_logprobs_total > 0 else 1.0
+        )
 
         # Place all rewards to last response token of the last_step response
         traj_rewards_batch = torch.zeros_like(response_batch, dtype=torch.float32)
@@ -704,33 +734,6 @@ class AgentSdkEngine:
         if rollout_logprobs_batch is not None:
             tensors_dict["rollout_log_probs"] = rollout_logprobs_batch
 
-
-        from collections import Counter
-
-        print("=" * 80)
-        print("[DEBUG format] num episodes:", len(episodes))
-        print("[DEBUG format] len(prompts):", len(prompts))
-        print("[DEBUG format] prompt_lengths:", prompt_lengths)
-        print("[DEBUG format] max_prompt_length:", max_prompt_length)
-        print("[DEBUG format] len(responses):", len(responses))
-        print("[DEBUG format] response_lengths:", response_lengths)
-        print("[DEBUG format] max_response_length:", max_response_length)
-        print("[DEBUG format] len(episode_ids):", len(episode_ids))
-        print("[DEBUG format] len(trajectory_ids):", len(trajectory_ids))
-        print("[DEBUG format] len(step_ids):", len(step_ids))
-        print("[DEBUG format] repeat_counts:", repeat_counts)
-        print("[DEBUG format] sum repeat_counts:", sum(repeat_counts))
-
-        print("[DEBUG format] unique episode_ids:", len(set(episode_ids)))
-        print("[DEBUG format] unique trajectory_ids:", len(set(trajectory_ids)))
-        print("[DEBUG format] step_nums hist:", Counter(step_nums))
-        print("[DEBUG format] termination_reasons:", Counter([x.value for x in termination_reasons]))
-        print("[DEBUG format] is_valid:", Counter(is_valid))
-
-        print("[DEBUG format] first trajectory_ids:", trajectory_ids[:20])
-        print("[DEBUG format] first step_ids:", step_ids[:20])
-        print("=" * 80)
-
         return DataProto.from_dict(
             tensors=tensors_dict,
             non_tensors={
@@ -753,6 +756,16 @@ class AgentSdkEngine:
             },
             meta_info={
                 "repeat_counts": repeat_counts,
+                # stage2 audit F5: surface rollout_log_probs alignment health
+                # so fit_agent can emit it as a training metric.
+                "rollout_log_probs_fill_rate": rollout_logprobs_fill_rate,
+                "rollout_log_probs_mismatched": rollout_logprobs_mismatched,
+                "rollout_log_probs_total": rollout_logprobs_total,
+                # stage2 D: raw prompt length distribution (pre-filter) +
+                # filter rate. Trainer emits these as
+                # `prompt_length/raw_p{50,95}/max` + `prompt_length/filtered_rate`.
+                "prompt_lengths_raw": all_prompt_lengths_raw,
+                "prompt_filtered_count": prompt_filtered_count,
             },
         )
 
