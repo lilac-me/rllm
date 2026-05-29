@@ -394,22 +394,17 @@ class KernelGymEnv(MultiTurnEnvironment):
         num_total_kernels = 0
         custom_kernel_cuda_time_in_profiling_us = 0
         total_kernel_run_time_in_profiling_us = 0
-        # if self.reward_config.coverage_reward.enable and correctness:
         final_reward = reward
-        if correctness:
+        # Only compute coverage when actually used — avoids noisy "fields missing" warnings
+        # and unnecessary work when coverage_reward.enable=False (e.g. data collection).
+        if correctness and self.config.coverage_reward.enable:
             coverage_dict = self.compute_coverage_reward(result)
             coverage = coverage_dict["coverage"]
             num_custom_kernel = coverage_dict["num_custom_kernel"]
             num_total_kernels = coverage_dict["num_total_kernels"]
             custom_kernel_cuda_time_in_profiling_us = coverage_dict["custom_kernel_cuda_time_in_profiling_us"]
             total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
-            print(f"[DEBUG] coverage: {coverage}")
-            print(f"[DEBUG] num_custom_kernel: {num_custom_kernel}")
-            print(f"[DEBUG] num_total_kernels: {num_total_kernels}")
-            print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us: {custom_kernel_cuda_time_in_profiling_us}")
-            print(f"[DEBUG] total_kernel_run_time_in_profiling_us: {total_kernel_run_time_in_profiling_us}")
-            if self.config.coverage_reward.enable:
-                final_reward += self.config.coverage_reward.weight * coverage
+            final_reward += self.config.coverage_reward.weight * coverage
 
         return {
             "reward": final_reward,
@@ -493,24 +488,17 @@ class KernelGymEnv(MultiTurnEnvironment):
         custom_kernel_cuda_time_in_profiling_us = 0
         total_kernel_run_time_in_profiling_us = 0
 
-        # if self.reward_config.coverage_reward.enable and correctness:
         final_reward = reward
-        if correctness:
+        # Only compute coverage when actually used — avoids noisy "fields missing" warnings
+        # and unnecessary work when coverage_reward.enable=False (e.g. data collection).
+        if correctness and self.config.coverage_reward.enable:
             coverage_dict = self.compute_coverage_reward(result)
             coverage = coverage_dict["coverage"]
             num_custom_kernel = coverage_dict["num_custom_kernel"]
             num_total_kernels = coverage_dict["num_total_kernels"]
             custom_kernel_cuda_time_in_profiling_us = coverage_dict["custom_kernel_cuda_time_in_profiling_us"]
             total_kernel_run_time_in_profiling_us = coverage_dict["total_kernel_run_time_in_profiling_us"]
-
-            print(f"[DEBUG] coverage: {coverage}")
-            print(f"[DEBUG] num_custom_kernel: {num_custom_kernel}")
-            print(f"[DEBUG] num_total_kernels: {num_total_kernels}")
-            print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us: {custom_kernel_cuda_time_in_profiling_us}")
-            print(f"[DEBUG] total_kernel_run_time_in_profiling_us: {total_kernel_run_time_in_profiling_us}")
-
-            if self.config.coverage_reward.enable:
-                final_reward += self.config.coverage_reward.weight * coverage
+            final_reward += self.config.coverage_reward.weight * coverage
 
         return {
             "reward": final_reward,

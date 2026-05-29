@@ -134,6 +134,33 @@ class AgentPPOTrainer(RayPPOTrainer):
         torch.save(payload, dump_path)
         print(f"[debug_rollout] Saved rollout dump to {dump_path}")
 
+    @staticmethod
+    def _make_json_serializable(obj):
+        """Recursively convert tensors and numpy arrays to JSON-compatible types."""
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().tolist()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: AgentPPOTrainer._make_json_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [AgentPPOTrainer._make_json_serializable(v) for v in obj]
+        return obj
+
+    def _save_individual_sample(self, sample: dict, global_steps: int):
+        """Save a single rollout sample immediately after it completes.
+
+        Stored as {debug_rollout_dir}/{step}/{step}_{sample_id}.json
+        """
+        debug_dir = self._get_debug_rollout_dir()
+        step_dir = debug_dir / str(global_steps)
+        step_dir.mkdir(parents=True, exist_ok=True)
+        sample_id = sample["idx"]
+        filepath = step_dir / f"{global_steps}_{sample_id}.json"
+        serialized = self._make_json_serializable(sample)
+        with open(filepath, "w") as f:
+            json.dump(serialized, f)
+
     def _load_debug_rollout_dump(self, global_steps: int, mode: str):
         load_path = self._get_debug_rollout_config().get("load_path")
         if not load_path:
@@ -666,6 +693,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                 gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Token", global_steps=global_steps)
                 for _, trajectory in enumerate(gen_seq_generator):
                     trajectories.append(trajectory)
+                    self._save_individual_sample(trajectory, global_steps)
             else:
                 raise ValueError("Only async rollout mode is supported")
         # Sort trajectories by their idx, to ensure they are in order.
@@ -698,6 +726,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Step")
             for _, trajectory in enumerate(gen_seq_generator):
                 steps.append(trajectory)
+                self._save_individual_sample(trajectory, self.global_steps)
         # Sort trajectories by their idx, to ensure they are in order.
         steps.sort(key=lambda x: x["idx"])
 
