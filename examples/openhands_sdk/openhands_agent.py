@@ -23,6 +23,15 @@ Environment Variables:
                                   Default: openai/openhands-model
     OPENHANDS_MAX_ITERATIONS    : Max agent iterations, default 30
     OPENHANDS_CONTAINER_TIMEOUT : Seconds to wait for container, default 600
+    KEEP_OPENHANDS_CONTAINER    : "1" to keep the docker container after each
+                                  rollout (debug). Default "0" → docker rm -f
+                                  after logs are archived. Set to "1" only on
+                                  interactive debug sessions; long runs will
+                                  exhaust docker storage otherwise.
+    KEEP_OPENHANDS_WORKSPACE    : "1" to keep the per-rollout workspace dir
+                                  after archive (debug). Default "0" → rmtree
+                                  after archive. Same caveat as above —
+                                  long runs exhaust host filesystem.
 """
 
 from __future__ import annotations
@@ -83,6 +92,11 @@ _MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
 _CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
 _ARTIFACT_DIR = os.environ.get("OPENHANDS_ARTIFACT_DIR", "")
 _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
+# stage2 B: debug knobs. Default off → runtime cleans up containers/workspaces
+# after each rollout so multi-step training doesn't exhaust docker storage or
+# the host filesystem. Set to "1" only for interactive inspection.
+_KEEP_CONTAINER = os.environ.get("KEEP_OPENHANDS_CONTAINER", "0") == "1"
+_KEEP_WORKSPACE = os.environ.get("KEEP_OPENHANDS_WORKSPACE", "0") == "1"
 # _OPENHANDS_ASCEND_VISIBLE_DEVICES = os.environ.get("OPENHANDS_ASCEND_VISIBLE_DEVICES", "").strip()
 
 # ---------------------------------------------------------------------------
@@ -562,10 +576,11 @@ def _run_openhands_container(
     print("DEBUG CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
     dbg(" ".join(shlex.quote(c) for c in cmd))
     try:
+        # docker run -d returns immediately with the container ID, so no
+        # timeout needed here. The long wait happens at `docker wait` below.
         result = subprocess.run(
             cmd,
             capture_output=True,
-            #timeout=_CONTAINER_TIMEOUT, # TODO
         )
         output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
         if result.returncode != 0:
@@ -574,19 +589,25 @@ def _run_openhands_container(
                 container_name, result.returncode,
             )
             return output
-    
+
+        # stage2 B: enable _CONTAINER_TIMEOUT on docker wait so a hung
+        # container can't block the whole training step indefinitely.
+        # Default 600s (env OPENHANDS_CONTAINER_TIMEOUT). On timeout we
+        # docker-kill, archive whatever logs the container produced, and
+        # return -1 so the upstream rollout treats it as a failed episode.
         wait_result = subprocess.run(
             ["docker", "wait", container_name],
             capture_output=True,
-            #timeout=_CONTAINER_TIMEOUT, # TODO
+            timeout=_CONTAINER_TIMEOUT,
         )
-        
+
         dbg(f"wait_result={wait_result}, {wait_result.stdout.decode().strip()}")
         try:
             exit_code = int(wait_result.stdout.decode().strip())
         except Exception as e: # TODO
             logger.error(f"exit_code error, {e}")
-        
+            exit_code = -1
+
         # 获取并保存日志
         logs_result = subprocess.run(
             ["docker", "logs", container_name],
@@ -605,18 +626,50 @@ def _run_openhands_container(
             }, f, indent=2)
 
         return exit_code
-    
+
     except subprocess.TimeoutExpired:
-        logger.error("[openhands] Container %s timed out", container_name)
-        subprocess.run(["docker", "kill", container_name])
+        # stage2 B: archive partial logs before killing so a hung container
+        # still produces inspectable artifacts. Best-effort — if any of these
+        # fail we still want the kill to happen.
+        logger.error(
+            "[openhands] Container %s exceeded %ds wait timeout; killing and archiving partial logs",
+            container_name, _CONTAINER_TIMEOUT,
+        )
+        try:
+            logs_result = subprocess.run(
+                ["docker", "logs", container_name],
+                capture_output=True,
+                timeout=30,
+            )
+            logs = logs_result.stdout + logs_result.stderr
+            with open(workspace+"/agent_workdir/conversation.log", "wb") as f:
+                f.write(logs)
+            with open(workspace+"/agent_workdir/conversation_result.json", "w") as f:
+                json.dump({
+                    "container": container_name,
+                    "exit_code": -1,
+                    "timeout": True,
+                    "timeout_seconds": _CONTAINER_TIMEOUT,
+                    "timestamp": time.time(),
+                }, f, indent=2)
+        except Exception:
+            logger.exception("[openhands] Failed to archive logs for timed-out container %s", container_name)
+        subprocess.run(["docker", "kill", container_name], capture_output=True)
         return -1
     except Exception:
         logger.exception("[openhands] Failed to run container %s", container_name)
         return -1
     finally:
-        # DEBUG: keep container for inspection
-        # subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL)
-        print(f"[DEBUG] kept container {container_name} for inspection")
+        # stage2 B: default cleanup with a debug escape hatch. Long runs
+        # accumulate ~N_steps * rollout_n containers without this; even short
+        # 10-step sanity runs leave 40+ stopped containers behind.
+        if _KEEP_CONTAINER:
+            print(f"[openhands] KEEP_OPENHANDS_CONTAINER=1; kept container {container_name}")
+        else:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
 # ---------------------------------------------------------------------------
 # Rollout entry point
@@ -745,6 +798,14 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         )
     finally:
         _archive_npu_artifacts(workspace, task, trace_label, reward)
-        # shutil.rmtree(workspace, ignore_errors=True) # TODO
+        # stage2 B: default cleanup with debug escape hatch. _archive_npu_artifacts
+        # above already copied everything important to OPENHANDS_ARTIFACT_DIR;
+        # the workspace itself is per-rollout scratch (DooD host-visible bind
+        # mount path). Without rmtree, each rollout leaves ~10s-100s of MB
+        # behind under /home/docker/openhands_workspace.
+        if _KEEP_WORKSPACE:
+            logger.info("[openhands] KEEP_OPENHANDS_WORKSPACE=1; kept %s", workspace)
+        else:
+            shutil.rmtree(workspace, ignore_errors=True)
     return reward
 
