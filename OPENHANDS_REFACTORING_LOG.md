@@ -14,7 +14,9 @@ Branch base: `5daa24c0` (offload buffer, last common ancestor with stage1).
 | 2 | `eeb5ccbb` | Port `rllm/engine/agent_sdk_engine.py` changes (trajectory_id naming + debug instrumentation, latter gated in #3) |
 | 3 | `93898fa5` | Env-driven config layer: `examples/openhands_sdk/config/{.env.example,qwen30b.env}`, `RLLM_LOG_DIR` / `OPENHANDS_KERNELBENCH_DATASET` for hardcoded paths, `RLLM_ENGINE_DEBUG` env gate for `agent_sdk_engine.py` prints |
 | 4 | `d4ed3328` | Single-host (16-NPU) config + orphan-container sweep at sh launch |
-| 5 | TBD | HTTP-only routing (delete same-machine docker-run path) + worker-side GC + worker health check in sh + single/multi unification |
+| 5 | `f6d3db64` | HTTP-only routing + worker-side GC + worker health check in sh |
+| 6 | `40a48c2e` | Unconditional NPU lock clear (worker startup + `/admin/reset-locks` from trainer) |
+| 7 | TBD | Collapse `qwen30b-singlehost.env` into `qwen30b.env` via `RLLM_TOPOLOGY` switch |
 
 ## Active design decisions
 
@@ -57,6 +59,26 @@ The worker launch itself is **manual** (`python3 remote_eval_worker.py ...` on t
   - Multi-host can't auto-spawn from trainer sh (it's on a different machine)
   - Single = multi consistency: same operator workflow regardless of topology
   - User has full control over worker logs / restart policy
+
+### D4b. One config file, topology via env switch
+
+`config/qwen30b.env` is the single config; `RLLM_TOPOLOGY` env decides
+single-host vs multi-host. Default is `multi` (preserves prior behavior).
+
+```
+RLLM_TOPOLOGY=multi  bash debug_oom.sh   # trainer 65, eval worker 51
+RLLM_TOPOLOGY=single bash debug_oom.sh   # both on this host
+```
+
+The differences between modes are only 4 variables:
+  - `TRAIN_HOST_IP` / `EVAL_WORKER_IP` (which IP)
+  - `OPENHANDS_CONTAINER_HOST_ALIAS` (TRAIN_HOST_IP in multi, host.docker.internal in single)
+  - `OPENHANDS_EVAL_DEVICE_IDS` (0-3 in multi for eval host, 8-15 in single to stay disjoint from trainer)
+
+Bogus `RLLM_TOPOLOGY` value fails fast with a clear error.
+
+`qwen30b-singlehost.env` is **deleted**. Don't recreate it; add another
+branch to the `if` if a new topology comes up.
 
 ### D4. HTTP timeout chain
 
