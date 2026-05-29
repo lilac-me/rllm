@@ -30,3 +30,5 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
 export HYDRA_FULL_ERROR=1
+
+export LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
