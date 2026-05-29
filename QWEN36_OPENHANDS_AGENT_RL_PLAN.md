@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.2 — 基线切到 `openhands_ascend`；软化 GDN 约束；高风险 cherry-pick 标注；明确算子 reward / 编译工具链不在本 plan 范围)
+> 修订时间：2026-05-25 (v2.16 — 删 obs 历史 vllm engine_kwargs，vllm-ascend 不识别 --swap-space 等；新增 §13.20)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -71,9 +71,21 @@ actor_rollout_ref.actor.kl_loss_coef=0.01
 actor_rollout_ref.actor.kl_loss_type=low_var_kl
 actor_rollout_ref.actor.entropy_coeff=0
 
-# Megatron-Bridge 集成（核心：use_mbridge=True + vanilla_mbridge=True）
+# Bridge 集成
+#
+# verl 提供两条 bridge 路径（verl/workers/engine/megatron/transformer_impl.py:173+）：
+#   vanilla_mbridge=True  → pypi `mbridge` 库 (`from mbridge import AutoBridge`)
+#   vanilla_mbridge=False → NVIDIA Megatron-Bridge (`from megatron.bridge import AutoBridge`)
+#
+# **NPU 必须 vanilla_mbridge=False**（与 verl 脚本 NPU case override 一致）。
+# 原因：pypi mbridge 0.15.1 不注册 qwen3_5_moe model_type，会 raise
+#       "Unregistered model type: qwen3_5_moe"；NVIDIA Megatron-Bridge 已有 PR #2654
+#       Qwen3.5 recipe。
+#
+# 注意：plan v2.4 以前的版本（本节早期）错抄了 verl 脚本"主行"的 True，遗漏 NPU
+#       case override。W2.9 (v2.8) 修正。
 actor_rollout_ref.actor.megatron.use_mbridge=True
-actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+actor_rollout_ref.actor.megatron.vanilla_mbridge=False    # NPU 必须 False
 actor_rollout_ref.actor.megatron.use_remove_padding=False  # GDN 默认值（W2 可调）
 actor_rollout_ref.actor.megatron.dtype=bfloat16
 actor_rollout_ref.actor.megatron.param_offload=True
@@ -861,3 +873,1066 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-23 | v2.0 | **重大修订**：基于生产环境实证（Ascend NPU + verl BryanChen408 fork + Megatron-Bridge + vllm-ascend 已就位且 Qwen3.6 已验证）重写。删除栈对齐、Megatron 转换验证等已完成项；W1 从 5–7 天压缩到 2–3 天；P0 交付从 3 周压缩到 ~2.5 周；明确 swe 配方仅作参考、不照搬；增加 Ascend 特定适配章节 §3.7。 |
 | 2026-05-23 | v2.1 | 把 `verl/examples/grpo_trainer/run_qwen3_5_35b_megatron.sh` 提升为**训练参数权威**。新增 §0.1 关键架构约束（GDN 不支持 THD、`use_remove_padding=False`、CUDA_DEVICE_MAX_CONNECTIONS=1 等）+ §0.2 verl 脚本固化参数清单。§3.2 重写权威顺序（verl 脚本 > obs NPU 脚本 > swe）。§3.4 标注训练参数已固化。§6 风险加 GDN/THD 与显存交互、ray runtime env 环境变量传播。§11.3 加 verl 脚本对齐的 env，§11.4 加参数提取命令。明确"rllm 顶端 agent 适配"是真正的工作量，verl 后端已稳定。 |
 | 2026-05-25 | v2.2 | **基线切到 `origin/openhands_ascend`**（已带 ascendc 数据准备 + SDK runner 更新），新分支名 `qwen36-openhands-stage1`；§2.1 补 obs 4 个独有 commit 的 cherry-pick 评估表，`c6e36b0a` 强烈建议拿。新增**范围声明**：算子 reward / 评测协议、ascendC 工具链、数据集来源、依赖版本管理均**不在本 plan 范围**（reward 在 OpenHands 容器内自洽，rllm 只拿标量；依赖以"当前 commit 即锁定版本"为准）。§0.1 把 GDN/`use_remove_padding=False` 从硬约束**软化为可调**，W2 实测决定。§3.1 把 `19983fe4`（router replay，新增 `rllm/algorithm` 子系统）与 `e66fc2e4`（lr_schedule，依赖前者）标 **P0★ 高风险 cherry-pick**，明确顺序约束。§4.2 W1 任务相应重排。§11.1 cherry-pick 脚本拆分 SAFE / HIGH_RISK 两段。§9 新增"下一阶段 TODO"清单，把 P1/P2 候选项（真实数据集、reasoning schema、checkpoint 后端、dashboard、端口预算、bypass rollout 归位、legacy example deprecate、GDN bshd 可视化）统一下放。|
+| 2026-05-25 | v2.3 | **W1 cherry-pick 全部落地** (12 commits, 见 §13.1)；本地全仓 syntax 通过；NPU 真实 import + vllm-ascend smoke 移交。**修正 R2/R3 在 stage1 路径上的真实生效情况**（§13.3）：stage1 走 `AgentPPOTrainer`（不是 `VerlBackend`），而 `19983fe4` 改动文件清单**完全不含** `rllm/trainer/verl/agent_ppo_trainer.py`——意味着 stage1 路径上 R2/R3 入口都不生效，无论是走 rllm 入口还是 verl native CLI（rllm 的 batch 组装路径绕开了 verl 原生 dataloader，rollout 端 routing 数据没法流到训练端）。stage1 建议**关 router_replay**，靠 KL coef / PPO clip 控制 off-policy；W2/W3 reward 不稳时按需 backport。§3.1 P0★ 表加"实施后注释"列。§3.3 swe 4 个 rllm 层 patch 全部 stage1 跳过（§13.2）。|
+| 2026-05-25 | v2.4 | **NPU smoke 第一轮跑出两类失败：(A) verl-BryanChen408 fork 已把 rollout 抽象重写**（`AsyncLLMServerManager` 重命名为 `LLMServerClient` 搬到 `verl/workers/rollout/llm_server.py`；`AgentLoopManager.{server_addresses,server_handles,global_load_balancer}` 三属性搬到 `LLMServerManager`；构造签名都变了）—— **不是我们 cherry-pick 引入的，upstream/main 也 broken，只是 W1 NPU smoke 第一次实际验证暴露**。**决策**：在 verl-BryanChen408 fork 加薄兼容层（路线 B），rllm 一行不改。**(B) 19983fe4 合并漏带 `RolloutCorrectionConfig` 类定义**，已从 upstream/main 补回（commit `c1ff82e3`）。verl shim 实施：分支 `qwen36-rllm-compat`，commit `881a98d7`，2 文件 +89 行：(1) `agent_loop.py` 给 `AgentLoopManager` 加可选 `_server_manager` kwarg + 3 shim property + 末尾 `AsyncLLMServerManager(LLMServerClient)` 兼容类；(2) `ray_trainer.py:902` 把 `_server_manager=self.llm_server_manager` wire 进 `AgentLoopManager.create(...)`。新增 §13.6（verl shim）、§13.7（stage1 safe config: 关 router_replay + 关 KL loss + 监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）、§13.8（NPU smoke 第二轮重写）。|
+| 2026-05-25 | v2.5 | **W1 全部完成进入 W2**。NPU smoke 第二轮 20/20 import OK + vllm-ascend Qwen3.6 4 项推理 smoke 全过（含 qwen3_coder tool call 单轮/多轮、关 thinking、32k context）。**W2.2 stage1 训练脚本交付**：新增 `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}`（py 100 行/sh 290 行），融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置。Surgical changes vs `train_open_megatron.sh`：env 补 `CUDA_DEVICE_MAX_CONNECTIONS=1` / `VLLM_ALLREDUCE_USE_SYMM_MEM=0`；ARGS 补 §0.2 MoE 4 项 + `vanilla_mbridge=True`；改 `calculate_log_probs=True` / `kl_loss_coef=0.0`；新增 `+rllm.algorithm.router_replay=disabled`；并行改成单节点 TP=2 EP=4 ETP=1（用户决策）；`max_model_len` 改 32k；rollout TP=8。Legacy `train_open_megatron.{py,sh}` 保留作参考。新增 §13.9（脚本交付清单 + W2.3 起 NPU 验证入口）。|
+| 2026-05-25 | v2.6 | **W2.0 stage1 分段测试基础设施落地（B 档）**。设计 6 层逻辑模型 + L1..L4 fail-fast orchestrator，把端到端跑挂时的定位时间从小时级压到秒级。新文件：(1) `preflight_qwen36_npu.py` Layer 1 隔离（imports / dataset / rollout signature / hydra compose / AgentTrainer ctor 5 个子检查）；(2) `mock_rollout.py` Layer 4 drop-in 假 rollout（确定性 trajectory，无 docker/LLM）；(3) `mock_llm_server.py` Layer 2 FastAPI mock OpenAI-compatible server（已本地 curl 验通，schema 与真 vllm-ascend 一致）；(4) `stage1_test_layered.sh` orchestrator（L1/L2a/L2b/L3/L4 任选子集、bash 3.2 兼容、独立 log、summary 表）。train 脚本新增三个互相正交的 env hatch：`PREFLIGHT_ONLY=1` / `STAGE1_DRY_STEPS=N` / `STAGE1_MOCK_ROLLOUT=1`。新增 §13.10。|
+| 2026-05-25 | v2.7 | **L2b 跑挂暴露 verl fork 第二轮 API 漂移**：`verl/workers/megatron_workers.py` / `fsdp_workers.py` 已合并成 backend-agnostic `engine_workers.py`（只有 `ActorRolloutRefWorker` + `TrainingWorker`）。rllm 三处 import 仍是旧路径。verl-BryanChen408 分支 `qwen36-rllm-compat` commit `85159408` 加 2 个 shim 文件（+139 行）re-export `engine_workers`，并 alias `AsyncActorRolloutRefWorker=ActorRolloutRefWorker`（async 改 config 驱动）、`CriticWorker=TrainingWorker`（stage1 GRPO 不实例化 critic）。累计 verl fork compat 文件清单详见 §13.11。NPU 节点重 pull verl fork 后重跑 L2b。|
+| 2026-05-25 | v2.8 | **L2b 第二次重跑（带 W2.8 worker shim）走到 `engine.initialize()` 挂在 `mbridge.AutoBridge.from_config` "Unregistered model type: qwen3_5_moe"**。**根因 audit 错误**：plan §0.2 v2.1~v2.7 抄 verl 脚本 ACTOR 主行 `vanilla_mbridge=True`，**漏读 NPU case override 块**（verl 脚本 :196 明确 NPU 用 `vanilla_mbridge=False`）。两个独立 bridge 库澄清：`mbridge`（pypi 0.15.1，不支持 qwen3_5_moe）vs `Megatron-Bridge`（NVIDIA-NeMo，含 Qwen3.5 recipe，你环境已装）；`vanilla_mbridge` 是两者的开关，NPU 必须 False。修正：plan §0.2 + §13.9 改 False + 长注释解释；`train_openhands_qwen36_npu.sh` actor + ref 两处改 False + 详细注释；新增 §13.12 documenting 根因 + audit 教训（抄上游脚本要扫 case/if/elif override）。不需要升级 mbridge pypi 包。|
+| 2026-05-25 | v2.9 | **训练脚本完整校对（W2.10）**：W2.9 修 vanilla_mbridge 后做完整 verl NPU 分支 vs stage1 脚本 diff，发现 17 项遗漏 + 4 项 dynamic_bsz 耦合不一致。用户决策：use_dynamic_bsz 走 verl 套（False + micro_batch=1 + max_token cap）。补 18 项：`CPU_AFFINITY_CONF=1` / `trust_remote_code=True` / `algorithm.use_kl_in_reward=False` / `data.truncation='error'` / `data.filter_overlong_prompts=True` / `megatron.dtype=bfloat16` / `actor.megatron.use_remove_padding=True` / `actor.checkpoint.strict=False` / `attention_backend=auto` / `moe_token_dispatcher_type=alltoall` / `use_naive_l2norm=True` / `overlap_cpu_optimizer_d2h_h2d=True` / `rollout.dtype=bfloat16` + 4 项耦合切换（actor/ref/rollout 三处 `use_dynamic_bsz=False` 同步，`max_token=16384`——按数据规模等比放大 verl 4096，因 OpenHands prompt+response=12288）。不补 `model_engine=megatron`（hydra defaults 链已带入）。34 项 stage1 必需 key 全部就位。新增 §13.13 + audit 教训 4 条（case/if 扫描、耦合识别、cap 等比放大、hydra defaults 追到底）。|
+| 2026-05-25 | v2.10 | **batch sanity 联立约束（用户指出）**：`BATCH_SIZE=1` < `ppo_mini_batch_size=4` 违反 verl actor.py:224。深挖发现还有 DP 维度约束：`total_trajectories (BATCH×ROLLOUT) >= DP_size` 不然 DP rank 分不到 sample。stage1 默认改为 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`（耦合）；脚本顶部加 fail-fast sanity check（两个约束秒级 reject，不进 Ray）；plan §13.14 写联立约束矩阵 + W3 scaling 例子 + 为什么 ROLLOUT_N=4（GRPO group baseline + 覆盖 DP=4）。|
+| 2026-05-25 | v2.11 | **prepare 脚本加 `--source mock` 模式（W2.12）**：用户希望 32 条 mock 跑 layered smoke 不依赖外部数据。复用既有 4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm），轮转生成任意 N 条（默认 32），前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保 op_name 唯一。Mock 模式 yield rl_single_ops-style shape 走 `_row_to_record` 统一管线，与 real-data 同路径，reward_model 多 `{kind:'mock', template}` 标识便于调试时区分。本地验证 32 条全转 + split 模式 (val_frac=0.1 → train=29 val=3)。Plan §13.15 续写对比表（legacy `create_mock_npu_operator_data.py` 16 行固定 vs 新 mock 模式任意数量）。|
+| 2026-05-25 | v2.12 | **mock parquet 在 dataset filter 挂在 jinja `No user query found in messages`（W2.13）**。根因：3 个 prepare/mock 脚本（`prepare_npu_operator_data.py`、legacy `create_mock_npu_operator_data.py`、`create_mock_npu_ascend_operator_data.py`）都用 `json.dumps([{...}])` 存 prompt 字段，但 verl `_build_messages` 和 `doc2len` 都直接拿 `doc[prompt_key]` 当 list iterate，无 `json.loads`。字符串被按字符 iterate → 找不到 user message。修复：三处都改成直接 `list[dict]`（pyarrow 原生支持 list[struct]）。为什么之前 mock 跑过没挂：之前没开 `filter_overlong_prompts=True`（W2.10 新加），doc2len 路径不触发。W2.10 + W2.13 是一起的。Audit 教训第 5 条：肉眼读 parquet 看不出 string vs list 时要 `type()` 验证。|
+| 2026-05-25 | v2.13 | **W2.13 prompt 修复后 L2b 推进到 verl `_build_tf_config` 挂在 `ModuleNotFoundError: No module named 'megatron.bridge'`**（W2.14）。根因：NPU 环境的 NVIDIA Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`）未 pip install，`from megatron.bridge import AutoBridge` 找不到。修：训练脚本顶部加三路 dispatch（源码路径 → PYTHONPATH；pip 装了 → 不动；都没 → WARN）。可用 `MEGATRON_BRIDGE_DIR` env 覆盖默认路径。Audit 教训第 6 条：依赖装载方式（pip / 源码 clone / 系统包）跨环境不一致，启动脚本应该把源码路径作为可配置 env + 路径不存在显式 WARN。|
+| 2026-05-25 | v2.14 | **L2b 在 Megatron-Bridge load_weights_hf_to_megatron → torch.distributed.broadcast 挂 HCCL error code 6（W2.15）**。**用户关键提示**：verl 自己跑 Qwen3.6 OK，rllm 基于 verl，所以问题在 rllm 这层引入。根因：obs 历史脚本硬编码 `HCCL_IF_IP=80.48.5.88` + `nic_name=ens1f3`，当前 NPU 节点 IP 是 80.48.5.65，HCCL_IF_IP 不存在 → HcclGetRootInfo 挂。verl 自己脚本 env 段只有 3 行（`CUDA_DEVICE_MAX_CONNECTIONS` / `VLLM_USE_V1` / `VLLM_ALLREDUCE_USE_SYMM_MEM`），没设这些 HCCL/socket env，靠容器默认。修：改成 opt-in 模式，`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE` env 才生效。Audit 教训第 7 条：硬编码 IP/MAC/NIC 跨机必爆，machine-specific identifier 不允许进库代码。**Audit 策略调整**：W2.10 只对齐了 ARGS 段，env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，全是潜在地雷；W2.15 先解决最毒的 HCCL_IF_IP，其他等 L2b 跑过再清理。|
+| 2026-05-25 | v2.15 | **W2.15 修 HCCL 后 vllm worker 启动 exit 2（W2.16）**。继续应用 verl-self-OK 诊断原则：审 verl vllm_async_server.py:237 写死 compilation_config.setdefault cudagraph_mode=FULL_AND_PIECEWISE，无论 user 怎么配 cudagraph 默认开。verl 自己脚本不设 enforce_eager（yaml 默认 false），cudagraph 真生效跑通。我们 obs 历史脚本 enforce_eager=True # TODO 与 cudagraph 矛盾，vllm-ascend worker init 时挂。改成 env 可控默认 False，ROLLOUT_ENFORCE_EAGER=True 可 opt-out。Audit 教训第 8 条：下游覆盖上游默认时要看上游 setdefault 隐式 fill。同时让用户去 /tmp/ray/session_latest/logs/worker-*.err 拿 vllm 真 stderr 验证。|
+| 2026-05-25 | v2.16 | **W2.16 改 enforce_eager 后 vllm worker 仍 exit 2（W2.17）**。拿 ray log 看到真实 vllm error: `unrecognized arguments: --swap-space 0`。obs 历史脚本通过 `engine_kwargs.vllm.<key>=...` 给 vllm CLI 加了 3 个参数（swap_space / cpu_offload_gb / enable_prefix_caching），vllm-ascend 不识别（vllm fork lag）。verl 自己脚本不设这三个，靠 vllm 默认。注释 3 行，保留 tool_call 必需的 2 行。Audit 教训第 9 条：vllm-ascend 是 vllm fork，CLI 参数有 lag；删到只剩业务必需的。**连续 W2.15/W2.16/W2.17 都是同模式**：obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过；剩余可疑 obs env/config 暂不动，待 L2b 跑过再清理。|
+
+---
+
+## 13. W1 实施记录（2026-05-25）
+
+### 13.1 cherry-pick 实际清单（12 commits）
+
+执行顺序与 §4.2 / §11.1 一致。所有 commit 都在 `qwen36-openhands-stage1` 分支上，全部 `python -c "import rllm"` OK，全仓 `py_compile` 通过（rllm/ 308 文件 + rllm-model-gateway/ 33 文件 = 0 错误）。
+
+**obs 独有（2 / 4 拿）：**
+
+| Commit | 决策 | 实际冲突 |
+|---|---|---|
+| `c6e36b0a` 修复stepwise下打印不全 + completionids 长度 | ✅ 拿 | 1 处冲突，与 HEAD `90a150fc add response length debug` 并列保留 |
+| `17430f3a` fix time (eval_pass_at_k.py) | ✅ 拿 | 无 |
+| `4268ffdd` "tmd" (KernelGym 脚本重命名 + memory_compact.txt) | ❌ 跳 | 重命名易破坏下游 + commit message 含糊 + KernelGym stage1 不重点 |
+| `095dd639` add gitignore | ❌ 跳 | 仅 +3 行 gitignore，意义不大 |
+
+**upstream SAFE 批次（7 / 7 拿）：**
+
+| Commit | 冲突情况 |
+|---|---|
+| `68e9107e` pad multi-turn batch to lcm(dp_size, ppo mini-batch) | DU agentcore_math/train_verl.sh (git rm，legacy)；verl_backend.py 2 段冲突手术合并（取 upstream 重构 `_get_dp_size`/`_get_aggregate_dp_size`） |
+| `45c99f1c` zero response_mask on padded rows | auto-merge |
+| `d09f6155` rollout_probs_diff masking respect response_mask | verl_backend.py + agent_sdk_trainer.py 2 段冲突，全取 upstream `calculate_debug_metrics_compat` |
+| `326445bd` Collapse multi-turn steps + unified merge metrics | DU 2 个 legacy 文件 (git rm)；transform.py 4 段 + tinker/transform.py 2 段全取 upstream（`--theirs`）；pyproject.toml 加 harbor extras + tool.uv.sources rllm-model-gateway editable |
+| `44fb9a3c` raise on aborted rollouts + normalize stop_reason | auto-merge |
+| `e8539db5` don't truncate merged multi-turn responses | auto-merge |
+| `e5ba77ea` Qwen3.5 chat template support + simple_math example | 新增 example 文件，无冲突 |
+
+**upstream HIGH_RISK 批次（3 / 3 拿，但 19983fe4 部分跳过）：**
+
+| Commit | 冲突情况 |
+|---|---|
+| `19983fe4` R2/R3 router replay | **6 个文件冲突**（modify/delete utils.py + verl_backend.py + verl_launcher.py + common/config.py + base.yaml + rollout/verl_engine.py + dataclass.py）。决策：sync_config 框架完整保留；R3 入口完整保留（verl_engine.py + transform.py + dataclass.py）；**R2 actor 端 50 行跳过**——upstream 那段引用 `tu`/`batch_td`/`no_padding_2_padding`/`bypass_mode`/`rc`，是上游另一波重构（未在 cherry-pick 范围内）引入的符号，硬合会让 import 直接挂；common/config.py from_config 保留 HEAD 调用约定 + 补 router_replay 新字段；base.yaml 取 upstream 并集但 use_rllm 保留 HEAD `false`；verl_launcher.py 自动补 `hydra_overrides = kwargs.get(...)` 和 `logger = logging.getLogger(...)` |
+| `d314745e` release GPU memory on Verl backend interrupts | verl_launcher.py 1 段冲突，HEAD 旧 `WorkflowTaskRunner.remote()` 直调 vs upstream 加 HydraConfig 捕获 + try/finally + Ray actor 重命名。手动合并：保留 HEAD class 名 `WorkflowTaskRunner`，吸收 upstream 的 try/finally + hydra_overrides 转发 |
+| `e66fc2e4` route lr_schedule to active backend's optim key | 1 段小冲突，接受 upstream（`_SHARED_KEYS` 表加 2 行 lr_warmup_steps 映射）；实际改动比 plan §3.1 预想小很多 |
+
+### 13.2 swe 的 4 个 rllm 层 patch — 全部 stage1 跳过
+
+| Patch | swe vs main 规模 | stage1 跳过原因 |
+|---|---|---|
+| `rllm/experimental/verl/patch.py` | +156 / -0 | 主要是 `RLLM_VLLM_PORT_BASE` 多节点端口分配；plan §9 "节点端口预算总表"已下放；HEAD 上 patch.py 已被 19983fe4 大改 (HEAD vs swe = +449/-59)，盲合风险高 |
+| `rllm/experimental/verl/utils.py` | +162 / -4 | 主要是 HDFS checkpoint 逻辑；plan §5.4 "checkpoint 后端拍板"已下放 |
+| `rllm/trainer/verl/ray_runtime_env.py` | +37 / -1 | HEAD 已有 +82 行 NPU env 透传（obs 自加），swe 37 行重合度高，W2 实测前不动 |
+| `rllm-model-gateway/*` | +102 / -29 | 主要是 token 透出；stage1 第一版用 vllm-ascend 原生 OpenAI API 不强依赖；plan §9 "reasoning schema" 已下放 |
+
+verl-BryanChen408 fork 已有完整 NPU 端口/HCCL 处理（`HCCL_HOST_SOCKET_PORT_RANGE` 等），与 rllm 层 swe patch 不重叠也不冲突。
+
+### 13.3 R2 / R3 在 stage1 路径上的真实生效情况（v2.3 修正）
+
+**stage1 训练入口实际调用链：**
+
+```
+examples/openhands_sdk/train_open_megatron.py
+  → from rllm.trainer.agent_trainer import AgentTrainer
+  → AgentTrainer.train()
+  → from rllm.trainer.verl.train_agent_ppo import TaskRunner
+  → AgentPPOTrainer  (rllm/trainer/verl/agent_ppo_trainer.py)
+```
+
+**stage1 不走的路径：**
+
+- `rllm/experimental/verl/verl_backend.py` (`VerlBackend`)
+- `rllm/experimental/verl/verl_launcher.py` (`WorkflowTaskRunner`)
+- `rllm/experimental/unified_trainer.py` (`UnifiedTrainer`)
+
+**19983fe4 改动的全部文件清单（`git diff-tree --name-only`）：**
+
+```
+rllm/experimental/common/config.py
+rllm/experimental/config/rllm/base.yaml
+rllm/experimental/rollout/verl_engine.py     ← R3 rollout-side 编码
+rllm/experimental/verl/dataclass.py           ← R3 字段
+rllm/experimental/verl/transform.py           ← R3 解码 + 填充
+rllm/experimental/verl/utils.py               ← sync_config (R2/R3 共用)
+rllm/experimental/verl/verl_backend.py        ← R2 actor-side propagate（被跳过那 50 行）
+rllm/experimental/verl/verl_launcher.py
+rllm/trainer/tinker/tinker_backend.py
+rllm/trainer/tinker/transform.py
+```
+
+**关键事实**：19983fe4 **完全没碰** `rllm/trainer/verl/agent_ppo_trainer.py`（也没碰 `agent_sdk_trainer.py`、`agent_workflow_trainer.py`）。也就是说，19983fe4 加的 router_replay 入口**只在 `VerlBackend` / `UnifiedTrainer` 路径上生效**。
+
+**关于"走 verl native CLI 应该能用 R2/R3" 的修正**：
+
+之前 §13.0 / 对外解释里说过 R2 备选可以走 verl native CLI。这个结论**只在 stage1 不走 `AgentPPOTrainer` 的情况下成立**。实际情况是：
+
+- verl-BryanChen408 fork 端确实有完整 R2/R3 **后端能力**（PR #5219、#5185 等 megatron worker 层面），这部分独立于 rllm
+- **R2** (training-side record)：verl megatron worker 在 proximal forward 时记 routing → 返回 output tensordict → **rllm AgentPPOTrainer 不会主动把 routed_experts 从 output 抽出来塞进 batch** → actor update 拿不到 → R2 失效
+- **R3** (rollout-side record)：verl rollout worker 记 routing → 但 rllm 的 `AgentExecutionEngine` / `AgentPPOTrainer` 自己组装 batch（不走 verl 原生 dataloader），**rollout 端 routing 数据没法流到训练 batch** → verl training forward 收到的 batch 里没 `routed_experts` → R3 失效
+
+**所以 stage1 路径上**：
+
+| | rllm CLI 入口 (`rllm.algorithm.router_replay=R3`) | verl native CLI (`actor.router_replay.mode=R3 rollout.enable_rollout_routing_replay=true`) |
+|---|---|---|
+| `VerlBackend` 路径 | ✅ R3 完整可用，R2 缺 actor-side propagation | ✅ 与左相同 |
+| **`AgentPPOTrainer` 路径（stage1 实际走）** | ❌ rllm 19983fe4 入口在这个 trainer 上完全不触发 | ❌ rllm 自己组装 batch 时不传 routing；verl worker 即使能记录也用不上 |
+
+**stage1 的建议处理**：
+
+1. **第一选择**：不开 router_replay（`rllm.algorithm.router_replay=disabled` + 不传 verl native router_replay）。靠 `actor.use_kl_loss=True` + `kl_loss_coef=0.01` + PPO clip 控制 off-policy 漂移
+2. **W2/W3 监控指标**：`rollout_probs_diff_max/mean/std`（来自 `calculate_debug_metrics_compat`，d09f6155 已 cherry-pick 生效）—— 如果 diff < 0.1 量级，router_replay 不是必须项
+3. **如果 W3 reward 不稳且 rollout_probs_diff 大**：才考虑把 R3 数据流 backport 到 `AgentPPOTrainer`（把 `transform.py` R3 解码逻辑接到 agent_ppo_trainer.py 的 batch 组装路径），这是独立的小工作（预计 1–2 天），不在 stage1 范围
+
+**plan §0.2 verl 脚本里的 `R3 default` 是 `VerlBackend` 路径的默认；stage1 走 `AgentPPOTrainer`，这个默认对我们不适用。**
+
+### 13.4 本地 import smoke 结果
+
+20 个关键模块：5 OK / 15 缺重依赖 (`torch_npu` / `verl` / `vllm` / `omegaconf` / `openai`)，**0 个 SyntaxError/NameError/AttributeError**。本地 Mac 不装 NPU 训练栈是预期；NPU 节点上跑 `git checkout qwen36-openhands-stage1` 后应该 20/20 OK。
+
+全仓 `py_compile`：rllm/ 308 文件 + rllm-model-gateway/ 33 文件 = 0 错误。
+
+### 13.5 W2 进入条件（NPU 节点验证清单）
+
+NPU 节点执行清单（命令见交付物 `RUNBOOK_W2_PREFLIGHT.md` —— 如未创建，可参考会话记录里的"W2 进入条件验证清单"）：
+
+- [ ] **NPU 节点拉到** `qwen36-openhands-stage1` 分支（需先 `git push -u origin qwen36-openhands-stage1`）
+- [ ] **真实 import smoke**：20/20 模块在装齐 `torch_npu` + verl@BryanChen408 + Megatron-Bridge + vllm-ascend 后全部 OK
+- [ ] **`npu-smi info`** 与 plan §0.2 `n_devices_per_node=16` 一致
+- [ ] **vllm-ascend Qwen3.6 4 项 smoke**（W1.7）：关 thinking 单请求 / qwen3_coder tool call / 多轮 tool call / 32k context
+
+**5.2 tool call 是关键失败点**——若 vllm-ascend 不支持 `qwen3_coder` parser，要么 fallback 到 generic tool parser，要么在 OpenHands 侧加 A3B tool 格式 post-processor（plan §3.5 第一版 task 之一）。
+
+### 13.6 verl-BryanChen408 fork rllm-compat shim（W1.8 新增）
+
+**问题**：NPU 第一轮 smoke 暴露 11/20 模块 import 失败，根因是 verl-BryanChen408 fork 已经把 rollout 抽象重写（基于 verl main 的最新形态），与 rllm 当前仍引用的 verl 0.7.x API 不兼容：
+
+| | rllm（含 upstream/main）当前期待 | verl-BryanChen408 fork 实际 |
+|---|---|---|
+| 符号 `AsyncLLMServerManager` | `verl.experimental.agent_loop.agent_loop` | **重命名为 `LLMServerClient`，搬到 `verl/workers/rollout/llm_server.py`** |
+| 构造签名 | `(config, servers=..., load_balancer_handle=...)` | `LLMServerClient(config, load_balancer_handle=...)` |
+| `AgentLoopManager` 属性 | `.server_addresses` / `.server_handles` / `.global_load_balancer` | **三属性全部搬到 `LLMServerManager`**（`llm_server.py:326-337`） |
+
+**注意：rllm 上游 main 也有这个问题** —— 不是 W1 cherry-pick 引入的，只是 W1 NPU smoke 第一次实际验证暴露。
+
+**决策（用户已同意）**：路线 B —— 在 verl-BryanChen408 fork 加一层薄兼容层，rllm 一行不改。
+
+**实施**：分支 `qwen36-rllm-compat` (verl-BryanChen408)，commit `881a98d7`，改动 2 个文件、+89 行：
+
+1. **`verl/experimental/agent_loop/agent_loop.py`**：
+   - 给 `AgentLoopManager.__init__` 加可选 kwarg `_server_manager=None`
+   - 加 3 个 shim property（`server_addresses` / `server_handles` / `global_load_balancer`）forward 到 `self._server_manager`
+   - 末尾新增 `class AsyncLLMServerManager(LLMServerClient)` 继承类，接受 legacy `servers=` / `load_balancer_handle=` kwargs，转发到新 `LLMServerClient` 构造
+
+2. **`verl/trainer/ppo/ray_trainer.py:902-904`**：
+   - 在 `AgentLoopManager.create(...)` 调用处加 `_server_manager=self.llm_server_manager`
+   - rllm 子类继承 `RayPPOTrainer` 后，`self.async_rollout_manager.server_addresses` 等自动可用
+
+**没 wire 的路径**（stage1 不走，留作未来）：
+- `verl/trainer/main_ppo_sync.py`（用的是 `AgentLoopManagerTQ` 子类，rllm 不依赖）
+- `verl/experimental/fully_async_policy/fully_async_rollouter.py`（fully-async 路径）
+- `verl/experimental/one_step_off_policy/ray_trainer.py`（one-step-off-policy 路径）
+
+**NPU 节点上拉取 shim**：
+
+```bash
+# 在 NPU 节点上的 verl 工作目录（实际路径替换）
+cd /workspace/verl
+git fetch <bryan-remote>     # 或 git remote add bryan git@github.com:BryanChen408/verl.git && git fetch bryan
+git checkout qwen36-rllm-compat     # 注意：可能需要先 push 到 origin
+# 如果分支只在本地 Mac 上：
+#   (本地)  git -C /Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408 push -u origin qwen36-rllm-compat
+#   (NPU)   git fetch origin && git checkout -b qwen36-rllm-compat origin/qwen36-rllm-compat
+```
+
+**Stage2 退出 shim 的条件**：等上游 rllm 跟进 `LLMServerClient`-based API 后，删除这两段改动即可。
+
+### 13.7 Stage1 安全训练配置（关 router_replay + 关 KL loss + 监控指标）
+
+基于 §13.3 结论（router_replay 在 `AgentPPOTrainer` 路径上不生效），stage1 训练脚本采用以下配置：
+
+```bash
+# === router_replay 关闭（在 AgentPPOTrainer 上即便开了也无效，明确关掉避免误解）===
+# 不传 rllm.algorithm.router_replay 即默认 disabled
+# 不传 actor.router_replay.mode 也不传 rollout.enable_rollout_routing_replay
+
+# === KL loss 关闭（业界惯例，包括 verl 脚本 NPU 分支自身 kl_loss_coef 较小）===
+actor_rollout_ref.actor.use_kl_loss=False
+actor_rollout_ref.actor.kl_loss_coef=0.0
+
+# === PPO clip 保持开启（verl 默认即可）===
+actor_rollout_ref.actor.clip_ratio=0.2
+actor_rollout_ref.actor.clip_ratio_low=0.2
+actor_rollout_ref.actor.clip_ratio_high=0.28
+actor_rollout_ref.actor.entropy_coeff=0      # NPU 分支默认
+
+# === learning rate 保守起步（与 verl 脚本 NPU 分支一致）===
+actor_rollout_ref.actor.optim.lr=1e-6
+```
+
+**W2/W3 必看的 4 个 off-policy 健康指标**（前 2 个由 cherry-pick `d09f6155` 自动上报，后 2 个 verl 原生自带）：
+
+| 指标 | 含义 | 健康 | 报警 |
+|---|---|---|---|
+| `rollout_probs_diff_mean` | rollout-engine vs train-engine logprob 一致性 | < 0.05 | > 0.1 → 考虑 router_replay backport |
+| `rollout_probs_diff_max` | 最坏单 token 偏差 | < 0.5 | > 1.0 |
+| `actor/pg_clipfrac` | 每步 PPO clip 触发比例 | < 0.1 | > 0.2 → 降 lr 或减小 ppo_mini_batch_size |
+| `actor/approx_kl` | actor 当前 vs 上一 ppo iter 的 KL | < 0.02 | > 0.05 → 临时开 kl_loss_coef=0.001 救场 |
+
+**判定规则（W3 长跑 100 步后）**：
+
+1. 4 个指标全 healthy → 配置 OK，继续
+2. reward 在涨但 `rollout_probs_diff_mean > 0.1` → 不阻塞，记录
+3. `actor/pg_clipfrac > 0.3` → **降 lr 或 ppo_mini_batch_size**，不是开 KL loss 的事
+4. `actor/approx_kl` 在 5–10 步内从 0.01 跳到 > 0.1 → **临时开 `kl_loss_coef=0.001`** 救场，并 dump batch 看是不是 reward 异常
+5. reward 长期不涨且 `rollout_probs_diff` 大 → 才考虑 R3 backport 到 `AgentPPOTrainer`（plan §13.3 列的 1–2 天工作）
+
+### 13.8 NPU smoke 第二轮（W1.7 重做）
+
+第一轮 smoke 暴露的两个问题都已修复（§13.6 verl shim + §13.5 RolloutCorrectionConfig）。第二轮 smoke 步骤：
+
+```bash
+# === 0. 同步 fix ===
+# 在 NPU 节点上
+cd /workspace/rllm      # 或你的 rllm 路径
+git fetch origin
+git checkout qwen36-openhands-stage1
+git pull                # 应拉到 commit c1ff82e3 (RolloutCorrectionConfig fix)
+
+cd /workspace/verl      # 或你的 verl 路径
+git fetch <bryan-remote>
+git checkout qwen36-rllm-compat
+git pull                # 应拉到 commit 881a98d7 (rllm-compat shim)
+
+# === 1. 重跑结构性 import smoke（应 20/20 OK）===
+python3 - <<'EOF'
+import importlib, traceback
+mods = [
+    "rllm", "rllm.sdk", "rllm.engine",
+    "rllm.engine.agent_execution_engine",
+    "rllm.engine.rollout.openai_engine",
+    "rllm.engine.rollout.verl_engine",
+    "rllm.engine.rollout.rollout_engine",
+    "rllm.trainer.verl.agent_ppo_trainer",
+    "rllm.trainer.verl.agent_sdk_trainer",
+    "rllm.trainer.verl.agent_workflow_trainer",
+    "rllm.trainer.verl.ray_runtime_env",
+    "rllm.experimental.verl.verl_backend",
+    "rllm.experimental.verl.verl_launcher",
+    "rllm.experimental.verl.transform",
+    "rllm.experimental.verl.utils",
+    "rllm.experimental.verl.metrics",
+    "rllm.experimental.verl.dataclass",
+    "rllm.experimental.common.config",
+    "rllm.experimental.rollout.verl_engine",
+    "rllm.parser.chat_template_parser",
+]
+fail = 0
+for m in mods:
+    try:
+        importlib.import_module(m); print(f"  OK   {m}")
+    except Exception as e:
+        fail += 1; print(f"  FAIL {m}: {type(e).__name__}: {e}")
+print(f"--- {len(mods)-fail}/{len(mods)} OK ---")
+import sys; sys.exit(1 if fail else 0)
+EOF
+
+# === 2. 再跑 vllm-ascend Qwen3.6 4 项推理 smoke（W1.7 原文）===
+#    关 thinking 单请求 / qwen3_coder tool call / 多轮 tool call / 32k context
+```
+
+**W2 准入硬性 checklist**（重写）：
+
+- [ ] §13.8 步骤 1：20/20 OK，无 `AsyncLLMServerManager` ImportError、无 `RolloutCorrectionConfig` NameError
+- [ ] §13.8 步骤 2：4 项 vllm-ascend Qwen3.6 smoke 全通
+
+通过即可进 W2。
+
+### 13.9 Stage1 训练脚本已交付（W2.2 完成）
+
+**新增文件**（plan §7.1 列出，本次 landed）：
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `examples/openhands_sdk/train_openhands_qwen36_npu.py` | 100 | hydra entry point（与 `train_open_megatron.py` 等价，独立文件防 stage1 改动污染 legacy） |
+| `examples/openhands_sdk/train_openhands_qwen36_npu.sh` | 290 | shell wrapper，融合 verl 脚本 NPU 分支参数 + OpenHands docker 链路 + §13.7 安全配置 |
+
+**关键配置（diff 自 `train_open_megatron.sh` 的 surgical changes）**：
+
+```bash
+# env (plan §0.1 必须，原脚本缺)
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
+# §13.7 stage1 safe config
+algorithm.kl_ctrl.kl_coef=0.0                                # 原 0.001
+actor_rollout_ref.actor.kl_loss_coef=0.0                     # 原 0.001
+actor_rollout_ref.rollout.calculate_log_probs=True           # 原 False
++rllm.algorithm.router_replay=disabled                       # 新增防御性显式
+
+# §0.2 verl 脚本权威 MoE 配置（原全缺）
+actor_rollout_ref.actor.megatron.vanilla_mbridge=False   # NPU 必须 False，见 §0.2 / §13.12
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=0.01
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=0.001
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
++actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
+
+# 并行（用户决策 2026-05-25：TP=2 EP=4 单节点 8 NPU）
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2          # 原 4
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
+actor_rollout_ref.actor.megatron.context_parallel_size=1               # 原 2
+actor_rollout_ref.actor.megatron.expert_model_parallel_size=4          # 原注释
+actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1         # 新增
+# ref.megatron 同步上述并行配置
+
+# rollout（plan §5.2 stage1 起步 32k）
+actor_rollout_ref.rollout.tensor_model_parallel_size=8                 # 原 4，单节点全 TP
+actor_rollout_ref.rollout.max_model_len=32768                          # 原 131072
+```
+
+**保持不变的部分**：HCCL/GLOO 网络 env、OpenHands docker config、LiteLLM proxy (PROXY_PORT=5000)、Ray cluster 重启逻辑、profiler 注释段、AgentTrainer + rollout 入口。
+
+**legacy 脚本归位**：`train_open_megatron.sh` / `train_open_megatron.py` 保留不动，作为 stage1 之前的参考实现 + 任何要回退测试的对照。
+
+**W2.3 起的 NPU 节点验证**：
+
+```bash
+# NPU 节点上
+cd /workspace/rllm-071
+git fetch origin
+git checkout qwen36-openhands-stage1
+git pull   # 拉最新
+
+# 跑 stage1
+bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
+```
+
+期待第一次跑：
+
+1. Ray cluster 起来
+2. LiteLLM proxy 启动监听 :5000
+3. Megatron-Bridge 加载 Qwen3.6（已验证可行）
+4. 单 episode rollout 启动 OpenHands docker，container 内调 proxy → vllm-ascend → 返回 trajectory
+5. 一步 ppo iter 跑完，metrics 显示 `rollout_probs_diff_mean` / `pg_clipfrac` / `approx_kl`（前者来自 §13.7 监控，后两者 verl 原生）
+6. checkpoint save 到 `default_local_dir`
+
+任何步骤失败的 traceback 告诉我。
+
+### 13.10 Stage1 分段测试基础设施（W2.0，B 档）
+
+**动机**：W2 端到端跑挂时定位成本太高（Ray + LiteLLM proxy + vllm-ascend + Megatron + OpenHands docker + rllm trainer 6 个子系统都可能挂在某一层）。增加分层 hatch + mock + orchestrator，做到"挂在哪一层"在秒级隔离。
+
+**6 层逻辑模型**：
+
+```
+L1  preflight              hydra config + import + dataset + AgentTrainer ctor (no Ray/NPU/docker/LLM)
+L2a mock_llm_server smoke  curl mock OpenAI server, 验 tool_calls schema
+L2b mock_rollout dry-step  STAGE1_MOCK_ROLLOUT=1 + STAGE1_DRY_STEPS=1 → 全 rllm trainer 链路 + Megatron + 1 ppo iter，但 rollout 是 deterministic fake
+L3  real-rollout dry-step  STAGE1_DRY_STEPS=1 → 真 OpenHands docker + LiteLLM proxy + vllm-ascend + 1 ppo iter
+L4  full training          无 hatch
+```
+
+**新增文件**：
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `examples/openhands_sdk/preflight_qwen36_npu.py` | 230 | Layer 1 隔离：5 子检查（imports / dataset / rollout signature / hydra compose / AgentTrainer construct），fail-fast，pass-through CLI overrides |
+| `examples/openhands_sdk/mock_rollout.py` | 110 | Layer 4 隔离：drop-in replacement for `openhands_agent.rollout`，返回 deterministic fake trajectory，无 docker/LLM |
+| `examples/openhands_sdk/mock_llm_server.py` | 160 | Layer 2 隔离：FastAPI mock OpenAI-compatible server，返回 schema 与真 vllm-ascend 完全一致的 tool_calls / logprobs / token_ids |
+| `examples/openhands_sdk/stage1_test_layered.sh` | 165 | Orchestrator：跨 L1..L4 fail-fast 跑，每层独立 log + summary 表 |
+
+**train 脚本新增 hatch**：
+
+```bash
+PREFLIGHT_ONLY=1     # skip Ray + ray job submit，只跑 preflight 后退出
+STAGE1_DRY_STEPS=N   # 注入 +trainer.total_training_steps=N，跑 N 步后退出
+STAGE1_MOCK_ROLLOUT=1 # train_openhands_qwen36_npu.py 自动 import mock_rollout.rollout
+```
+
+三个 hatch 互相正交可组合。orchestrator 内部就是几条 hatch 组合的 wrapper：
+
+| 层 | hatch 组合 |
+|---|---|
+| L1 | `PREFLIGHT_ONLY=1 bash train_openhands_qwen36_npu.sh` |
+| L2a | `python3 -m examples.openhands_sdk.mock_llm_server --port 18000` + 2 个 curl 验 schema |
+| L2b | `STAGE1_MOCK_ROLLOUT=1 STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh` |
+| L3 | `STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh` |
+| L4 | `bash train_openhands_qwen36_npu.sh` |
+
+**NPU 节点使用**：
+
+```bash
+# 全跑
+bash examples/openhands_sdk/stage1_test_layered.sh
+
+# 只跑 L1+L2a（不需要装 verl/Megatron 的轻量验证）
+bash examples/openhands_sdk/stage1_test_layered.sh L1 L2a
+
+# 跑到 L2b 即停（验证 rllm trainer + Megatron 不依赖 OpenHands docker）
+bash examples/openhands_sdk/stage1_test_layered.sh L1 L2b
+
+# 跳过 L1（已知通过）直接 L3 dry-step
+bash examples/openhands_sdk/stage1_test_layered.sh L3
+```
+
+**fail-fast 行为**（用户决策）：每层 fail 立即停，summary 表里其余层标 `(skipped)`。覆盖：`STAGE1_HALT_ON_FAIL=0 bash stage1_test_layered.sh`。
+
+**logs**：`/tmp/stage1-layered/L{1,2a,2b,3,4}.log` + mock server log。orchestrator 退出前打 summary 表。
+
+**第一次 W2 推荐路径**：
+
+1. `bash stage1_test_layered.sh L1 L2a` —— 4 秒内验：rllm 链路 import 健康 + mock LLM 链路 OK
+2. `bash stage1_test_layered.sh L2b` —— ~10–30 分钟（要起 Megatron + 1 ppo iter），验：rllm trainer 全链路 + Megatron-Bridge 加载 Qwen3.6 + 一步训练 + checkpoint save（mock rollout 跳过 docker/LLM）
+3. `bash stage1_test_layered.sh L3` —— 验：OpenHands docker + LiteLLM proxy + vllm-ascend 真实联调
+4. `bash stage1_test_layered.sh L4` —— 进入正式训练
+
+L1/L2a 通过 L2b 挂 → 100% 是 rllm trainer / Megatron / NPU 问题（与 OpenHands 无关）。  
+L2b 通过 L3 挂 → 100% 是 OpenHands / LiteLLM proxy / vllm 链路问题（与 trainer / Megatron 无关）。
+
+**stage2 退出 hatch**：mock 文件保留，只是 orchestrator 默认配置改成 L4 only。三个 env var 永久保留作 debug tool。
+
+### 13.11 verl fork shim 第二轮：megatron_workers / fsdp_workers（W2.8）
+
+**触发**：L2b 跑 `mock_rollout + dry-step` 时挂在
+`ModuleNotFoundError: No module named 'verl.workers.megatron_workers'`，定位到 verl fork 的第二轮 API 漂移。
+
+**漂移内容**：fork 把 backend-specific worker 模块（`megatron_workers.py` / `fsdp_workers.py`）**合并到一个 backend-agnostic `engine_workers.py`**，只暴露两个类：
+
+| 旧符号 | 新位置 / 行为 |
+|---|---|
+| `verl.workers.megatron_workers.ActorRolloutRefWorker` | `verl.workers.engine_workers.ActorRolloutRefWorker`（async/sync 改 config 驱动：`actor_rollout_ref.rollout.mode=async`） |
+| `verl.workers.megatron_workers.AsyncActorRolloutRefWorker` | 同上（统一类） |
+| `verl.workers.megatron_workers.CriticWorker` | `verl.workers.engine_workers.TrainingWorker`（generic 训练 worker；critic 也用它） |
+| `verl.workers.fsdp_workers.*` | 同上（fork 也搬走了） |
+
+**rllm 侧的滞后 import**（与之前一样不是我们 cherry-pick 引入）：
+
+```
+rllm/trainer/verl/train_agent_ppo.py:99    AsyncActorRolloutRefWorker (fsdp 分支)
+rllm/trainer/verl/train_agent_ppo.py:105   AsyncActorRolloutRefWorker (megatron) ← stage1 触发
+rllm/trainer/verl/train_agent_ppo.py:134   CriticWorker (megatron, GRPO 不用但 import 必须通过)
+rllm/trainer/verl/train_workflow_pipeline.py:120-123 同（stage1 不走但保险）
+```
+
+**实施**（verl-BryanChen408 分支 `qwen36-rllm-compat`，commit `85159408`，新增 2 个文件 +139 行）：
+
+| 文件 | 角色 |
+|---|---|
+| `verl/workers/megatron_workers.py` | shim：from engine_workers 重导 + alias `AsyncActorRolloutRefWorker = ActorRolloutRefWorker` + `CriticWorker = TrainingWorker` |
+| `verl/workers/fsdp_workers.py` | 同样的 shim（stage1 不走 fsdp，但 import safety net） |
+
+shim 在 `engine_workers` 模块缺失时 raise 明确错误（不是模糊的 ImportError），方便未来诊断。
+
+**stage1 影响**：
+- GRPO actor-only，不实例化 critic → CriticWorker=TrainingWorker 的运行时签名差异（TrainingWorker 要 `TrainingWorkerConfig`）不被触发
+- 真正实例化的是 `AsyncActorRolloutRefWorker → ActorRolloutRefWorker`，async 行为由 `rollout.mode=async` 触发（stage1 训练脚本里已经是 `actor_rollout_ref.rollout.mode=async`）
+
+**累计 verl fork compat 文件清单**（`qwen36-rllm-compat` 分支）：
+
+| commit | 文件 | 解决问题 |
+|---|---|---|
+| `881a98d7` | `verl/experimental/agent_loop/agent_loop.py` | `AgentLoopManager` 三 property + `AsyncLLMServerManager` shim class |
+| `881a98d7` | `verl/trainer/ppo/ray_trainer.py` | wire `_server_manager` 到 `AgentLoopManager.create()` |
+| `85159408` | `verl/workers/megatron_workers.py` | shim：re-export engine_workers |
+| `85159408` | `verl/workers/fsdp_workers.py` | shim：同上 |
+
+**stage2 退出条件**：等上游 rllm 跟进 verl 8.x worker API 后整体删除。
+
+**NPU 节点拉新 commit**：
+
+```bash
+cd /workspace/verl
+git fetch origin
+git pull origin qwen36-rllm-compat   # 应拉到 85159408
+```
+
+然后重跑：
+
+```bash
+cd /workspace/rllm-071
+bash examples/openhands_sdk/stage1_test_layered.sh L2b
+```
+
+### 13.12 `vanilla_mbridge` NPU 必须 False（W2.9）
+
+**触发**：L2b 重跑（带 W2.8 worker shim 后）走到 `engine.initialize()` 时挂在：
+
+```
+File "verl/workers/engine/megatron/transformer_impl.py", line 178, in _build_tf_config
+    bridge = AutoBridge.from_config(self.model_config.hf_config, dtype=self.param_dtype)
+File "mbridge/core/auto_bridge.py", line 50, in from_config
+    raise ValueError("Unregistered model type: qwen3_5_moe, now only support
+                      dict_keys(['deepseek_v3', 'llama', 'qwen2', 'mimo',
+                      'mixtral', 'qwen2_5_vl', 'qwen2_moe', 'qwen3', 'qwen3_moe',
+                      'glm4_moe', 'glm4v', 'glm4v_moe', 'gemma3', 'internvl_chat']))
+```
+
+**重要澄清：两个独立库**
+
+| | `Megatron-Bridge` (NVIDIA-NeMo) | `mbridge` (pypi 包) |
+|---|---|---|
+| 来源 | github.com/NVIDIA-NeMo/Megatron-Bridge | github.com/ISEEKYAN/mbridge → pypi |
+| 用途 | offline HF↔Megatron 权重转换 + recipes | runtime build TransformerConfig + model |
+| plan §0 装的版本 | `de93536e`（含 PR #2654 Qwen3.5 recipe） | `0.15.1`（pypi）— **不支持 qwen3_5_moe** |
+
+verl 提供两条 bridge 路径（`verl/workers/engine/megatron/transformer_impl.py:173+`）：
+
+| `vanilla_mbridge` | 走的库 | import 路径 |
+|---|---|---|
+| `True` | pypi `mbridge` | `verl/models/mcore/mbridge.py` → `from mbridge import AutoBridge` |
+| `False` | NVIDIA `Megatron-Bridge` | `verl/models/mcore/bridge.py` → `from megatron.bridge import AutoBridge` |
+
+**verl 自己的 Qwen3.5 NPU 脚本明确 NPU case override 为 False**（`run_qwen3_5_35b_megatron.sh:196`）：
+
+```bash
+case "${DEVICE}" in
+    npu)
+        ACTOR+=(
+            actor_rollout_ref.actor.megatron.vanilla_mbridge=False    # ← NPU override
+            ...
+        )
+```
+
+**plan §0.2 早期版本的 audit 错误**（v2.1 ~ v2.7）：抄了 verl 脚本 ACTOR 主行参数 `vanilla_mbridge=True`，**没读 case override 块**。stage1 训练脚本（v2.5）继承了这个错误，导致 L2b 重跑挂。
+
+**修正**：
+- plan §0.2 改正 + 长注释说明两个 bridge 路径区分 + NPU 必须 False 的根因
+- plan §13.9 W2.2 记录里的 `vanilla_mbridge=True` 改 False
+- `train_openhands_qwen36_npu.sh` 改 actor + ref 两处 `vanilla_mbridge=False`，加详细注释解释
+
+**stage1 影响**：不需要升级 mbridge pypi 包，也不需要装新 NVIDIA Megatron-Bridge 版本（你环境 `de93536e` 已经够）。
+
+**通用教训（写给 stage2 / 类似项目）**：
+
+抄上游脚本主行参数时要扫一下 case/if/elif 块的 override —— 主行表的"权威值"可能被 device/strategy/mode 分支 case override，audit 时容易漏。Plan §0.2 接下来对照 `run_qwen3_5_35b_megatron.sh` 应该重做一次 case-aware 抄录。
+
+**下一步**：NPU 节点上 `git pull` rllm 拉到这个修正后重跑 L2b。
+
+### 13.13 训练脚本完整校对（W2.10）
+
+**触发**：W2.9 vanilla_mbridge 修复时意识到 plan §0.2 只抄了 verl 脚本 ACTOR 主行，遗漏 NPU case override。
+做完整 verl NPU 分支 vs stage1 脚本 diff，发现还有 **17 项遗漏**（分高/中风险，外加 4 项配置耦合不一致）。
+
+**用户决策（2026-05-25）**：`use_dynamic_bsz` 整组耦合 config 走 verl 套（False + micro_batch=1 + max_token cap）。
+
+**所有补全（18 项）**：
+
+| 类别 | key | 值 | 来源 |
+|---|---|---|---|
+| env | `CPU_AFFINITY_CONF=1` | yes | verl 脚本 :191 NPU case |
+| model | `trust_remote_code=True` | yes | verl MODEL 段 |
+| algorithm | `use_kl_in_reward=False` | yes | verl ALGORITHM 段 |
+| data | `truncation='error'` | yes | verl DATA 段 |
+| data | `filter_overlong_prompts=True` | yes | verl DATA 段 |
+| actor | `megatron.dtype=bfloat16` | yes | verl ACTOR 段 |
+| actor | `megatron.use_remove_padding=True` | 与 model 层同步 | plan §0.1 软约束 |
+| actor | `checkpoint.strict=False` | yes | verl NPU case :194 |
+| actor.megatron.tf_cfg | `attention_backend=auto` | yes | verl ACTOR 段 |
+| actor.megatron.tf_cfg | `moe_token_dispatcher_type=alltoall` | yes | verl NPU case :199 |
+| actor.megatron.tf_cfg | `use_naive_l2norm=True` | yes | verl NPU case :200 |
+| actor.optim.override | `overlap_cpu_optimizer_d2h_h2d=True` | yes | verl 段（之前误注释） |
+| rollout | `dtype=bfloat16` | yes | verl ROLLOUT 段 |
+| 耦合切换 | `actor.use_dynamic_bsz` | True→**False** | 用户决策（verl 套） |
+| 耦合切换 | `actor.ppo_micro_batch_size_per_gpu` | (缺)→**1** | verl 套必需 |
+| 耦合切换 | `actor.ppo_max_token_len_per_gpu` | 32768→**16384** | 按数据规模放大（max_prompt+max_response=12288 + 33% headroom；verl 主行 4096 在我们数据下放不下） |
+| 耦合切换 | `ref.log_prob_use_dynamic_bsz` | True→False；`ref.log_prob_max_token_len_per_gpu` 32768→16384 | 与 actor 套一致 |
+| 耦合切换 | `rollout.log_prob_use_dynamic_bsz` | (缺)→False；`rollout.log_prob_max_token_len_per_gpu` (缺)→16384 | 与 actor 套一致 |
+
+**没补的**（确认不需要）：
+
+| key | 不补理由 |
+|---|---|
+| `EXTRA=(model_engine=megatron)` | rllm `agent_ppo_trainer_megatron.yaml` → `ppo_megatron_trainer.yaml` → `override model_engine: megatron`，hydra defaults 链已自动带入 |
+| `pip install -U git+https://github.com/ISEEKYAN/mbridge.git` | NPU 走 `vanilla_mbridge=False`（NVIDIA Megatron-Bridge），不依赖 pypi mbridge |
+
+**保留的差异**（plan 已记录原因）：
+
+- 并行 TP=2 PP=1 EP=4（用户决策单节点 8 卡）vs verl TP=2 PP=2 EP=8（16 卡）
+- `data.max_prompt_length=8192` / `max_response_length=4096`（OpenHands 长 episode）vs verl 1024/2048（geo3k 短题）
+- `kl_loss_coef=0.0` / `use_kl_loss=False` / `+rllm.algorithm.router_replay=disabled` / `clip_ratio_low/high=0.2/0.28`（§13.7 安全配置）
+- `max_model_len=32768`（plan §5.2）
+- `rollout.n=${ROLLOUT_N}`（默认 1，bring-up 阶段）
+- `trainer.test_freq=20 / total_epochs=100`（长 episode 调小 eval 频率 + 长跑）
+
+**对照执行**：
+
+```bash
+# 34 项必需 key 自动校验
+for key in CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1 VLLM_ALLREDUCE_USE_SYMM_MEM=0 CPU_AFFINITY_CONF=1 \
+           trust_remote_code=True kl_loss_coef=0.0 router_replay=disabled vanilla_mbridge=False \
+           megatron.dtype=bfloat16 rollout.dtype=bfloat16 \
+           moe_aux_loss_coeff moe_z_loss_coeff moe_permute_fusion moe_grouped_gemm \
+           moe_token_dispatcher_type=alltoall use_naive_l2norm=True \
+           use_flash_attn=True attention_backend=auto use_kl_in_reward=False \
+           checkpoint.strict=False calculate_log_probs=True \
+           max_model_len=32768 use_dynamic_bsz=False \
+           ppo_micro_batch_size_per_gpu=1 ppo_max_token_len_per_gpu=16384 \
+           log_prob_use_dynamic_bsz=False log_prob_max_token_len_per_gpu=16384 \
+           expert_model_parallel_size=4 tensor_model_parallel_size=2 expert_tensor_parallel_size=1 \
+           overlap_cpu_optimizer_d2h_h2d=True data.truncation data.filter_overlong_prompts; do
+    grep -q "$key" examples/openhands_sdk/train_openhands_qwen36_npu.sh && echo "  ✓ $key" || echo "  ✗ MISSING $key"
+done
+# 已全 ✓
+```
+
+**audit 教训整理**（plan §13.12 续写）：
+
+1. **抄上游 array 时务必扫 case/if/elif override**（W2.9）
+2. **耦合 config（use_dynamic_bsz / use_remove_padding 等）要识别为"套装"**，不能单改一项（W2.10）
+3. **数据规模差异 → cap 类参数等比放大**（W2.10：verl 4096 → 我们 16384）
+4. **hydra defaults 链要追到底**（W2.10：rllm 引用的 ppo_megatron_trainer.yaml 已经是 verl 8.x stub）
+
+### 13.14 batch sanity：`train_batch_size`/`ppo_mini_batch_size`/`rollout.n`/`DP` 联立约束（W2.10 续）
+
+**触发**：用户指出 `BATCH_SIZE=1` 默认值 < `actor.ppo_mini_batch_size=4`，verl actor.py:224 会直接 reject。
+
+进一步发现这不只是整除问题，而是**联立约束**——还有 DP 维度。
+
+**verl 实际约束**（from `verl/workers/config/actor.py:222` + `verl/trainer/ppo/ray_trainer.py:1267`）：
+
+```
+DP_size = N_GPUS / (TP × PP × CP)                         = 8 / 2 = 4  (stage1 single-node)
+total_trajectories = train_batch_size × rollout.n
+effective_mini_batch = ppo_mini_batch_size × rollout.n
+
+约束 1 (硬 check, actor.py:224):  train_batch_size >= ppo_mini_batch_size
+约束 2 (DP 切分, implicit):       total_trajectories >= DP_size
+约束 3 (PPO 完整 iter):           total_trajectories % effective_mini_batch == 0
+```
+
+**stage1 默认 (修正后)**：
+
+```bash
+BATCH_SIZE=1           # 每 step 1 prompt → 1 个 OpenHands docker 容器（bring-up 稳）
+ROLLOUT_N=4            # 每 prompt 4 rollouts（GRPO group baseline；同时 1×4=4=DP，所有 rank 都有活）
+PPO_MINI_BATCH_SIZE=1  # = BATCH_SIZE，保证 train_batch_size >= ppo_mini_batch_size
+```
+
+验证：
+
+| 约束 | 计算 | 结果 |
+|---|---|---|
+| 1 | 1 >= 1 | ✓ |
+| 2 | 1×4=4 >= 4 | ✓ |
+| 3 | 4 % (1×4=4) == 0 | ✓ |
+
+**W3 scaling 例子**（用户改 env 即可）：
+
+| Env | total | mini_eff | DP | 合法? |
+|---|---|---|---|---|
+| `BATCH_SIZE=4 ROLLOUT_N=4` | 16 | 16 | 4 | ✓ 1 PPO iter |
+| `BATCH_SIZE=4 ROLLOUT_N=8 PPO_MINI_BATCH_SIZE=2` | 32 | 16 | 4 | ✓ 2 PPO iter |
+| `BATCH_SIZE=2 ROLLOUT_N=2` | 4 | 4 | 4 | ✓ 最小 |
+| `BATCH_SIZE=1 ROLLOUT_N=1` | 1 | 1 | 4 | ❌ DP 切不下去 |
+| `BATCH_SIZE=2 PPO_MINI_BATCH_SIZE=4` | (n/a) | (n/a) | (n/a) | ❌ batch < mini |
+
+**fail-fast sanity check 已加在脚本顶部**：
+
+```bash
+DP_SIZE=$(( N_GPUS / 2 ))   # TP=2, PP=1, CP=1
+_total_samples=$(( BATCH_SIZE * ROLLOUT_N ))
+if [[ ${_total_samples} -lt ${DP_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH × ROLLOUT < DP ($DP_SIZE)" >&2; exit 2
+fi
+if [[ ${BATCH_SIZE} -lt ${PPO_MINI_BATCH_SIZE} ]]; then
+    echo "[stage1] FATAL: BATCH < MINI" >&2; exit 2
+fi
+```
+
+挂在脚本顶部秒级 reject 配置错误，不浪费 30s 启动 Ray 才挂在 verl validate()。
+
+**为什么默认 `ROLLOUT_N=4` 而不是 1**：
+- DP=4 必须 >=4 个 samples
+- GRPO 需要 group baseline（n>=2 才有意义）
+- 4 是平衡 OpenHands docker 串行执行时间（每 prompt 4 rollouts ≈ 8-15 分钟单 step）与 statistical signal 的最小可用值
+
+**为什么 `PPO_MINI_BATCH_SIZE` 默认耦合 `BATCH_SIZE` 而不是固定值**：
+- BATCH_SIZE=1 时 mini=1（1 个 mini-batch）
+- BATCH_SIZE=4 时 mini=4（仍 1 个 mini-batch）
+- 用户 W3 scale up 时改 BATCH_SIZE，mini 自动跟随，**避免再踩 1 vs 4 这种坑**
+- 想分多个 mini-batch (e.g. 4 prompts × 2 mini-batches) 时显式传 `PPO_MINI_BATCH_SIZE=2`
+
+### 13.15 真实数据集 prepare 脚本（W2.11）
+
+**触发**：用户想直接用真实算子数据集（kernelgym 风格 JSONL）训 stage1，问能否复用
+`examples/kernelgym/prepare_kernelbench_data.py`。
+
+**结论**：不能直接复用。两份脚本输出 schema 完全不一致：
+
+| | `prepare_kernelbench_data.py` | stage1 训练脚本期待 |
+|---|---|---|
+| 格式 | JSONL | parquet |
+| 顶层 schema | `{task: {...}, backend: "..."}` | `{prompt: str, extra_info: {...}}` |
+| 字段命名 | `task.problem_id` / `task.reference_code` / `task.prompt` | `extra_info.op_name` / `extra_info.task_code` / `extra_info.instruction` |
+| 注入路径 | `DatasetRegistry.register_dataset()` | verl 直接读 parquet (`data.train_files=<parquet>`) |
+
+**新增 `examples/openhands_sdk/prepare_npu_operator_data.py`**（460 行，含 W2.12 mock 模式）支持 4 种输入源：
+
+```bash
+# 1. kernelgym 风格 JSONL（用户实际格式）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-jsonl \
+    --input ./data/drkernel_rl_data.jsonl \
+    --output ./examples/openhands_sdk/real_ops_train.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+
+# 2. rl_single_ops 风格 JSON（既有 mock 的源）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-json --input ./rl_single_ops.json \
+    --output ./examples/openhands_sdk/rl_single_ops.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+
+# 3. HuggingFace dataset（本地 hf_dataset/ 目录或远端 Hub）
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source hf --input ./hf_dataset/drkernel-rl-data --hf-split train \
+    --output ./examples/openhands_sdk/real_ops_train.parquet
+
+# Train/val 切分
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source local-jsonl --input ./data/drkernel_rl_data.jsonl \
+    --output-train ./examples/openhands_sdk/real_ops_train.parquet \
+    --output-val ./examples/openhands_sdk/real_ops_val.parquet \
+    --val-frac 0.05 --seed 42
+```
+
+**统一输出 schema**（与 mock 完全兼容，superset）：
+
+```python
+{
+    "prompt": str,        # json.dumps([{"role":"user", "content": instruction}])
+    "extra_info": {
+        "instruction":  str,     # 给 LLM 的提示
+        "scenario":     str,     # 'npu_operator' / 'npu_ascend_operator'
+        "op_name":      str,     # 短标识，metrics 聚合用
+        "arch":         str,     # 'ascend910b1' / 'ascend910b'
+        "task_code":    str,     # PyTorch 参考实现，写进 OpenHands workspace
+        "reward_model": dict,    # 新增字段：{ground_truth, entry_point, backend, problem_id}
+                                 # 给容器内 reward 函数读，不破坏现有 rollout
+    }
+}
+```
+
+**核心设计**：
+
+- 单一 `_row_to_record(row, scenario, arch)` 函数自动判别 kernelgym-style (有 `task` 字段) vs rl_single_ops-style (有 `prompt`+`py_code/code`)，源端解析与目标 schema 解耦
+- 不认识 schema 的行 `--skip` 计数（前 5 条打 stderr），不阻塞整体转换
+- `--limit N` 支持 smoke 模式（先转 N 条试管线）
+- `--val-frac` deterministic split（seed 固定）
+
+**本地验证**（4 条 mini kernelgym JSONL → parquet）：
+
+```
+✓ top-level columns identical: ['prompt', 'extra_info']
+mock extra_info keys: ['arch', 'instruction', 'op_name', 'scenario', 'task_code']
+real extra_info keys: ['arch', 'instruction', 'op_name', 'reward_model', 'scenario', 'task_code']
+✓ real parquet is a superset of mock keys — rollout will work
+✓ split mode: train=3 val=1
+```
+
+**接到 stage1 训练**：
+
+train_openhands_qwen36_npu.py 当前指向 `rl_single_ops.parquet`：
+
+```python
+_MOCK_NPU_PARQUET = os.path.join(_EX_DIR, "rl_single_ops.parquet")
+```
+
+如果你的 prepare 输出叫 `real_ops_train.parquet`，两种接法：
+
+A. **改 .py 里的常量**指向新 parquet（最干净）
+B. **生成时 `--output=examples/openhands_sdk/rl_single_ops.parquet`** 覆盖现有文件（最少代码改动）
+
+stage1 起步推荐 B（不动 .py，重跑 prepare 时直接覆盖 parquet）。
+
+**W2.12 内置 mock 模式（`--source mock`）**：
+
+不依赖任何外部数据源，4 个 ascendc 算子模板（vector_add / matmul / softmax / layer_norm）轮转生成任意 N 条；前 4 条用原名，从第 5 条起加 `_NNNN` 后缀保唯一。
+
+```bash
+# 32 条 mock，single file
+python3 -m examples.openhands_sdk.prepare_npu_operator_data \
+    --source mock --mock-count 32 \
+    --output examples/openhands_sdk/rl_single_ops.parquet \
+    --scenario npu_ascend_operator --arch ascend910b
+# 输出：32 行 parquet，extra_info.reward_model 含 {ground_truth, kind="mock", template}
+# 用途：layered smoke L2b/L3 不需要真实数据时；快速 bring-up
+```
+
+**与既有 `create_mock_npu_operator_data.py` 的关系**：
+
+| | `create_mock_npu_operator_data.py` (legacy, 4×4=16 rows) | `prepare_npu_operator_data.py --source mock` (新) |
+|---|---|---|
+| 行数 | 固定 16（4 模板 × 4 重复） | 任意 N (`--mock-count N`，默认 32) |
+| op_name 唯一 | 否（vector_add 出现 4 次） | 是（加 `_NNNN` 后缀） |
+| reward_model | 无 | `{ground_truth, kind="mock", template}` |
+| 输出位置 | 固定 `mock_npu_operator.parquet` | 任意 `--output <path>` |
+| 走 _row_to_record | 否（直接写 parquet） | 是（与 real-data 统一管线） |
+
+legacy 脚本 stage1 用过、保留不动；新脚本 mock 模式作为统一入口。
+
+### 13.16 prompt 字段类型修正：list[dict] 不是 JSON string（W2.13）
+
+**触发**：用户用 `--source mock --mock-count 32` 生成的 parquet 在 L2b dataset filter 阶段挂在：
+
+```
+jinja2.exceptions.TemplateError: No user query found in messages.
+  File "verl/utils/dataset/rl_dataset.py", line 256, in doc2len
+    tokenized_prompt = tokenizer.apply_chat_template(doc[prompt_key], ...)
+```
+
+**根因**：verl 在两条路径上都假设 `doc[prompt_key]` **已经是 `list[dict]`**：
+
+```python
+# rl_dataset.py:_build_messages
+messages: list = example[key]              # 不 json.loads
+for message in messages:                   # 字符串会被按字符 iterate
+    ...
+
+# rl_dataset.py:doc2len (plain tokenizer path)
+tokenizer.apply_chat_template(doc[prompt_key], ...)   # jinja iterate, 字符串失败
+```
+
+我们三个 prepare/mock 脚本都用了 `json.dumps([{"role":"user",...}])`，所以 prompt 字段是 string，jinja iterate 字符找不到 `role=='user'` → "No user query found"。
+
+**修复**：prompt 字段直接存 list[dict]，pyarrow 原生支持 `list[struct]`。
+
+涉及 3 个文件：
+
+| 文件 | 修改 |
+|---|---|
+| `examples/openhands_sdk/prepare_npu_operator_data.py` | `_row_to_record` 末尾 `json.dumps(...)` → 直接 list |
+| `examples/openhands_sdk/create_mock_npu_operator_data.py` | `prompt = json.dumps(...)` → `prompt = [...]` |
+| `examples/openhands_sdk/create_mock_npu_ascend_operator_data.py` | 同上 |
+
+每处加注释说明 verl 要求 list、字符串会挂 jinja，避免未来回归。
+
+**本地验证**：
+
+```
+prompt type: ndarray   (pyarrow list[struct] → numpy.ndarray of dict)
+prompt[0]: role=user content_head=Implement an AscendC kernel ...
+✓ 1 user message(s) found in row 0 (previously 0 → jinja crashed)
+```
+
+**为什么之前 stage1 跑过 mock 没挂？**
+
+最可能：之前没开 `filter_overlong_prompts=True`（这是 W2.10 新加的，§0.2 verl 权威要求）。`filter_overlong_prompts` off 时，doc2len 路径不触发；prompt 字段后续怎么解 / 有没有别的兜底 json.loads 没追到底。**v2.10 把 `filter_overlong_prompts=True` 加上后，这条 latent bug 立刻显形**。
+
+也就是说：W2.10 完整对齐 verl NPU 分支 → 触发 W2.13 修复 prompt 类型 → 这两个修是一起来的，缺一不可。
+
+**audit 教训补充（§13.13 第 5 条）**：
+
+5. 跨数据/训练边界的 schema 不能假设"看起来对就行" —— pyarrow 能存 list[struct] 也能存 string，但 verl 只接受 list，肉眼读 parquet 看不出 string 还是 list 时要 `type()` 一下。
+
+### 13.17 Megatron-Bridge PYTHONPATH 自动注入（W2.14）
+
+**触发**：L2b 走过 dataset filter 后挂在：
+
+```
+File "verl/workers/engine/megatron/transformer_impl.py", line 192, in _build_tf_config
+    from verl.models.mcore.bridge import AutoBridge
+File "verl/models/mcore/bridge.py", line 17, in <module>
+    from megatron.bridge import AutoBridge
+ModuleNotFoundError: No module named 'megatron.bridge'
+```
+
+**根因**：NPU 环境的 Megatron-Bridge 是源码 clone（`/workspace/Megatron-Bridge`），**未 pip install**，所以 `megatron.bridge` 不在 Python path 上。
+
+**修复**：训练脚本顶部加路径自动注入：
+
+```bash
+MEGATRON_BRIDGE_DIR="${MEGATRON_BRIDGE_DIR:-/workspace/Megatron-Bridge}"
+if [[ -d "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge" ]]; then
+    export PYTHONPATH="${MEGATRON_BRIDGE_DIR}/src:${PYTHONPATH}"
+elif python3 -c "import megatron.bridge" 2>/dev/null; then
+    echo "[stage1] Megatron-Bridge: already importable (pip-installed)"
+else
+    echo "[stage1] WARN: not found AND not pip-installed; training will crash"
+fi
+```
+
+三路 dispatch：
+- 源码 clone 存在 → 加入 PYTHONPATH
+- 已 pip install → 不做事
+- 都没有 → 显式 WARN（不立即 exit，让 preflight smoke 也能跑）
+
+`MEGATRON_BRIDGE_DIR` 默认 `/workspace/Megatron-Bridge`，可用环境变量 override。
+
+**通用教训补充（§13.13 第 6 条）**：
+
+6. **依赖装载方式（pip vs 源码 clone vs 系统包）跨环境不一致** —— stage1 启动脚本应该把"源码 clone 路径"作为可配置 env，并加路径不存在的显式 WARN，避免又跑半天才发现是 PYTHONPATH 没接上。
+
+### 13.18 删 HCCL_IF_IP 硬编码 — 对齐 verl 自己跑的默认（W2.15）
+
+**触发**：L2b 走过 `_build_tf_config` + Megatron-Bridge load HF weights，挂在 `torch.distributed.broadcast`：
+
+```
+RuntimeError: createHCCLCommOrigin:torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:2314
+HCCL function error: HcclGetRootInfo(&hcclID), error code is 6
+[ERROR] (PID:1131801, Device:0, RankID:6) ERR02200 DIST call hccl api failed.
+```
+
+Traceback 头部显示 worker `pid=1131801, ip=80.48.5.65` — **当前节点 IP 是 80.48.5.65**。
+
+**用户关键提示**：verl 自己跑 Qwen3.6 是 OK 的。rllm 基于 verl，所以排查方向必须是"rllm 引入了什么 verl 自己跑时没有的差异"。
+
+**根因**：obs 分支历史脚本硬编码：
+
+```bash
+nic_name="ens1f3"
+export HCCL_IF_IP=80.48.5.88        # ← 当前节点没有这个 IP
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+```
+
+当前 NPU 节点不存在 IP 80.48.5.88，HCCL `HcclGetRootInfo` 找不到对应 NIC → error code 6。
+
+verl 自己的脚本（`run_qwen3_5_35b_megatron.sh`）**根本不设这些**，靠 NPU 容器默认 HCCL 配置就 OK。
+
+**修复**：改成 opt-in 模式：
+
+```bash
+# 默认（与 verl 自己跑一致）：完全不设 HCCL_IF_IP / SOCKET_IFNAME / port range
+
+# 需要 override（多 NIC 机器、端口冲突等）时启动前 export：
+HCCL_IF_IP_OVERRIDE=10.1.2.3 \
+HCCL_NIC_NAME=enp0s8 \
+HCCL_FORCE_PORT_RANGE=1 \
+bash train_openhands_qwen36_npu.sh
+```
+
+三个独立 opt-in env：
+- `HCCL_IF_IP_OVERRIDE` — 多 IP 机器选哪个 NIC 通信
+- `HCCL_NIC_NAME` — GLOO/TP/HCCL SOCKET_IFNAME 一致设
+- `HCCL_FORCE_PORT_RANGE` — 同节点跑多 verl 实例时强制端口段（含 HCCL_INTRA_ROCE/PCIE）
+
+**Audit 教训补充（§13.13 第 7 条）**：
+
+7. **硬编码 IP/MAC/NIC 名称跨机器必爆**。obs 历史脚本对某个 dev 节点是 OK 的，但 stage1 跑在新节点上立刻挂。原则：machine-specific identifier 不允许出现在 commit 进库的代码里，要么用 env override 要么 runtime detect（如 `hostname -I`）。
+
+**Audit 整体策略调整**：
+
+之前 W2.10 做"完整对齐 verl NPU 分支"是对的方向，但只对齐了 `ARGS` 段参数，**没对齐 env 段**。verl 自己脚本 env 段只有 3 行：
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_USE_V1=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+```
+
+我们脚本 env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，**这些都是 stage1 的潜在地雷**。W2.15 解决 HCCL_IF_IP 这个最炸的，其他 env（如 `ASCEND_LAUNCH_BLOCKING=1`、`VLLM_ATTENTION_BACKEND=TORCH_SDPA` 等）等到 L2b 跑过再视情况清理。
+
+### 13.19 enforce_eager 对齐 verl 默认（W2.16）
+
+**触发**：L2b 走过 Megatron load + HCCL broadcast 后，vllm worker 启动时 `exits with an exit code 2`，ray actor 死亡。debug 输出能看到 vllm CLI args 但没有 vllm 内部 stderr。
+
+**verl 自己 vllm worker 关键代码**（`vllm_async_server.py:234-249`）：
+
+```python
+compilation_config = engine_kwargs.pop("compilation_config", None) or {}
+compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")   # ← 写死
+# ...
+args = {
+    "enforce_eager": self.config.enforce_eager,
+    "compilation_config": compilation_config,
+    ...
+}
+```
+
+verl **永远把 `cudagraph_mode='FULL_AND_PIECEWISE'` 传给 vllm**。verl 自己脚本 yaml 默认 `enforce_eager: false`（不显式设），cudagraph 真生效，vllm-ascend 跑 Qwen3.6 OK。
+
+我们脚本从 obs 历史继承了 `actor_rollout_ref.rollout.enforce_eager=True # TODO`，导致 `enforce_eager=True` + `cudagraph_mode=FULL_AND_PIECEWISE` 矛盾，vllm-ascend worker init 时 exit 2。
+
+**修复**：改成 env 可控，默认 False（对齐 verl）：
+
+```bash
+# 默认（与 verl 一致）
+actor_rollout_ref.rollout.enforce_eager=False
+
+# 如 NPU cudagraph warmup 太久或挂，可临时 opt-out
+ROLLOUT_ENFORCE_EAGER=True bash train_openhands_qwen36_npu.sh
+```
+
+**待用户确认**（同时跑 W2.16 + 拿 stderr 验证）：
+
+```bash
+# 在 NPU 节点
+ls -la /tmp/ray/session_latest/logs/ | grep "worker-" | tail -5
+grep -l "vllm" /tmp/ray/session_latest/logs/worker-*.err 2>/dev/null | head -3
+cat /tmp/ray/session_latest/logs/worker-<vllm-worker-pid>.err | tail -50
+```
+
+如果 W2.16 改完跑过：cudagraph 确实是根因。
+如果还挂：stderr 会显示真实错误，可能是别的（如 `--logprobs_mode processed_logprobs` 或 `--enable_sleep_mode` vllm-ascend 不支持）。
+
+**Audit 教训补充（§13.13 第 8 条）**：
+
+8. **下游覆盖上游默认值时要看上游 setdefault / 隐式 fill 的行为**。verl 的 vllm CLI 不只是 user-config 透传，还有 setdefault 自动填充（compilation_config 就是例子），下游显式设的某些值会与 setdefault 自动填的形成矛盾。审 verl 类似自动 fill 行为：`grep -rn "setdefault\|_apply_quantization" verl/workers/`。
+
+### 13.20 删 obs 历史 vllm engine_kwargs（W2.17）
+
+**触发**：W2.16 改 enforce_eager 后 vllm worker 仍 exit 2。Ray log 显示真实 vllm CLI parse error：
+
+```
+:job_id:02000000
+:actor_name:InstrumentedvLLMHttpServer
+usage: default_worker.py [-h] {serve} ...
+default_worker.py: error: unrecognized arguments: --swap-space 0
+```
+
+**根因**：obs 历史脚本通过 verl 的 `engine_kwargs.vllm.<key>=...` 透传机制给 vllm CLI 加了 3 个参数：
+
+```bash
++actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
++actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
++actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
+```
+
+verl 把它们转成 `--swap-space 0` 等 vllm CLI args。**vllm-ascend 不识别这些参数**（vllm-ascend fork 早，vllm 主线后加的 args 没跟）。
+
+verl 自己脚本根本不设这三个，靠 vllm 默认 → 能跑通。
+
+**修复**：注释三行，对齐 verl 默认。tool call 必需的两个保留：
+
+```bash
+# 保留
++actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True   # tool call 必需
++actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=qwen3_coder    # 同
+
+# 注释（vllm-ascend 不识别）
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=0
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb=0
+# +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=False
+```
+
+**vllm-ascend 不识别的 vllm 参数**：累计这次 + 之前 (`--logprobs_mode processed_logprobs` 等)，后续如需 disable swap / prefix_caching 要查 vllm-ascend 对应参数名（可能 vllm-ascend 用 `--ascend-swap-space` 之类的）。
+
+**Audit 教训补充（§13.13 第 9 条）**：
+
+9. **vllm-ascend 是 vllm 的 fork，CLI 参数与 vllm 主线有 lag**。obs 历史脚本可能是为 GPU+vllm 写的，迁到 vllm-ascend 上时凡是 `engine_kwargs.vllm.*` 透传的参数都要"上下游 fork 是否同步"逐个验证。最简方式：删到只剩业务必需的（如 tool_call_parser），其他靠默认。
+
+**W2.17 体现的 audit 模式**（连续 W2.15/W2.16/W2.17 三次都是同一类）：
+
+```
+obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过
+```
+
+W2.15 删 HCCL_IF_IP 硬编码 / W2.16 改 enforce_eager / W2.17 删 vllm engine_kwargs，全是同样模式。剩余可疑 obs 历史 env / config：
+
+- `actor_rollout_ref.rollout.max_num_seqs=4`（vllm-ascend 应该支持但 verl 默认不设）
+- `actor_rollout_ref.rollout.max_num_batched_tokens=8192`（同）
+- `actor_rollout_ref.rollout.enable_chunked_prefill=True`（同）
+- `actor_rollout_ref.rollout.free_cache_engine=True`（同）
+- `++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096`（同）
+- 顶部 env：`ASCEND_LAUNCH_BLOCKING=1` / `VLLM_ATTENTION_BACKEND=TORCH_SDPA` / `PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` / `VLLM_ENGINE_ITERATION_TIMEOUT_S=...` / `RAY_DEBUG_POST_MORTEM=0` / `RAY_DEDUP_LOGS=0` / `VLLM_ASCEND_ENABLE_NZ=0` / `OOM_SNAPSHOT_*`
+
+这些先不动（"非必要不改"原则），等 L2b 跑过看哪些真的是必需的，再视情况清理。
