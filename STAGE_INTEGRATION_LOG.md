@@ -126,11 +126,84 @@ stage1 用的那个 `verl_engine.py`（`rllm/engine/rollout/verl_engine.py`）�
 ## 后续工作
 
 - [x] 核实 `35bd9e05` → 必要（改 `rllm/engine/rollout/verl_engine.py:87`）
-- [ ] W2 阶段 review：决定 stage1 路径搭建 + 第一轮 debug 的 16 条 commits 哪些必要
+- [x] W2 阶段 review + squash 整合（见下方 §W2）
 - [ ] W2.20-W2.30 deep debug 阶段 review：14 条都是核心 bug fix，预期大多数必要
 - [ ] Stage2 阶段 review：6 条 commits，跟 stage1 强耦合
-- [ ] 出整合 cherry-pick 计划：从 b2538771 依次 cherry-pick 必要 commits
 - [ ] 跑回归 sanity（L3）确认整合后链路完整
+- [ ] **stage3+ cleanup commit**：替换 `dbg()` helper 为标准 `logger.debug(...)`（agent_sdk_trainer.py + openhands_agent.py）；reconcile plan markdown version reference in script header
+
+---
+
+## W2 Setup + Debug Round 1 Review (16 commits → 1 squash commit)
+
+**最终决策**：全部 11 个必要 commit squash 成单 commit `feat(stage1): training script for Qwen3.6-35B-A3B × OpenHands × NPU` (`d810e758`)，每个 fix 的技术决策保留在脚本 inline 注释里。5 个剔除 (`c1ff82e3` + 4 个 mock/test infra)。
+
+### 各 commit 一句话回顾
+
+| Commit | 决策 | 一句话 |
+|---|---|---|
+| `c1ff82e3` | ❌ 剔除 | 修 `3c8ee08d` (R2/R3) 副作用，3c8ee08d 已剔除 |
+| `5082c854` W2.2 | ✅ 合并 | 新建 train script baseline（v2.5 hydra config + 8-NPU 并行度 TP=2 EP=4） |
+| `b07a55d7` W2.0 | ❌ 剔除 | layered test infra（mock LLM / mock rollout / preflight / orchestrator）开发期工具 |
+| `d1fda898` W2.9 | ✅ 合并 | `vanilla_mbridge=False`（NPU 必须 NVIDIA Megatron-Bridge，pypi mbridge 0.15.1 不识别 qwen3_5_moe） |
+| `25054b71` W2.10 | ✅ 合并 | 18 处对齐 verl NPU 分支（13 个 outright omission + 5 个 coupled-config） |
+| `845a0585` W2.11 | ✅ 合并 | batch sanity（DP_SIZE / PPO_MINI_BATCH_SIZE 约束 fail-fast 检查） |
+| `bd475579` | ❌ 剔除 | prepare_npu_operator_data.py mock 数据准备工具 |
+| `d4482bf1` W2.12 | ❌ 剔除 | --source mock 选项 |
+| `ecda05d7` W2.13 | ❌ 剔除 | mock 数据准备脚本的 prompt schema fix |
+| `4073fb1d` W2.14 | ✅ 合并 | Megatron-Bridge PYTHONPATH 3-路 dispatch（source clone / pip / WARN） |
+| `fff72535` W2.15 | ✅ 合并 | drop hardcoded HCCL_IF_IP；改为 env opt-in（audit lesson #7） |
+| `e480c657` W2.16 | ✅ 合并 | enforce_eager=False 默认（vllm setdefault cudagraph_mode + enforce_eager=True 冲突） |
+| `86065972` W2.17 | ✅ 合并 | 删 obs-legacy 3 个 vllm engine_kwargs（swap_space / cpu_offload_gb / enable_prefix_caching，vllm-ascend 不识别） |
+| `07d98394` | ✅ 合并 | 路径标准化 1：MODEL_PATH / ARTIFACT_DIR / TRACE_DB_PATH / logs / SAVE_PATH 从 `/home/t00893162/` → `/home/docker/` + `/workspace/results/` |
+| `4dfb7dc9` | ✅ 合并 | 路径标准化 2：撤回 07d98394 留的 `/workspace/rllm-071/...` 用户特定 hardcode |
+| `6b1f522e` | ✅ 合并 | 路径标准化 3：`dbg()` log path 改 `/workspace/results/`；注释 `ASCEND_LAUNCH_BLOCKING=1`（改 `# debug only` 替代原 `# TODO`） |
+
+### Squash 实施细节
+
+执行步骤：
+1. `git reset --hard 50ab196d`（回 W1 末）
+2. `git cherry-pick 8d8b1fe6`（plan baseline 独立 commit）
+3. `git cherry-pick --no-commit -X theirs` 11 个 W2 必要 commit（plan markdown 冲突自动接 incoming）
+4. Edit train script line 49 `# TODO` → `# debug only`（唯一需要补的注释；其余 inline 注释 cherry-pick 时已经齐了）
+5. `git commit` 一次 squash 全部 staged changes
+6. update STAGE_INTEGRATION_LOG.md（本节）
+
+### 注释下放清单（已在脚本里完成）
+
+每条 fix 在脚本中的 inline 注释位置（读者直接看脚本就能 follow 决策）：
+
+| Fix | 脚本注释位置 |
+|---|---|
+| vanilla_mbridge=False (W2.9) | `.sh` line 310-313, 373（两路 actor/ref + 详细 root cause） |
+| 18 omissions (W2.10) | `.sh` 各参数旁标 `verl NPU case :191` 等来源 |
+| batch sanity (W2.11) | `.sh` line 167-194（约束公式 + fail-fast assertion） |
+| Megatron-Bridge PYTHONPATH (W2.14) | `.sh` line 114-126（3-路 dispatch + WARN） |
+| HCCL env opt-in (W2.15) | `.sh` line 52-67（详细 obs hardcode root cause + opt-in 用法） |
+| enforce_eager=False (W2.16) | `.sh` line 385-390（cudagraph setdefault 冲突说明） |
+| drop obs vllm kwargs (W2.17) | `.sh` line 411-415（删的 3 个 kwargs 列出 + vllm-ascend CLI lag 原因） |
+| 路径标准化 | 不需要注释（路径已是标准值） |
+| ASCEND_LAUNCH_BLOCKING 注释 | `.sh` line 49（`# debug only` 替代原 `# TODO`） |
+
+### dbg() helper 处理
+
+**保留到 stage3+ cleanup commit 一次性处理**：
+
+- 当前状态：`agent_sdk_trainer.py:dbg()` 用 `/workspace/results/` 路径（W2 squash 合并后的版本，从 6b1f522e 来）
+- 同样 dbg() helper 在 `examples/openhands_sdk/openhands_agent.py` 也有
+- 多处 `dbg(...)` 调用散布在 W2 / W3 / stage2 各阶段
+- 如果 W2 时就删 dbg → W3 / stage2 cherry-pick 时撞冲突
+- 决策：W2/W3/stage2 全部整合完后，加单独 cleanup commit 替换 `dbg(...)` 为 `logger.debug(...)` 或直接删
+
+### 修订后统计
+
+**16 → 11 必要 → squash 成 1 commit**。剔除占比 31%，整合 commit 数压缩 91%。
+
+### Verify 方法论补充
+
+3 条 commit message 写得像 dev iteration 临时改动（`"customize"` / `"change"`），实际是 path 标准化——**必须读 patch 才能区分**，不能只看 commit message。
+
+新增 verify check：commit message 含 `"customize"` / `"change"` / `"hack"` / `"tmp"` / `"fix me"` 等"非正式"词时，强制 `git show` 完整 patch。
 
 ---
 
@@ -206,3 +279,6 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 | 2026-05-28 | `697afd79` 保留 | `metrics.py` 是这个 PR 新建，`calculate_debug_metrics_compat` 是 stage1 `agent_sdk_trainer.py:506` 的直接依赖 |
 | 2026-05-28 | `74721f13` 保留 | Qwen3.5 chat template parser 是 Qwen3.6 实际使用的 parser |
 | 2026-05-28 | `35bd9e05` 升级为 ✅ 必要 | 第一轮 verify 只读 `git show --stat` 前 2 行，漏看了关键的 `rllm/engine/rollout/verl_engine.py:87` truncate 调用——stage1 用的就是这个文件，修的 EOS-后多余 token 截断 bug 在 SDK 路径同样存在；review 方法论同步加严（见 §W1 末段） |
+| 2026-05-29 | W2 mock/test infra 全部剔除 | b07a55d7 / bd475579 / d4482bf1 / ecda05d7 都是开发期辅助工具，整合分支只保留生产代码 baseline |
+| 2026-05-29 | W3/Stage2 review 工作流改为"先 log 等用户确认 + 再 cherry-pick" | 避免直接 cherry-pick 后再回退 |
+| 2026-05-29 | W2 最终方案：11 个必要 commit squash 成 1 个 + 决策下放到脚本 inline 注释 | 整合分支是生产代码 baseline 不是 debug archive；git log 简洁、技术决策就近、读脚本直接 follow 决策；dbg() helper 推迟到 stage3+ cleanup commit 一次性删 |
