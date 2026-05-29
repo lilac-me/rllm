@@ -127,9 +127,9 @@ stage1 用的那个 `verl_engine.py`（`rllm/engine/rollout/verl_engine.py`）�
 
 - [x] 核实 `35bd9e05` → 必要（改 `rllm/engine/rollout/verl_engine.py:87`）
 - [x] W2 阶段 review + squash 整合（见下方 §W2）
-- [ ] W2.20-W2.30 deep debug 阶段 review：14 条都是核心 bug fix，预期大多数必要
-- [ ] Stage2 阶段 review：6 条 commits，跟 stage1 强耦合
-- [ ] 跑回归 sanity（L3）确认整合后链路完整
+- [x] W3 阶段 review + squash 拆分 (3 commits)（见下方 §W3）
+- [x] Stage2 阶段 review + squash 拆分 (5 commits)（见下方 §Stage2）
+- [ ] 跑回归 sanity（L3）确认整合后链路完整（需要环境）
 - [ ] **stage3+ cleanup commit**：替换 `dbg()` helper 为标准 `logger.debug(...)`（agent_sdk_trainer.py + openhands_agent.py）；reconcile plan markdown version reference in script header
 
 ---
@@ -288,6 +288,77 @@ Trade-off：W3 阶段整合分支多 2 个 commit（从 1 个变 3 个），换�
 4. Group 3: 同上 `dd229d51 5eb4224f c4efcc07` → commit `35f12439`
 
 最终 W3 阶段贡献 4 commits：1 log + 3 squash commits。
+
+---
+
+## Stage2 Review (8 commits → 5 squash commits)
+
+Stage2 是这次对话从一开始做的工作——audit + 实施工作 + 配套修复（本对话内 task #1-#10 对应的 8 个 commits）。整合到 verl-main 时按 logical sub-theme 拆 5 个 squash commit。
+
+### 8 个 input commits 分类决策
+
+| 原 commit | 决策 | 一句话 |
+|---|---|---|
+| `82d01ab3` audit doc + plan locks | ✅ → Group 1 | STAGE2_FIT_LOOP_AUDIT.md (新建 155 行) + plan §14.5 加 stage2 lock 表行 (use_critic / sum_pi_squared / rejection_sample)；性质：docs only |
+| `38f18b10` trainer audit fix | ✅ → Group 2 | fit_agent 全 drop 兜底 continue + driver 侧 rollout_log_probs 填充率 metric + MFU observability 提取 |
+| `a22295a5` engine audit fix | ✅ → Group 2 | 删 hardcoded `max_prompt_length = 16384` + DEBUG print 残留 + engine 侧 rollout_log_probs 填充率统计 (透出 meta_info) |
+| `0dce238c` plan soft-constraint backfill | ✅ → Group 1 | plan §0.1 / §0.2 "可调 / 起步" → "已实测 = X" + footer note (verl 权威基线 vs stage1 锁定值区别) |
+| `b3a82c4f` openhands runtime cleanup | ✅ → Group 3 | 默认 docker rm -f + KEEP_OPENHANDS_CONTAINER=1 escape；默认 shutil.rmtree workspace + KEEP_OPENHANDS_WORKSPACE=1 escape；恢复 _CONTAINER_TIMEOUT 在 docker wait 生效 |
+| `c8412e94` Dr.GRPO 决策 | ✅ → Group 4 | 删 random fallback (reward=0.0) + algorithm.norm_adv_by_std_in_grpo=False (Dr.GRPO) + rollout/std0_groups + rollout/std0_rate metric |
+| `3362e70a` 诊断 metric | ✅ → Group 2 | reward/{mean, std, max, zero_rate} + adv/{has_nan, has_inf, abs_max} defense + prompt_length/{raw_p50, raw_p95, raw_max, raw_mean, filtered_rate} |
+| `6324d5f6` DooD precheck FATAL | ✅ → Group 5 | train script `docker ps` FATAL 检查 + workspace fstype overlay/tmpfs WARN → FATAL 升级 |
+
+全部 8 个 commits 都必要——是本对话内为整合分支专门做的工作。**0 个剔除**。
+
+### 5 个 squash commit 输出
+
+| # | Commit subject | 包含 input commits | 性质 |
+|---|---|---|---|
+| 1 | `docs: stage2 fit-loop audit + plan config locks` | 82d01ab3 + 0dce238c | docs / plan |
+| 2 | `fix: stage2 audit findings + observability metrics` | 38f18b10 + a22295a5 + 3362e70a | **核心 audit fix + 配套 metric** |
+| 3 | `fix(openhands): container/workspace cleanup + docker wait timeout` | b3a82c4f | 独立运维 |
+| 4 | `feat(stage1): Dr.GRPO + std0 metric (drop random fallback)` | c8412e94 | 算法决策 |
+| 5 | `fix(train-script): DooD precheck FATAL` | 6324d5f6 | 独立 precheck |
+
+### 拆分逻辑（继承 W3 拆分经验）
+
+跟 W3 拆 3 个 commit 同精神——按 logical sub-theme 拆，避免把不相关子系统混在 1 commit 里：
+
+- **Group 1（docs）独立**：跟 W1/W2/W3 docs 同 pattern
+- **Group 2（audit + observability 合并）**：38f18b10 / a22295a5 / 3362e70a 三者性质强相关（都是 audit 主线产物 — 漏 port 修复 + 配套观测）
+- **Group 3（openhands runtime）独立**：性质完全不同（运维/稳定性），独立 visible
+- **Group 4（算法决策）独立**：Dr.GRPO 是关键算法选择决策（删 fallback + Dr.GRPO + std0 metric 三者强相关），独立 visible
+- **Group 5（precheck）独立**：debug session 沉淀的独立 startup fix
+
+### 特殊 cherry-pick 处理
+
+`c8412e94` (Group 4) 的 `openhands_agent.py` 改动跟 W3 squash 已经手工 apply 的 `reward = 0.0` 一致；cherry-pick 时 -X theirs 接受 incoming，结果跟 working tree 一致没新增 diff。其他 3 文件（train.sh / agent_sdk_trainer.py / plan）正常 apply。
+
+### 实施步骤
+
+```bash
+# Group 1
+git cherry-pick --no-commit -X theirs 82d01ab3 0dce238c
+git commit -m "docs: stage2 fit-loop audit + plan config locks"
+
+# Group 2
+git cherry-pick --no-commit -X theirs 38f18b10 a22295a5 3362e70a
+git commit -m "fix: stage2 audit findings + observability metrics"
+
+# Group 3
+git cherry-pick --no-commit -X theirs b3a82c4f
+git commit -m "fix(openhands): container/workspace cleanup + docker wait timeout"
+
+# Group 4
+git cherry-pick --no-commit -X theirs c8412e94
+git commit -m "feat(stage1): Dr.GRPO + std0 metric (drop random fallback)"
+
+# Group 5
+git cherry-pick --no-commit -X theirs 6324d5f6
+git commit -m "fix(train-script): DooD precheck FATAL"
+```
+
+5 个新 commit messages 完全不带 stage1 日志的 W2.X / plan §13.x / audit lesson #X 引用（吸取上一次教训；commit subject + body 都用 logical 描述）。
 
 ---
 
@@ -450,3 +521,5 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 | 2026-05-29 | `OPENHANDS_MAX_ITERATIONS=1` 跟 `rejection_sample.enable=False` 和 `Dr.GRPO` 一致性地保留（都是 stage2 临时 default） | 三者性质相同（接 condenser + reward 稳定后解锁），不能分开处理；剔除任一会破坏 stage2 工作核心成果 |
 | 2026-05-29 | log 加 "整合分支用户接手指南" 章节 | 整合分支不带 mock 工具，L3 不能"直接跑"；用户接手时需明确知道 Step 0 mount / Step 1 验链路 / Step 2 解锁 stage2 default / Step 3 stage3+ 工作 |
 | 2026-05-29 | W3 squash 拆分（初版 1 commit → 拆 3 commit） | W2 squash 合理是因为 11 个 commits 是同一 feature 演进；W3 11 个 commits 跨 OpenHands runtime / 训练脚本 config / Trainer 核心架构 bridge 三个完全不同子系统，1 commit 让 trainer bridge 这种核心架构修复在 git log 不可见；拆 3 个 commit 每个 logical scope 单一 |
+| 2026-05-29 | Commit message rewrite — 6 个 commits 移除 stage1 日志绑定（W2.X / plan §13.x） | 用户校准要求整合分支独立于 stage1 工作日志；用 git filter-branch --msg-filter 一次性重写，commit content 不变；只更新过期 SHA 在 log 文档里的引用 |
+| 2026-05-29 | Stage2 squash 拆 5 commit | 继承 W3 拆分精神——8 个 input commits 跨 audit/observability / runtime / 算法决策 / precheck 4-5 个子系统；按 logical sub-theme 拆 5 个 commit 让每个 scope 单一；audit + observability 合并 1 commit 因为三者性质强相关（都是 audit 主线产物）|
