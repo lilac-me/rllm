@@ -767,19 +767,22 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
 
     workspace = _setup_npu_operator_workspace(task, trace_label)
     instruction = task.get("instruction", "")
-    # Real reward passed through unconditionally. The W2.22-W2.24 random fallback
-    # was introduced under the assumption that all-zero group rewards crash the
-    # PPO step ("std=0 → NaN"). Re-reading verl source disproved that:
+
+    # stage2 A (方案 0+): pass real reward through unconditionally. The W2.22-
+    # W2.24 random fallback was introduced under the assumption that all-zero
+    # group rewards crash the PPO step (plan §13.25 wrote "std=0 → NaN").
+    # Re-reading verl source disproved that:
     #   - core_algos.py:326 — GRPO uses `/ (std + epsilon)` with eps=1e-6,
     #     so std=0 yields advantage=0, not NaN.
-    #   - core_algos.py:315-317 — single-rollout groups get mean=0, std=1 bypass.
-    #   - algorithm.norm_adv_by_std_in_grpo=False (Dr.GRPO; stage2 lock in
-    #     train script) — removes the division entirely.
+    #   - core_algos.py:315-317 — single-rollout groups get mean=0, std=1
+    #     bypass, no division risk.
+    #   - algorithm.norm_adv_by_std_in_grpo=False (Dr.GRPO) — stage2 sets this
+    #     in train_openhands_qwen36_npu.sh, removing the division entirely.
     # Random fallback was treating a symptom that doesn't exist while diluting
-    # real reward variance. Trainer-side observability metrics
-    # (rollout/std0_groups + rollout/std0_rate in agent_sdk_trainer.py) track
-    # how often groups collapse, so stage3+ can decide whether to re-enable
-    # normalization.
+    # real reward variance and confusing diagnostic metrics. Now removed.
+    # Trainer-side observability: rollout/std0_groups + rollout/std0_rate in
+    # agent_sdk_trainer.py track how often groups collapse, so stage3+ can
+    # decide whether to re-enable normalization.
     reward = 0.0
     try:
         output = _run_openhands_container(

@@ -302,6 +302,15 @@ ARGS=(
   algorithm.kl_ctrl.kl_coef=0.0
   # plan §0.2 verl ALGORITHM 段权威：显式设 False（默认应该也是 False，但 stage1 显式更稳）
   algorithm.use_kl_in_reward=False
+  # stage2 A (方案 0+): use Dr.GRPO (https://arxiv.org/abs/2503.20783) — advantage
+  # = (r - group_mean), no /std. Two reasons:
+  #   1. Removes std=0 NaN risk entirely (eliminates need for any rollout-side
+  #      reward fallback; previous random fallback removed in this commit).
+  #   2. _npu_operator_reward outputs reward ∈ [0, 1] so un-normalized advantage
+  #      magnitude stays ≤ 1 → PPO clip behaves normally.
+  # Stage3+ trade-off: re-enable to True for cross-prompt advantage scale
+  # comparability when measuring convergence. Locked False for stage2 per §14.5.
+  algorithm.norm_adv_by_std_in_grpo=False
 
   # =========================
   # data

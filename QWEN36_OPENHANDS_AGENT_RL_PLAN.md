@@ -2380,12 +2380,13 @@ push 到:  origin/qwen36-rllm-compat
 | `actor.use_kl_loss` | **`False`** | §13.7 | stage1 靠 PPO clip，不开 KL term |
 | Workspace path | hardcode **`/home/docker/openhands_workspace`** | W2.20 | DooD 要求 host-visible same-path bind mount |
 | `actor.use_dynamic_bsz` | **`False`** | W2.10 + §0.1 | GDN bshd 模式下显存压力，verl NPU 默认 |
-| MAX_ITERATIONS=1 时的 rollout fallback reward | **`random.random()`** (per-rollout) → **`std=0 兜底`** (stage2 重构后) | W2.22 + W2.24 | GRPO advantage = (r - mean)/std；MAX_ITER=1 下 reward 全 0 std=0 NaN。**stage2 改造**：真 reward 优先，全组 std=0 时才注入 random，避免无脑覆盖真信号 |
+| ~~MAX_ITERATIONS=1 时的 rollout fallback reward~~ | **已删除**（stage2 A 方案 0+）| W2.22 + W2.24 → stage2 A removal | 原假设"std=0 → NaN"被 verl source 验证不成立（`core_algos.py:326` 有 `+ epsilon` 防御）。配合下面 `norm_adv_by_std_in_grpo=False`（Dr.GRPO）彻底绕开 std=0 风险。真 reward 0 直接进 PPO，advantage=0 也是正确语义。trainer 侧 `rollout/std0_groups` metric 监控触发率 |
 | `data.max_response_length` | `4096` | §13.13 | verl NPU 套权威；OpenHands LLM client 默认 max_tokens=2048 也不超 |
 | 单节点并行 | TP=2 PP=1 CP=1 EP=4 ETP=1，rollout TP=8 | §13.13 用户决策 | TP×EP=8 一节点 8 NPU |
 | `use_critic` (trainer-level) | **`False`** | stage2 audit F1/F2 | GRPO 路径不用 critic；rllm `_compute_values`/`_update_critic` 无 bridge（直接传 DataProto 给 critic_wg，缺 `to_tensordict`/`left_right_2_no_padding`/`assign_non_tensor`/`no_padding_2_padding`/`rename_dict` 全套），开了立即崩 |
 | `actor.calculate_sum_pi_squared` | **`False`** | stage1 默认 + stage2 audit F3 | 开了 worker 返 nested tensor，但 rllm `agent_sdk_trainer.py:459-465` 只读 `entropy`+`log_probs`，缺 sum_pi_squared post-process → 下游 `select_idxs` 撞 `NotImplementedError(aten.index.Tensor)` |
 | `rllm.rejection_sample.enable` | **`False`** | stage2 audit F3 + D-rejection | 单 turn 真 reward `is_correct=False` 概率高（agent 没时间写实现）；开了整 batch drop → step skip 饿死；真训练验过 reward 信号稳定（is_correct=True 比例 > drop 阈值）后才能考虑解锁 |
+| `algorithm.norm_adv_by_std_in_grpo` | **`False`** (Dr.GRPO, stage2 only) | stage2 A 方案 0+ | 配合删除 rollout random fallback，彻底绕开 std=0 风险（verl `core_algos.py:326` 自带 epsilon 已防 NaN，Dr.GRPO 更彻底）。`_npu_operator_reward` 输出 [0,1]，不归一化 advantage 量级仍 ≤1，PPO clip 行为正常。**stage3+ 真训练前切回 `True`**（一行 config）以获得跨 prompt advantage scale 可比性 |
 
 **当前位置**：W2.23 fix 后等待 L3 重跑结果。已诊断清楚 trace store / session_uid / max_prompt_length 全链路；上一次 L3 跑全部子链路通到 `transform_results_for_verl`，因 step 过滤阈值过低被全 drop。fix 后 step 应能放行，期望挂点回到 PPO step 真挂这种"上游链路全通"的位置。
 

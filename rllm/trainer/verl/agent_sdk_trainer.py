@@ -636,17 +636,6 @@ class AgentSdkTrainer(RayPPOTrainer):
                                     _std0_groups += 1
                             metrics["rollout/std0_groups"] = _std0_groups
                             metrics["rollout/std0_rate"] = _std0_groups / max(1, len(_unique_uids))
-                            # stage2 D: reward distribution (per-rollout
-                            # scalars). zero_rate is the fraction of rollouts
-                            # with reward == 0 (e.g. agent wrote no impl file
-                            # under _npu_operator_reward); reward range is
-                            # bounded [0, 1] by _npu_operator_reward design.
-                            metrics["reward/mean"] = float(_per_rollout_reward.mean().item())
-                            metrics["reward/std"] = float(_per_rollout_reward.std().item())
-                            metrics["reward/max"] = float(_per_rollout_reward.max().item())
-                            metrics["reward/zero_rate"] = float(
-                                (_per_rollout_reward.abs() < 1e-8).sum().item()
-                            ) / max(1, _per_rollout_reward.numel())
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(
