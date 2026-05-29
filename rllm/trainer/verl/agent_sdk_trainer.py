@@ -18,6 +18,15 @@ from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.core_algos import agg_loss
+# W2.27 (rllm-side mid-migration bridge for compute_log_prob / update_actor):
+# verl's RayPPOTrainer._compute_old_log_prob / _compute_ref_log_prob / _update_actor
+# explicitly convert DataProto → TensorDict + left_right_2_no_padding + assign metadata
+# before calling worker (see verl ray_trainer.py:1188-1289). rllm AgentSdkTrainer
+# was missing these bridges, sending DataProto where worker expects TensorDict.
+# See plan §13.30. To be removed when verl PR #2733 part-N finishes migration.
+from verl.utils import tensordict_utils as tu
+from verl.utils.py_functional import rename_dict
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -405,6 +414,19 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # W2.28: mirror verl fit:1394-1395 — set temperature on batch.meta_info
+                    # ONCE per PPO iter, before any worker call. Megatron forward_step
+                    # (verl/workers/engine/megatron/transformer_impl.py:841) reads
+                    # `batch["temperature"]` with no default — KeyError if missing.
+                    # verl trainer sets it in fit() main loop; rllm's transform_results_for_verl
+                    # path doesn't, so we mirror it here. Also set multi_turn for parity
+                    # (currently no reader in verl, but verl _update_actor:1251 sets it).
+                    _rollout_cfg = self.config.actor_rollout_ref.rollout
+                    batch.meta_info["temperature"] = _rollout_cfg.temperature
+                    batch.meta_info["multi_turn"] = (
+                        _rollout_cfg.multi_turn.enable if hasattr(_rollout_cfg, "multi_turn") else False
+                    )
                     if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                         images_seqlens_all = []
                         for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -415,7 +437,34 @@ class AgentSdkTrainer(RayPPOTrainer):
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # W2.27 bridge: mirror verl RayPPOTrainer._compute_old_log_prob (ray_trainer.py:1212-1226)
+                        batch_td = batch.to_tensordict()
+                        batch_td = left_right_2_no_padding(batch_td)
+                        calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+                        tu.assign_non_tensor(
+                            batch_td,
+                            calculate_entropy=True,
+                            calculate_sum_pi_squared=calculate_sum_pi_squared,
+                            compute_loss=False,
+                        )
+                        old_log_prob_td = self.actor_rollout_wg.compute_log_prob(batch_td)
+                        # W2.30: mirror verl _compute_old_log_prob:1227-1246 post-processing.
+                        # Worker output contains nested tensors (because input was nested via
+                        # left_right_2_no_padding); rllm downstream `old_log_prob.batch["entropys"]`
+                        # + `batch.union(old_log_prob)` + later `batch.select_idxs(...)` all assume
+                        # regular padded tensors. Need: extract fields + no_padding_2_padding +
+                        # rename keys (worker emits "log_probs"/"entropy", rllm reads "old_log_probs"/
+                        # "entropys"). Without this, select_idxs hits NotImplementedError(aten.index.Tensor)
+                        # on the nested tensor.
+                        if old_log_prob_td is not None:
+                            _entropy = tu.get(old_log_prob_td, "entropy")
+                            _log_probs = tu.get(old_log_prob_td, "log_probs")
+                            _entropy = no_padding_2_padding(_entropy, batch_td)
+                            _log_probs = no_padding_2_padding(_log_probs, batch_td)
+                            _result = {"old_log_probs": _log_probs.float(), "entropys": _entropy.float()}
+                            old_log_prob = DataProto.from_tensordict(tu.get_tensordict(_result))
+                        else:
+                            old_log_prob = None
 
                         if "entropys" in old_log_prob.batch:
                             entropys = old_log_prob.batch["entropys"]
@@ -451,10 +500,27 @@ class AgentSdkTrainer(RayPPOTrainer):
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
+                            # W2.27 bridge: mirror verl RayPPOTrainer._compute_ref_log_prob (ray_trainer.py:1188-1210)
+                            ref_batch_td = batch.to_tensordict()
+                            ref_batch_td = left_right_2_no_padding(ref_batch_td)
+                            ref_metadata = {"calculate_entropy": False, "compute_loss": False}
+                            if self.ref_in_actor:
+                                ref_metadata["no_lora_adapter"] = True
+                            tu.assign_non_tensor(ref_batch_td, **ref_metadata)
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob_td = self.ref_policy_wg.compute_ref_log_prob(ref_batch_td)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                ref_log_prob_td = self.actor_rollout_wg.compute_ref_log_prob(ref_batch_td)
+                            # W2.30: mirror verl _compute_ref_log_prob:1203-1208 post-processing
+                            # (extract log_probs + no_padding_2_padding + rename to "ref_log_prob")
+                            if ref_log_prob_td is not None:
+                                _ref_log_probs = tu.get(ref_log_prob_td, "log_probs")
+                                _ref_log_probs = no_padding_2_padding(_ref_log_probs, ref_batch_td)
+                                ref_log_prob = DataProto.from_tensordict(
+                                    tu.get_tensordict({"ref_log_prob": _ref_log_probs.float()})
+                                )
+                            else:
+                                ref_log_prob = None
                             batch = batch.union(ref_log_prob)
 
                     # compute values
@@ -531,7 +597,38 @@ class AgentSdkTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            # W2.27 bridge: mirror verl RayPPOTrainer._update_actor (ray_trainer.py:1249-1289)
+                            # Note (W2.28): batch.meta_info["temperature"]/["multi_turn"] already set
+                            # globally above (next to global_token_num); not duplicating here.
+                            rollout_cfg = self.config.actor_rollout_ref.rollout
+                            update_batch_td = batch.to_tensordict()
+                            update_batch_td = left_right_2_no_padding(update_batch_td)
+                            actor_cfg = self.config.actor_rollout_ref.actor
+                            _calc_entropy = bool(getattr(actor_cfg, "calculate_entropy", False)) or (actor_cfg.entropy_coeff != 0.0)
+                            _ppo_mini_batch_size = actor_cfg.ppo_mini_batch_size * rollout_cfg.n
+                            tu.assign_non_tensor(
+                                update_batch_td,
+                                calculate_entropy=_calc_entropy,
+                                distillation_use_topk=False,  # stage1 no distillation
+                                global_batch_size=_ppo_mini_batch_size,
+                                mini_batch_size=_ppo_mini_batch_size,
+                                epochs=actor_cfg.ppo_epochs,
+                                seed=getattr(actor_cfg, "data_loader_seed", 1),
+                                dataloader_kwargs={"shuffle": getattr(actor_cfg, "shuffle", False)},
+                                compute_loss=True,
+                            )
+                            actor_output_td = self.actor_rollout_wg.update_actor(update_batch_td)
+                            # W2.30: mirror verl _update_actor:1283-1287 post-processing
+                            # (extract metrics + rename_dict("actor/") + perf/mfu/actor key swap +
+                            # from_single_dict). rllm downstream reads actor_output.meta_info["metrics"].
+                            if actor_output_td is not None:
+                                _metrics = tu.get(actor_output_td, "metrics")
+                                _metrics = rename_dict(_metrics, "actor/")
+                                if "actor/mfu" in _metrics:
+                                    _metrics["perf/mfu/actor"] = _metrics.pop("actor/mfu")
+                                actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": _metrics})
+                            else:
+                                actor_output = None
 
                         # save checkpoint
                         if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
