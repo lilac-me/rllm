@@ -198,6 +198,54 @@ AgentSdkTrainer fix, referencing issue #350.
 
 [remote_eval_worker.py:261](examples/openhands_sdk/remote_eval_worker.py:261) checks this env to skip the per-rollout `rmtree`. Useful for postmortem inspection of failed rollouts. Documented here, no automated lifecycle.
 
+### KU8. LiteLLM proxy startup non-determinism on flaky network
+
+**Symptom**: `bash debug_oom.sh` sometimes works, sometimes fails with
+`TimeoutError: Proxy server did not start within 30.0s` at
+[proxy_manager.py:244](rllm/sdk/proxy/proxy_manager.py:244). Same machine,
+same config, back-to-back runs — pure non-determinism.
+
+**Root cause**: LiteLLM synchronously fetches
+`https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`
+inside `get_model_cost_map.py:271` during startup. The fetch result is
+non-essential (LiteLLM has a local fallback), but the fetch **blocks
+startup**. On flaky outbound network the timing varies:
+- DNS hit + TCP connect ok → fetch < 5s → server ready inside rllm's 30s window ✓
+- DNS slow / TCP timeout to GitHub → fetch blocks > 30s → rllm
+  `_wait_for_server_start` times out before LiteLLM finishes init ✗
+
+Trainer log evidence (3 occurrences across two attempts):
+```
+LiteLLM:WARNING: get_model_cost_map.py:271 — LiteLLM: Failed to fetch
+remote model cost map ... [Errno 101] Network is unreachable. Falling
+back to local backup.
+```
+
+**Fix (operator-side, no code change)**: set in shell / env before
+`debug_oom.sh`:
+```bash
+export LITELLM_LOCAL_MODEL_COST_MAP="True"
+```
+This makes LiteLLM skip the remote fetch entirely and use the bundled
+local map. Startup drops to < 5s, fully deterministic.
+
+**Verify env name matches your LiteLLM version**:
+```bash
+LITELLM_DIR=$(python3 -c 'import litellm, os; print(os.path.dirname(litellm.__file__))')
+grep -nE 'LITELLM_LOCAL|os.environ' $LITELLM_DIR/litellm_core_utils/get_model_cost_map.py | head
+```
+
+**Long-term framework fixes** (not done in this branch):
+1. rllm `proxy_manager.py:_wait_for_server_start` hardcodes
+   `timeout=30.0`. Should be env-configurable (`RLLM_PROXY_START_TIMEOUT`)
+   so slow networks aren't outright blocked. ~2 line change.
+2. rllm `proxy_manager.py` could set
+   `LITELLM_LOCAL_MODEL_COST_MAP=True` by default when launching the
+   subprocess, removing the trap entirely. Even cleaner: just `env=...`
+   to the `subprocess.Popen` call.
+
+Recorded as an upstream contribution candidate.
+
 ## Verified facts (don't re-debate)
 
 - `--network host` on dev container is required for trainer ↔ host-worker on `127.0.0.1` to work (verified via `ip route` showing host LAN as default).
