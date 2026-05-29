@@ -263,14 +263,31 @@ MAX_ITER=1 看起来像调试值，但本质上跟 plan §14.5 其他两个 stag
 
 三者要么一起留，要么一起剔。后两者是 stage2 工作核心成果不能剔，所以 MAX_ITER=1 同保留。stage3+ cleanup 时三个一起解锁。
 
-### W3 squash 计划
+### W3 squash 计划（初版 → 拆分版）
 
-执行顺序：
-1. cherry-pick W3 9 个 clean commits + partial W2.22（带 -X theirs，跟 W2 squash 同模式）
-2. manual edit `openhands_agent.py` 把 W2.22 引入的 `reward = random.random()` 撤回成 `reward = 0.0`
-3. 一次 commit 所有 staged：`feat(stage1): L3 unblock + trainer DataProto→TensorDict bridge (W2.18-W2.30)`
+**初版尝试**：11 个必要 commit 全部 squash 成 1 个 commit。第一次按 W2 squash 同模式做出来后回头评估，发现：
 
-新增 1 个 squash commit + 1 个 log update commit。
+- W2 11 个 commits 是"同一 feature 演进"（训练脚本逐步对齐），squash 成 1 commit 合理
+- **W3 11 个 commits 跨 3 个完全不同子系统**：OpenHands runtime / 训练脚本 config / Trainer 核心架构 bridge —— squash 成 1 commit 让 trainer bridge 这种**核心架构修复**埋在 git log 里看不见
+
+**拆分版**（最终采用）：拆 3 个 commit，每个 logical scope 单一：
+
+| # | Commit message | 包含原 commits | 性质 |
+|---|---|---|---|
+| 1 | `fix(openhands): DooD workspace alignment + diag tool (W2.20-W2.23 runtime path)` | feb85471 + bedbb1b0 + 15686e0e + e2ff129f | OpenHands runtime / DooD |
+| 2 | `fix(stage1): L3 unblock — context/iter/padding configs (W2.21-W2.29)` | e5e6c9ce + 2a2fdbb7 (partial) + 4f941da2 + 81cb31f0 | 训练脚本 / algorithm config |
+| 3 | `fix(trainer): AgentSdkTrainer DataProto→TensorDict bridge (W2.27/W2.28/W2.30)` | dd229d51 + 5eb4224f + c4efcc07 | **核心架构 fix** |
+
+Trade-off：W3 阶段整合分支多 2 个 commit（从 1 个变 3 个），换来 trainer bridge 这种核心修复在 git log 直接 visible + 单子系统 revert 容易。
+
+**实施步骤**：
+
+1. `git reset --hard 505859d5`（回 W3 log 之后，丢弃初版 squash）
+2. Group 1: `git cherry-pick --no-commit -X theirs feb85471 bedbb1b0 15686e0e e2ff129f` → commit `7893663a`
+3. Group 2: 同上 `e5e6c9ce 2a2fdbb7 4f941da2 81cb31f0` → manual edit `openhands_agent.py` 撤回 W2.22 random fallback + 删 `import random` → commit `31f0529f`
+4. Group 3: 同上 `dd229d51 5eb4224f c4efcc07` → commit `ab5efdc2`
+
+最终 W3 阶段贡献 4 commits：1 log + 3 squash commits。
 
 ---
 
@@ -432,3 +449,4 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 | 2026-05-29 | W3 14 commits → 1 squash commit；剔除 mock W2.18 + DooD 中间态 fdb8e236 + fallback 修补 W2.24；W2.22 partial cherry-pick（保留 MAX_ITER=1，跳过 random fallback hunk）| 跟 W2 同方针——squash 生产代码 baseline + 决策保留脚本注释；W2.22 partial 避免 squash 里带"stage2 A 将撤销代码" |
 | 2026-05-29 | `OPENHANDS_MAX_ITERATIONS=1` 跟 `rejection_sample.enable=False` 和 `Dr.GRPO` 一致性地保留（都是 stage2 临时 default） | 三者性质相同（接 condenser + reward 稳定后解锁），不能分开处理；剔除任一会破坏 stage2 工作核心成果 |
 | 2026-05-29 | log 加 "整合分支用户接手指南" 章节 | 整合分支不带 mock 工具，L3 不能"直接跑"；用户接手时需明确知道 Step 0 mount / Step 1 验链路 / Step 2 解锁 stage2 default / Step 3 stage3+ 工作 |
+| 2026-05-29 | W3 squash 拆分（初版 1 commit → 拆 3 commit） | W2 squash 合理是因为 11 个 commits 是同一 feature 演进；W3 11 个 commits 跨 OpenHands runtime / 训练脚本 config / Trainer 核心架构 bridge 三个完全不同子系统，1 commit 让 trainer bridge 这种核心架构修复在 git log 不可见；拆 3 个 commit 每个 logical scope 单一 |
