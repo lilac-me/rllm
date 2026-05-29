@@ -134,7 +134,10 @@ def create_parquet(output_path: str) -> None:
     rows = []
     for task in _MOCK_TASKS+_MOCK_TASKS+_MOCK_TASKS+_MOCK_TASKS:
         instruction = task["instruction"]
-        prompt = json.dumps([{"role": "user", "content": instruction}])
+        # MUST be list[dict] not JSON string — verl _build_messages / doc2len
+        # call tokenizer.apply_chat_template(doc[prompt_key], ...) directly
+        # with no json.loads; a string crashes jinja with "No user query found".
+        prompt = [{"role": "user", "content": instruction}]
         extra_info = {
             "instruction": instruction,
             "scenario": "npu_operator",
