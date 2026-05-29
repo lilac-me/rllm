@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B × OpenHands Agentic RL 开发计划
 
 > 生成时间：2026-05-23
-> 修订时间：2026-05-25 (v2.16 — 删 obs 历史 vllm engine_kwargs，vllm-ascend 不识别 --swap-space 等；新增 §13.20)
+> 修订时间：2026-05-26 (v2.20 — W2.20 DooD workspace path alignment：L3 首跑容器空 workspace 退出，根因 `workspace_temp` 在 main container overlay 上、宿主 dockerd 看不见。修：hardcode `/home/docker/openhands_workspace` + 训练脚本加 fail-fast precheck + 用户加同路径 bind mount。新增 §13.23 + audit 教训第 12 条)
 > 配套分析文档：[UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md](./UPSTREAM_DELTA_QWEN36_AGENT_TRAINING_ANALYSIS.md)
 
 ## 范围声明（v2.2）
@@ -887,6 +887,10 @@ git -C ../vllm-ascend log --oneline -3
 | 2026-05-25 | v2.14 | **L2b 在 Megatron-Bridge load_weights_hf_to_megatron → torch.distributed.broadcast 挂 HCCL error code 6（W2.15）**。**用户关键提示**：verl 自己跑 Qwen3.6 OK，rllm 基于 verl，所以问题在 rllm 这层引入。根因：obs 历史脚本硬编码 `HCCL_IF_IP=80.48.5.88` + `nic_name=ens1f3`，当前 NPU 节点 IP 是 80.48.5.65，HCCL_IF_IP 不存在 → HcclGetRootInfo 挂。verl 自己脚本 env 段只有 3 行（`CUDA_DEVICE_MAX_CONNECTIONS` / `VLLM_USE_V1` / `VLLM_ALLREDUCE_USE_SYMM_MEM`），没设这些 HCCL/socket env，靠容器默认。修：改成 opt-in 模式，`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE` env 才生效。Audit 教训第 7 条：硬编码 IP/MAC/NIC 跨机必爆，machine-specific identifier 不允许进库代码。**Audit 策略调整**：W2.10 只对齐了 ARGS 段，env 段从 obs 历史继承了 10+ 行硬编码 NPU/HCCL/vLLM env，全是潜在地雷；W2.15 先解决最毒的 HCCL_IF_IP，其他等 L2b 跑过再清理。|
 | 2026-05-25 | v2.15 | **W2.15 修 HCCL 后 vllm worker 启动 exit 2（W2.16）**。继续应用 verl-self-OK 诊断原则：审 verl vllm_async_server.py:237 写死 compilation_config.setdefault cudagraph_mode=FULL_AND_PIECEWISE，无论 user 怎么配 cudagraph 默认开。verl 自己脚本不设 enforce_eager（yaml 默认 false），cudagraph 真生效跑通。我们 obs 历史脚本 enforce_eager=True # TODO 与 cudagraph 矛盾，vllm-ascend worker init 时挂。改成 env 可控默认 False，ROLLOUT_ENFORCE_EAGER=True 可 opt-out。Audit 教训第 8 条：下游覆盖上游默认时要看上游 setdefault 隐式 fill。同时让用户去 /tmp/ray/session_latest/logs/worker-*.err 拿 vllm 真 stderr 验证。|
 | 2026-05-25 | v2.16 | **W2.16 改 enforce_eager 后 vllm worker 仍 exit 2（W2.17）**。拿 ray log 看到真实 vllm error: `unrecognized arguments: --swap-space 0`。obs 历史脚本通过 `engine_kwargs.vllm.<key>=...` 给 vllm CLI 加了 3 个参数（swap_space / cpu_offload_gb / enable_prefix_caching），vllm-ascend 不识别（vllm fork lag）。verl 自己脚本不设这三个，靠 vllm 默认。注释 3 行，保留 tool_call 必需的 2 行。Audit 教训第 9 条：vllm-ascend 是 vllm fork，CLI 参数有 lag；删到只剩业务必需的。**连续 W2.15/W2.16/W2.17 都是同模式**：obs 历史 vs verl-self-OK 差异 → 删 obs 多余 → 跑过；剩余可疑 obs env/config 暂不动，待 L2b 跑过再清理。|
+| 2026-05-25 | v2.17 | **L2b 通过所有 setup 阶段（vllm + LiteLLM + Megatron load + actor.reset 全部 OK），挂在 step 1 start 后 AgentSdkEngine assertion Must be a list of Trajectory（W2.18）**。根因：mock_rollout 返回 list[dict]，但 AgentSdkEngine 接受三种类型（float/list[BaseTrajectory]/tuple），dict 不是 BaseTrajectory 触发 assertion。**真 openhands_agent.rollout 末尾 return reward (float)** 走 (a) float 分支，但它 docstring 写 List with one trajectory dict 误导了我。改 mock_rollout 返回 float 0.5 对齐真 rollout。Audit 教训第 10 条：不要相信 docstring，看 return 语句。L2b 进展：vllm-ascend Qwen3.6 + cudagraph capture + LiteLLM proxy + Megatron-Bridge load Qwen3.6 + HCCL broadcast + actor.reset 全部跑过，整个 setup 链路通；W2.18 之后剩 trainer 内部 mock 数据流 + PPO step。|
+| 2026-05-26 | v2.18 | **L2b mock 路径走完它能走的最远（W2.19）**：W2.18 修后 4 episode 全 rollout success reward 0.5，但 mock_rollout 不调真 LLM，trace store 空，transform_results_for_verl pad_sequence 拿到 empty list 挂。这是 mock 天然边界（PPO step 需要真 token data，标量 reward 不够）。用户决策跳 L2b 进 L3。**L2b setup 验证使命已完成**（W2.8-W2.18 累积验过：rllm import / verl-fork shim / Megatron-Bridge load Qwen3.6 / HCCL / vllm-ascend cudagraph / LiteLLM proxy / actor.reset / step 1 进入 / rollout 调用 / AgentSdkEngine process_task）。新增 §13.22 documenting L2b 边界 + L3 准备清单 + audit 教训第 11 条（分层 mock 设计时先画清覆盖范围 vs 真链路依赖边界）。|
+| 2026-05-26 | v2.19 | **新增 §14 新对话接手指南（Onboarding）**：用户问当前 plan 是否够新对话续工作。补 9 个 subsection：14.1 TL;DR（30 秒回上下文）、14.2 git refs cheatsheet（两仓库当前分支 + 关键 commit）、14.3 NPU 节点环境（本地 vs NPU 路径对照表）、14.4 关键代码文件清单（stage1 入口 / 辅助 / 业务 / shim 分类）、14.5 当前进度 + 下一步（已完成 / 当前位置 / 用户该做的 / L3 挂点预期）、14.6 已知 limitations + 历史踩坑（mock 边界 / verl×vllm-ascend 不兼容 / verl setdefault 暗坑 / 两个 bridge 库 / 数据 schema 陷阱 / verl API 漂移模式 / 机器特定信息不进代码 / stage1 safe config / batch sanity）、14.7 常见用户 prompt → 处理模式表、14.8 哪节看哪个 reference 表、14.9 plan 维护规则。让新对话 Claude 5 分钟内回到上下文。|
+| 2026-05-26 | v2.20 | **L3 首跑 DooD workspace path alignment（W2.20）**：4 个 OpenHands 容器在 ~3s 内全 exit，reward=0.0，trace store 空 → pad_sequence empty list（与 L2b 同症状但根因不同）。根因：rllm 主进程跑在一个 main container 内，`workspace_temp` 写在 main container overlay 上；`openhands_agent` 用 `-v {workspace}:/opt/workspace` 起子容器，**这条 `-v` 由宿主 dockerd 解析**，看不到 main container 内的路径 → 宿主新建空目录挂到子容器 → entrypoint.py 不存在 exit 127。修复（用户决策：不引入新 env，stage1 env 已过多 + 不污染 /tmp）：(1) `openhands_agent.py:225` workspace_temp **hardcode** `/home/docker/openhands_workspace`（NPU 节点 docker user home，持久路径稳定）+ 长注释说明 DooD 约束；(2) 训练脚本顶部加 **fail-fast precheck**：`workspace_temp` + `artifact_dir` dir 不存在/不可写直接 `exit 1` 并提示 bind mount 修复指令；soft warn 不是 bind mount（用 findmnt 检测，不阻塞，因为 findmnt 不一定每个 image 都装）；(3) 用户运维侧 main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`。新增 §13.23 + audit 教训第 12 条：DooD 下任何 `-v <src>:<dst>` 的 `<src>` 必须宿主可见（在宿主 shell `ls <src>` 能看到内容才合法）。**Stage 2 演化路线**：用户决策不烤 skills 进 image（迭代成本高），多机时走 OBS 拉取（首选，Ascend 集群默认有）/ NFS / 自有 HTTP 服务（最重，非必要不引入）。stage 2 进 §9 下一阶段 TODO 跟踪。|
 
 ---
 
@@ -1936,3 +1940,419 @@ W2.15 删 HCCL_IF_IP 硬编码 / W2.16 改 enforce_eager / W2.17 删 vllm engine
 - 顶部 env：`ASCEND_LAUNCH_BLOCKING=1` / `VLLM_ATTENTION_BACKEND=TORCH_SDPA` / `PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128` / `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` / `VLLM_ENGINE_ITERATION_TIMEOUT_S=...` / `RAY_DEBUG_POST_MORTEM=0` / `RAY_DEDUP_LOGS=0` / `VLLM_ASCEND_ENABLE_NZ=0` / `OOM_SNAPSHOT_*`
 
 这些先不动（"非必要不改"原则），等 L2b 跑过看哪些真的是必需的，再视情况清理。
+
+### 13.21 mock_rollout 返回类型对齐真 rollout（W2.18）
+
+**触发**：L2b 走过 vllm + LiteLLM proxy 起来 + Megatron-Bridge load + actor.reset() + Qwen35VLMoEBridge 模型转换完成，到 "epoch 0, step 1 started"，然后立刻挂：
+
+```
+Error in execute_tasks: Must be a list of Trajectory, retrying...
+AssertionError: Must be a list of Trajectory
+  File "rllm/engine/agent_sdk_engine.py", line 220, in process_task_with_retry
+    assert all(isinstance(t, BaseTrajectory) for t in output)
+```
+
+**根因**：`AgentSdkEngine.process_task_with_retry` 接受 rollout 函数 3 种返回形式（agent_sdk_engine.py:213-223）：
+
+```python
+(a) float | int | bool        → 单纯 reward 标量
+(b) list[BaseTrajectory]      → trajectories (有 assertion 检查类型)
+(c) tuple[(payload, metrics)] → 带 metrics 的 payload
+```
+
+**真 `openhands_agent.rollout` 末尾返回 `reward` (float)** 走 (a)。但它的 docstring 写：
+
+```python
+"""
+Returns:
+    List with one trajectory dict: {name, steps, reward}.
+"""
+```
+
+**docstring 撒谎**——实际看代码 line 730 `return reward`。
+
+我之前写 `mock_rollout.py` 时被 docstring 误导，返回了 `list[dict]` → 走 (b) 分支但里面是 dict 不是 BaseTrajectory → assertion 挂。
+
+**修复**：mock_rollout 返回 `float` (0.5)，与真 rollout 对齐：
+
+```python
+def rollout(*args, **kwargs) -> float:
+    return 0.5
+```
+
+L2b 设计目的（exercise rllm trainer step / Megatron / PPO 框架，不验真 rollout）依然满足：scalar reward 进 trainer，trajectory 数据从 trace store 取（mock 模式下 trace store 是空的，但 trainer 框架能跑过 1 step）。
+
+**Audit 教训补充（§13.13 第 10 条）**：
+
+10. **不要相信 docstring，看 return 语句**。`openhands_agent.rollout` docstring 写 "List with one trajectory dict"，实际 `return reward` 返回 float。Mock / shim / adapter 类代码尤其要 grep `return` 实证，不能照 docstring 抄签名。
+
+**L2b 进展确认**：在挂到 W2.18 之前，L2b 已经走过：
+- vllm-ascend Qwen3.6 server 启动 + cudagraph FULL_AND_PIECEWISE capture
+- LiteLLM proxy 启动 + admin/reload 200
+- Megatron-Bridge 加载 Qwen3.6 (Qwen35VLMoEBridge converting 100%)
+- HCCL broadcast + actor.reset() 完成
+- Step 1 start
+
+也就是 W2.8/W2.9/W2.13/W2.14/W2.15/W2.16/W2.17 一连串修复**全部生效**，rllm × verl × vllm-ascend × Megatron-Bridge × NPU 链路 setup 阶段已通。剩下是 trainer 内部 mock 数据流（W2.18）+ PPO step 框架。
+
+### 13.22 L2b mock 路径天然边界 + 跳 L3 决策（W2.19）
+
+**W2.18 修 mock_rollout 返回 float 后，L2b 走得更远**：
+
+```
+Generating trajectories: 100% 4/4
+[xxx:0:1] Rollout completed with reward: 0.5
+[xxx:1:1] Rollout completed with reward: 0.5
+[xxx:2:1] Rollout completed with reward: 0.5
+[xxx:3:1] Rollout completed with reward: 0.5
+INFO: POST /admin/flush-tracer 200 OK
+Episode xxx:0:1 has no valid trajectories, dropping it from the batch
+Episode xxx:1:1 has no valid trajectories, dropping it from the batch
+Episode xxx:2:1 has no valid trajectories, dropping it from the batch
+Episode xxx:3:1 has no valid trajectories, dropping it from the batch
+RuntimeError: received an empty list of sequences
+  at agent_sdk_engine.py:614 pad_sequence(prompts)
+```
+
+**根因 — L2b mock 路径的天然边界**：
+
+`AgentSdkEngine.transform_results_for_verl` 从 trace store（LiteLLM proxy 录的 SQLite）拿真 LLM 调用记录，build `prompt_ids / completion_ids / logprobs` 喂给 PPO。**mock_rollout 只返回 reward 标量，不调 LLM**，trace store 是空的 → 4 个 episode 全 drop → batch 空 → `pad_sequence(empty_list)` 挂。
+
+PPO step 需要真 token data，mock 标量 reward 不够。要让 L2b 真跑通 PPO step，必须 mock_rollout 真调一次 LLM（哪怕通过 mock_llm_server）—— 那就和 L3 差不多了。
+
+**用户决策（2026-05-26）**：跳过 L2b 直接进 L3。L2b setup 验证使命已完成。
+
+**L2b 已验证的（W2.8-W2.18 累积成果）**：
+
+| 子系统 | 状态 |
+|---|---|
+| rllm import 链 + verl-fork shim | ✓ |
+| Megatron-Bridge PYTHONPATH | ✓ |
+| HCCL broadcast | ✓ |
+| Megatron-Bridge load Qwen3.6 | ✓ (Qwen35VLMoEBridge 转换 5916/5916) |
+| vllm-ascend Qwen3.6 server + cudagraph capture | ✓ |
+| LiteLLM proxy 启动 + admin/reload | ✓ |
+| AgentSdkTrainer.init_workers | ✓ |
+| epoch 0 step 1 进入 | ✓ |
+| rollout 函数调用（mock × 4） | ✓ (reward 0.5 × 4) |
+| AgentSdkEngine.process_task_with_retry | ✓ (W2.18 后) |
+
+**L2b 未验的（mock 天然不能验）**：
+
+| 子系统 | 状态 |
+|---|---|
+| 真 LLM 调用 + trace store filling | ❌ mock 跳过 |
+| PPO batch 构造 | ❌ 上一项依赖 |
+| actor.compute_log_prob | ❌ 同 |
+| PPO loss / backward / optimizer.step | ❌ 同 |
+| checkpoint save / load | ❌ 同 |
+
+剩余子系统**只能 L3 真 rollout 验**。
+
+### L3 准备清单
+
+L3 = `STAGE1_DRY_STEPS=1 bash train_openhands_qwen36_npu.sh`（不设 `STAGE1_MOCK_ROLLOUT`，走真 OpenHands docker 路径）。
+
+**前置检查**：
+
+| 项 | 命令 | 期待 |
+|---|---|---|
+| docker daemon 在跑 | `docker info \| head -5` | 不报错 |
+| OpenHands image 已 build | `docker images \| grep openhands-triton-env` | 有 v1 |
+| 容器能调 host | `docker run --rm --network host openhands-triton-env:v1 curl -fsS http://localhost:5000/health` | 200 OK |
+| OPENHANDS_ARTIFACT_DIR 可写 | `mkdir -p /workspace/results/openhands_results && touch $_/test && rm $_/test` | OK |
+| mock_npu_operator reward 函数能在容器内跑 | 看 openhands_agent.py `_npu_operator_reward` 是否容器内可执行 | 函数体内只用 fs，OK |
+
+**可能挂点排序（按风险递减）**：
+
+1. **docker image 不存在 / build 失败** —— FORCE_BUILD=1 重 build 看
+2. **容器内调 LiteLLM proxy 不通** —— `host.docker.internal:5000`（默认）vs `--network host` + `localhost:5000` 看 OpenHands 容器 entrypoint 怎么传 LLM_BASE_URL
+3. **OpenHands 容器内 entrypoint 异常 exit** —— 看 `OPENHANDS_ARTIFACT_DIR` 下容器 log
+4. **第一次 LLM 调用太慢导致 timeout** —— 已设 `OPENHANDS_CONTAINER_TIMEOUT=1800`（30 分钟）
+5. **PPO step 真挂**（最值得期待——意味着前面全通了）
+
+**Audit 教训补充（§13.13 第 11 条）**：
+
+11. **分层 mock 的"覆盖范围 vs 真链路依赖"边界要早画**。L2b 设计初衷"绕 docker/LLM 验 trainer"是对的，但低估了 PPO step 对真 token data 的硬依赖（标量 reward 不够）。下次设计 mock 层，先在 plan 里明确该层能验/不能验的子系统清单（这次 plan §13.10 没画清楚 PPO step 是否在 L2b 范围内）。
+
+### 13.23 DooD workspace path alignment：workspace_temp 必须落在宿主可见路径（W2.20）
+
+**L3 第一次跑出意外快速失败**：4 个 OpenHands 容器 docker run 成功（拿到 container id），但**总耗时 2.96 秒就 4 个全部 reward=0.0 退出**，trace store 空 → 4 episode 全 drop → 同 L2b 的 `pad_sequence empty list`。容器内 entrypoint stderr 报 `/opt/workspace/entrypoint.py: No such file or directory`。
+
+**根因 — Docker-out-of-Docker volume 路径未对齐**：
+
+rllm 主进程跑在一个 "main container" 里（NPU 节点上的训练容器）。`openhands_agent.rollout` 用 docker SDK 在**宿主 dockerd 上**起子容器，emit 的 `-v {workspace}:/opt/workspace`：
+
+```
+main container 内：
+    /workspace/rllm-071/examples/openhands_sdk/workspace_temp/trajectory-XXX/   ← shutil.copytree 写在这里
+              ↓ openhands_agent emit "-v {workspace}:/opt/workspace"
+宿主 dockerd 在宿主 FS 找 /workspace/rllm-071/.../workspace_temp/trajectory-XXX
+              ↓ 找不到 → 默认行为：宿主上新建空目录
+子 OpenHands 容器看到 /opt/workspace/ 是空的 → entrypoint.py 不存在 → exit 127
+```
+
+**关键点**：`docker run -v <src>:<dst>` 的 `<src>` 始终由**执行 docker daemon 的内核**解析，永远不是调用方容器的视角。这是 DooD 拓扑的基础约束，文档里很少提，第一次踩必坑。
+
+**修复（W2.20，code + 文档）**：
+
+| 文件 | 改动 | 行号 |
+|---|---|---|
+| `examples/openhands_sdk/openhands_agent.py` | `workspace_temp` hardcode 为 `/home/docker/openhands_workspace` + DooD 注释 | [:220-228](rllm/examples/openhands_sdk/openhands_agent.py:220) |
+| `examples/openhands_sdk/train_openhands_qwen36_npu.sh` | 启动前 fail-fast 检 `workspace_temp` + `artifact_dir` 存在 + 可写；soft warn 不是 bind mount | 紧接 `OPENHANDS_ARTIFACT_DIR` |
+
+**用户决策（2026-05-26）**：
+- stage1 env var 已积累过多，workspace_temp 路径**不引入新 env**，直接 hardcode 在 `openhands_agent.py`。代价：换路径要改 code；收益：脚本 env 表清爽，新人接手不用追溯一条 env 链。
+- 不用 `/tmp/openhands_workspace`（容易污染 tmp / 重启丢），落在 `/home/docker/openhands_workspace`（NPU 节点 docker user 的 home，持久 + 路径稳定）。
+- 训练脚本顶部加 fail-fast precheck：dir 不存在或不可写直接 `exit 1`，提示用户加 bind mount；soft warn 不是 bind mount（用 `findmnt` 检测，不阻塞）。
+
+**用户操作（main container 启动侧）**：main container 启动命令需加同路径 bind mount（rllm 仓不管 main container 怎么起，这步在用户的运维脚本里）：
+
+```bash
+# 宿主上准备
+mkdir -p /home/docker/openhands_workspace
+
+# main container 启动加 bind mount（源/目的同路径）
+docker run ... \
+    -v /home/docker/openhands_workspace:/home/docker/openhands_workspace \
+    ...
+```
+
+**验证方式**（在宿主 shell，不是 main container 内）：rollout 跑起来后宿主上能看到 `/home/docker/openhands_workspace/trajectory-*/agent_workdir/INSTRUCTIONS.md`，子容器才看得到。
+
+或者直接靠训练脚本顶部的 precheck：跑 `bash stage1_test_layered.sh L3` 时，如果 main container 没加 bind mount，脚本会在进入 Ray 之前就 fail 并打印明确的修复指引。
+
+**为什么这个解法是"同路径 bind mount"而不是"路径翻译"**：DooD 拓扑里，**main container 内的路径 = 宿主路径 = 子容器 -v 的 source 路径**，三者必须一致。如果搞路径映射（"main container 内 X 在宿主上是 Y"），代码就要维护一张映射表，每次起容器都查表，下次接手的人很难调试。同路径 bind mount 是工业标准做法（k8s 的 hostPath、Jenkins agent 跑 docker build 都是这个套路）。
+
+**为什么 `_WORKSPACE_PKG`（模板源）不用宿主可见**：模板只在 main container 内被 `shutil.copytree` 读取，destination 才挂到子容器。所以**只有 workspace_temp 这个 destination 需要同路径 bind mount**，源模板 + rllm 源码这些都不用动。这点很重要 —— 用户可以继续在 main container 内迭代 `examples/openhands_sdk/workspace/` 模板，**改完立刻生效**（每次 rollout 重新 copytree），不需要重 build image。
+
+**Audit 教训第 12 条**：**DooD 下任何 `docker run -v <src>:<dst>` 的 `<src>` 必须是宿主可见路径**。判断方法：在宿主 shell（不是 main container 内）`ls <src>`，能看到内容才合法。代码里 emit 这种 mount 字符串的位置（[openhands_agent.py:546](rllm/examples/openhands_sdk/openhands_agent.py:546)）值得在 docstring / 注释里显式标"这里的 path 是宿主 dockerd 视角"。
+
+**Stage 2 演化路线（用户决策 2026-05-26）**：
+
+skills 快速迭代场景下，stage 2 不走"workspace 烤进 image"（迭代成本高），三个备选：
+
+| 路线 | 适用 | 评估 |
+|---|---|---|
+| OBS / S3 拉取（Ascend 集群默认有） | 模板存对象存储，节点本地缓存 | **首选**：不写自有 service，对象版本天然支持 |
+| 自有 HTTP 服务 | 需要复杂 skill 拼装逻辑或细粒度访问控制 | 多一个 critical service，部署/监控/HA 成本，非必要不引入 |
+| 多机共享 NFS | 节点已有共享 fs | 路径直挂，跨节点透明 |
+
+stage 1（W2.20）= 同路径 bind mount，工时 < 30 分钟。stage 2 真正切多机时再选 OBS 或 NFS，进 §9 下一阶段 TODO 跟踪。
+
+---
+
+## 14. 新对话接手指南（Onboarding）
+
+**给在新对话窗口接手的 Claude / 工程师**：先读 §14.1（30 秒 TL;DR），然后按需深入 §14.2-§14.9。其余 §0-§13 是 history / reference，按需检索。
+
+### 14.1 TL;DR — 30 秒回到上下文
+
+**目标**：Qwen3.6-35B-A3B × OpenHands × Ascend NPU 跑 agentic RL（算子生成 agent）。
+**基础设施**：rllm（agent RL framework）跑在 verl-BryanChen408 fork（Ascend 适配的 verl）+ Megatron-Bridge + vllm-ascend + Megatron-LM。
+**项目阶段**：W1 全完成（cherry-pick + 适配），W2 进行中（stage1 训练 bring-up）。
+**当前位置**：L2b mock 路径已验完 setup chain（vllm/Megatron/HCCL/proxy/step 进入全 OK），准备进 **L3 真 OpenHands docker rollout**。
+**已知 limitation**：L2b 的 mock_rollout 不调 LLM，trace store 空，PPO step 验不到（plan §13.22）；L3 真 rollout 自然修复。
+
+### 14.2 Git refs cheatsheet
+
+**rllm 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/rllm`）：
+
+```
+当前分支: qwen36-openhands-stage1
+基线:    origin/openhands_ascend
+push 到:  origin/qwen36-openhands-stage1
+```
+
+| 类别 | 数量 | 关键 commit |
+|---|---|---|
+| W1 obs cherry-pick | 2 | `c6e36b0a` + `b2538771` (基线之上前两条) |
+| W1 upstream SAFE | 7 | `029ee36f` ~ `74721f13` |
+| W1 upstream HIGH_RISK | 3 | `3c8ee08d` (R2/R3) `80d4e7b8` (GPU mem) `ca560dc7` (lr_schedule) |
+| W1 RolloutCorrectionConfig 修复 | 1 | `c1ff82e3` |
+| W1 plan v2.2/v2.3/v2.4 | 3 | `8d8b1fe6` `3818073b` `76c0cff4` |
+| W2 stage1 训练脚本 | 1 | `5082c854` |
+| W2 分层测试 | 1 | `b07a55d7` |
+| W2 vllm/megatron/HCCL/script 修复（W2.9-W2.18） | 9 | 见 `git log` |
+| 用户人工调整（路径） | 3 | `07d98394` `4dfb7dc9` `6b1f522e` |
+| 最新 | — | `8dc3ecc9` (plan §13.22 + L3 prep) |
+
+**verl-BryanChen408 仓库**（`/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408`）：
+
+```
+当前分支: qwen36-rllm-compat
+基线:    hostoom-debug
+push 到:  origin/qwen36-rllm-compat
+```
+
+| Commit | 内容 |
+|---|---|
+| `881a98d7` | shim 1: `AsyncLLMServerManager` 别名 + `AgentLoopManager` 3 个 property |
+| `85159408` | shim 2: `megatron_workers.py` + `fsdp_workers.py` re-export `engine_workers` |
+
+### 14.3 NPU 节点环境（已知路径）
+
+| | 本地 Mac | NPU 节点 |
+|---|---|---|
+| rllm 工作目录 | `/Users/yeji/Documents/Code/Python/Qwen36/rllm` | `/workspace/rllm-071` |
+| verl-BryanChen408 | `/Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408` | `/workspace/pri/verl` |
+| Megatron-Bridge | `/Users/yeji/Documents/Code/Python/Qwen36/Megatron-Bridge` | `/workspace/Megatron-Bridge` |
+| Megatron-LM | `/Users/yeji/Documents/Code/Python/Qwen36/Megatron-LM` | (需确认实际路径) |
+| MindSpeed | `/Users/yeji/Documents/Code/Python/Qwen36/MindSpeed` | (需确认实际路径) |
+| vllm-ascend | `/Users/yeji/Documents/Code/Python/Qwen36/vllm-ascend` | `/workspace/vllm-ascend` |
+| Qwen3.6 模型 | n/a | `/home/docker/Qwen3.6-35B-A3B` |
+| trace SQLite | n/a | `/workspace/results/rllm-openhands-traces.db` |
+| OpenHands artifacts | n/a | `/workspace/results/openhands_results` |
+
+**NPU 节点 IP**：节点上 vllm server 实际监听 `80.48.5.88:39557`（多 NIC 机器，88 是可达 IP；65 是 ray actor 启动 IP）。**不要硬编码任一 IP 进脚本**（W2.15 教训）。
+
+### 14.4 关键代码文件清单
+
+**stage1 入口（必读）**：
+- `examples/openhands_sdk/train_openhands_qwen36_npu.{py,sh}` — 训练入口
+- `examples/openhands_sdk/stage1_test_layered.sh` — 分层 smoke orchestrator (L1/L2a/L2b/L3/L4)
+
+**stage1 辅助**：
+- `examples/openhands_sdk/preflight_qwen36_npu.py` — L1 隔离 (config + import + dataset + ctor)
+- `examples/openhands_sdk/mock_rollout.py` — L2b mock rollout（返回 float reward，**不调 LLM**，天然不能验 PPO step）
+- `examples/openhands_sdk/mock_llm_server.py` — L2a FastAPI mock OpenAI server
+- `examples/openhands_sdk/prepare_npu_operator_data.py` — 4-source 数据准备脚本（mock/local-jsonl/local-json/hf）
+
+**stage1 业务代码**（rllm 老分支已有，stage1 不动）：
+- `examples/openhands_sdk/openhands_agent.py` — 真 rollout 函数（末尾 `return reward` 是 float，docstring 撒谎说 list[dict]，已被坑过）
+- `examples/openhands_sdk/workspace/` — OpenHands docker 容器内 entrypoint
+
+**verl-fork shim**（不用碰，pull 即可）：
+- `verl/experimental/agent_loop/agent_loop.py` — 加 `AsyncLLMServerManager` 别名 + `AgentLoopManager` 3 property
+- `verl/workers/megatron_workers.py` / `verl/workers/fsdp_workers.py` — re-export `engine_workers`
+- `verl/trainer/ppo/ray_trainer.py:902` — `_server_manager` kwarg wire
+
+### 14.5 当前进度 + 下一步
+
+**已完成**：
+- ✓ W1 全部 (cherry-pick + verl-fork shim + RolloutCorrectionConfig 修复)
+- ✓ W2.0 分层测试基础设施
+- ✓ W2.1-W2.2 训练脚本 + OpenHands LLM 配置
+- ✓ W2.8-W2.18 持续修复 setup 链路（HCCL/Megatron-Bridge/vllm/mock_rollout）
+- ✓ W2.19 跳 L2b 决策（mock 天然边界，setup 已验完）
+- ✓ L1/L2a/L2b（部分） — 全部走过 setup chain
+
+**当前位置**：等用户在 NPU 上跑 L3。
+
+**下一步（用户该做的）**：
+
+```bash
+# 本地 push（如未做）
+git -C /Users/yeji/Documents/Code/Python/Qwen36/rllm push origin qwen36-openhands-stage1
+git -C /Users/yeji/Documents/Code/Python/Qwen36/verl-BryanChen408 push origin qwen36-rllm-compat
+
+# NPU 节点拉新
+cd /workspace/rllm-071 && git pull   # 到 8dc3ecc9
+cd /workspace/pri/verl && git pull    # 到 85159408
+
+# L3 前置 4 项检查（plan §13.22）
+docker info | head -5
+docker images | grep openhands-triton-env
+docker run --rm --network host openhands-triton-env:v1 \
+    curl -fsS http://localhost:5000/health
+mkdir -p /workspace/results/openhands_results && \
+    touch /workspace/results/openhands_results/test && rm $_
+
+# 跑 L3
+cd /workspace/rllm-071
+bash examples/openhands_sdk/stage1_test_layered.sh L3
+# = STAGE1_DRY_STEPS=1 bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
+```
+
+**预期 L3 挂点**（按风险递减，plan §13.22 末段）：
+1. docker image 不存在 / build 失败
+2. 容器内调 LiteLLM proxy 不通（`host.docker.internal` vs `--network host`）
+3. OpenHands 容器内 entrypoint 异常 exit
+4. 第一次 LLM 调用慢 timeout
+5. **PPO step 真挂**（如果走到这里，意味着 W2.8-W2.18 全成功，可以庆祝）
+
+### 14.6 已知 limitations / 历史踩坑（避免重复踩）
+
+**Mock vs 真链路**：
+- `mock_rollout` 只返 float reward，**不调 LLM → trace store 空 → PPO step 没法跑**（plan §13.22）。要验 PPO step 必须走 L3 真 rollout。
+- `mock_llm_server` 与 mock_rollout 互不调用，前者只为 L2a curl smoke 用。
+
+**verl × vllm-ascend 不兼容点**：
+- vllm-ascend 不识别 `--swap-space` / `--cpu-offload-gb` / `--enable-prefix-caching` 等 vllm 主线新参数（W2.17）
+- 还可能不识别：`--logprobs_mode processed_logprobs` / `--enable_sleep_mode`（vllm 0.10+ 引入，未实测，如挂同样删）
+
+**verl `setdefault` 暗坑**：
+- `vllm_async_server.py:237` 写死 `compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")` → 强制开 cudagraph
+- `enforce_eager=True` 会与之矛盾，vllm-ascend 直接 exit 2（W2.16）
+- 审 verl 类似 setdefault：`grep -rn "setdefault" verl/workers/`
+
+**两个独立的 "bridge" 库**（plan §13.12）：
+- `mbridge`（pypi 0.15.1）— 不支持 qwen3_5_moe，**NPU 不能用**
+- `Megatron-Bridge`（NVIDIA-NeMo，src clone）— 你环境装的这个，NPU 必须 `vanilla_mbridge=False` 走这条
+- 默认 PYTHONPATH 注入：`MEGATRON_BRIDGE_DIR=/workspace/Megatron-Bridge`（可 env override）
+
+**rllm 数据 schema 陷阱**（plan §13.16）：
+- parquet 的 `prompt` 字段**必须是 `list[dict]`**，不是 JSON string
+- 已修 3 个数据脚本（prepare + 2 个 legacy mock），未来加新脚本注意
+
+**rllm × verl API 漂移**（plan §13.6 §13.11）：
+- verl-BryanChen408 fork = verl main 最新；rllm 仍假设 verl 0.7.x
+- 已知 2 处 shim：rollout 抽象（`AsyncLLMServerManager` → `LLMServerClient`）+ worker 抽象（`megatron_workers/fsdp_workers` → `engine_workers`）
+- 未来 verl-fork 升级可能暴露第 3 处漂移，按 W2.8/W2.14 同模式处理：fork 端 shim，rllm 不动
+
+**机器特定信息不进代码**（plan §13.18，audit 教训第 7 条）：
+- `HCCL_IF_IP` / `nic_name` / 节点 IP 一律不允许硬编码
+- 现在全是 env opt-in：`HCCL_IF_IP_OVERRIDE` / `HCCL_NIC_NAME` / `HCCL_FORCE_PORT_RANGE`
+
+**DooD volume path alignment**（plan §13.23，audit 教训第 12 条）：
+- rllm 主进程跑在 main container 内，`openhands_agent` 用 docker SDK 起子容器；`-v <src>:<dst>` 的 `<src>` **由宿主 dockerd 解析**，不是 main container 视角
+- 任何要给子容器看的目录（典型：`workspace_temp/`）必须落在 main container 和宿主**同路径 bind mount** 的位置
+- 当前 hardcode `/home/docker/openhands_workspace`（[openhands_agent.py:225](rllm/examples/openhands_sdk/openhands_agent.py:225)），main container 启动加 `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
+- 训练脚本顶部已有 fail-fast precheck，dir 不存在/不可写直接退出；soft warn 不是 bind mount（findmnt 检测）
+- 排错：在**宿主 shell**（不是 main container 内）`ls /home/docker/openhands_workspace/`，能看到 `trajectory-*` 子目录才合法
+
+**Stage1 安全训练 config**（plan §13.7）：
+- `router_replay=disabled`（stage1 AgentPPOTrainer 路径上 19983fe4 入口不生效，§13.3）
+- `use_kl_loss=False` + `kl_loss_coef=0` — 靠 PPO clip 控制 off-policy
+- **必须** `rollout.calculate_log_probs=True`（监控 `rollout_probs_diff` / `pg_clipfrac` / `approx_kl`）
+
+**Batch sanity 联立约束**（plan §13.14）：
+- 默认 `BATCH_SIZE=1 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=${BATCH_SIZE}`
+- 联立：`BATCH × ROLLOUT >= DP=4` 且 `BATCH >= MINI`
+- 脚本顶部 fail-fast 验过
+
+### 14.7 常见用户 prompt → 该怎么处理
+
+| 用户说 | Claude 应该做 |
+|---|---|
+| "贴 traceback" | 先看 traceback 末尾 file + line；查 §13.6-§13.22 找类似挂点；如果是 verl × vllm-ascend × Megatron 接口问题，**先怀疑 "verl 自己能跑 vs rllm 跑"差异**（这是 W2.15-W2.17 反复出现的模式） |
+| "脚本里又改了 X，对不对" | 看 §0.2 verl 脚本 NPU 分支权威表 + §13.13 audit 完整表 + §13.7 stage1 safe config |
+| "新加 Y 数据集" | 参考 §13.15 `prepare_npu_operator_data.py`，加 `--source <name>` 分支；schema 见 §13.16（prompt 必须 list[dict]） |
+| "L3 挂在 Z" | 看 §13.22 L3 prep checklist + 可能挂点表；常见诊断 `docker logs` / `/tmp/ray/session_latest/logs/worker-*.err` |
+| "PPO 不收敛" | 看 §13.7 监控阈值表，调 lr / mini_batch（先不开 KL loss） |
+| "想加 OpenHands 新功能" | 不动 `rllm/sdk/*`（fork 债务，§2.1）；改 `examples/openhands_sdk/` 业务代码 |
+| "改并行" | 看 §0.2 verl 脚本 + §13.13 用户决策（TP=2 EP=4 单节点 8 卡）；§13.14 联立约束必须满足 |
+
+### 14.8 快速 reference — 哪节看哪个
+
+| 想知道 | 看哪节 |
+|---|---|
+| 项目目标 / 不做什么 | §1 / §10 |
+| 硬件 / 依赖版本 | §0 |
+| 训练参数权威（verl 脚本 NPU 分支完整摘录） | §0.2 |
+| 基线分支决策 / cherry-pick 列表 | §2 / §3.1 / §13.1 |
+| stage1 安全训练 config | §13.7 |
+| Batch sanity 约束 | §13.14 |
+| 分层测试架构（L1-L4） | §13.10 |
+| 全 W1+W2 实施记录 | §13.1-§13.22 |
+| verl-fork shim 详情 | §13.6 + §13.11 |
+| 已知 audit 教训（11 条） | §13.13/.14/.16/.17/.18/.19/.20/.21/.22 散布 |
+| NPU smoke 命令 | §13.8 |
+| L3 prep checklist | §13.22 末段 |
+
+### 14.9 plan 维护规则
+
+- **每个新挂点修复都加 §13.x 子节** + audit 教训累加 + 修订表新 row
+- **每次 sh/py 改动同步反映在 §13.13 或对应章节**（避免代码与文档漂移）
+- **commit message 引用 W2.x 编号**，task list 维持同步
+- **plan 永远基于 verl 自己能跑 Qwen3.6 这个事实**，rllm 这边的 bug 优先怀疑"rllm 引入的差异"（W2.15-W2.17 共同模式）
