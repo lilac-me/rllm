@@ -160,8 +160,10 @@ local `verl-main-merge`，未 push（你 review 后再 push）。
 | `create_mock_npu_operator_data.py` | A：verl-main 覆盖 ×4 + 多修 prompt list[dict] bug | ✅ 用 verl-main |
 | `agent_sdk_trainer.py` | A：我们 18 行=padding，verl-main:998 已覆盖；verl-main 另有 bridge/Dr.GRPO | ✅ 用 verl-main |
 | `agent_sdk_engine.py` | A：rollout_logprobs verl-main 更优；_dprint gate 记可选 TODO | ✅ 用 verl-main |
-| `openhands_agent.py` | C 当前并 HTTP worker；reward 推迟 skills 阶段；其余保留 verl-main | ⏳ 待实施 |
-| `runner.py` | B：两边各 ~400 行，待 3-way reconcile | ⏳ 待做 |
+| `openhands_agent.py` | C 当前并 HTTP worker；reward 推迟 skills 阶段；其余保留 verl-main | ✅ done (aeaec543) |
+| `runner.py` | B：通用用 verl-main；RLLM_LOG_DIR 并入；system prompt 推迟 | ✅ done (b9b999dc) |
+| `remote_eval_worker.py` + `OPENHANDS_REFACTORING_LOG.md` | C 干净加 | ✅ done (467c4f9a) |
+| config/ (B 方案) | .env.example + qwen36.env + sh source config | ✅ done (fd51ba65) |
 
 **关键发现（修正了 §2.1 先前分类）**：
 - reward（`_npu_operator_reward` + 防 stale helpers）**不是通用改进，是 triton
@@ -170,8 +172,16 @@ local `verl-main-merge`，未 push（你 review 后再 push）。
 - 先前用"两分支当前 diff 行数"分类不准（把 verl-main 没改的 distributed_npu_lock
   误判 B）。改用"相对 base 的双侧改动量"才能区分 A/B/C。
 
-**当前阶段剩余工作**：openhands_agent.py HTTP worker 并入 + runner.py reconcile
-+ C 类干净加（remote_eval_worker.py / config/ / LOG.md）+ 静态验证。
+**当前阶段（代码合并，不含 skills）✅ 全部完成**。静态验证通过：
+py_compile（6 文件）/ bash -n（sh+config）/ HTTP worker payload schema
+（client↔server）一致。全部 commit 在 local verl-main-merge，未 push。
+
+**待 user**：① review ② 单 rollout 冒烟（需 NPU+docker+ray，本地跑不了）
+③ push。
+
+**下一阶段（skills 移植，独立，等 triton skills 仓路径）**：见 §4 —
+triton skills + system prompt + reward(triton metrics.json + F3 guard 重评估)
++ operator_pipeline.sh + 数据集。
 
 ### 7.1 verl-main 持续演进的影响（rebase 跟进）
 
