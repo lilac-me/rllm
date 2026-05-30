@@ -42,19 +42,17 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
 
 | 文件 / 函数 | 类别 | 相对 verl-main diff | 说明 |
 |---|---|---|---|
-| `openhands_agent.py` `_run_remote_eval_worker` + `_tar_directory_b64` + `_manifest_directory` + `_extract_tar_b64_into` | **C** | 独有 | HTTP worker 入口 + helper，verl-main 完全没有 |
-| `openhands_agent.py` `_impl_newer_than_metrics` + `_snapshot_success_as_best` | **C** | 独有 | reward 防 stale + 最佳实现快照。**粗暴 merge 极易漏掉。** |
-| `openhands_agent.py` `_npu_operator_reward` / `_setup_npu_operator_workspace` / `rollout` / `_run_openhands_container` | **B** | 大 | 两边从不同 pqy 基线 diverge；reward + workspace 逻辑要仔细 reconcile |
+| `openhands_agent.py` HTTP worker（`_run_remote_eval_worker` + `_tar_directory_b64` + `_manifest_directory` + `_extract_tar_b64_into` + `_metadata_for_proxy_url`）| **C 当前并** | 独有 | 路线无关的 rollout 执行机制（docker run OpenHands 容器）。当前阶段并入 + rollout 路由改 1 行 |
+| `openhands_agent.py` reward（`_npu_operator_reward` + `_impl_newer_than_metrics` + `_snapshot_success_as_best`）| **推迟 skills 阶段** | 独有/diverge | ⚠️ **路线绑定**：我们读 triton `metrics.json`（success/correctness_ok + 防stale + best快照），verl-main 读 AscendC `trace.md`（Phase 3/4），两套完全不同。跟 triton skills + operator_pipeline.sh 死绑，必须一起换。当前并入会破坏 verl-main AscendC pipeline → reward 全 0 |
+| `openhands_agent.py` `_setup_npu_operator_workspace` / `_run_openhands_container` / `_archive_npu_artifacts` / `rollout` 其余 | **A 保留 verl-main** | — | 配套 verl-main AscendC PKG；`_run_openhands_container`（bind-mount）作 HTTP worker 的 localhost fallback |
 | `remote_eval_worker.py` | **C** | 独有（verl-main 无此文件） | HTTP worker server + GC + /health + /admin/reset-locks |
-| `agent_sdk_engine.py` `_ENGINE_DEBUG`/`_dprint` gate | **C** | 131 的一部分 | env-gated debug print（RLLM_ENGINE_DEBUG） |
-| `agent_sdk_engine.py` rollout_logprobs padding | **B/C** | 131 的一部分 | logprob 支持（对应 openhands-observability "增加rollout_logprobs"）；需 verify verl-main 是否已有 |
-| `agent_sdk_engine.py` 其他 | **A** | 131 的一部分 | verl-main +78 行含 DataProto 路径，更新 |
-| `agent_sdk_trainer.py` LCM mini_batch padding | **A** | — | **两边字节级相同**（verl-main:998）。丢我们的。 |
-| `agent_sdk_trainer.py` DataProto→TensorDict bridge / Dr.GRPO / stage2 audit | **A** | 329 的一部分 | verl-main 独有且更新，保留 verl-main |
-| `agent_sdk_trainer.py` config 读取（我们的） | **B** | 329 的一部分 | 仅当保留 config/ 层时需要 |
-| `distributed_npu_lock.py` | **B** | 37 | 两边 diverge，需 reconcile |
-| `runner.py` | **B** | 33 | 小，reconcile |
-| `create_mock_npu_operator_data.py` | **B** | 7 | 琐碎 |
+| `agent_sdk_engine.py` `_ENGINE_DEBUG`/`_dprint` gate | **C 可选 TODO** | base:63 的一部分 | env-gated debug print。verl-main 无。纯调试辅助，本阶段先不并（插入点要匹配 verl-main 结构有风险），记可选增强 |
+| `agent_sdk_engine.py` rollout_logprobs padding | **A 用 verl-main**（已确认） | base:80 的一部分 | 已实测：verl-main 更完善（量化 mismatch + `rollout_log_probs_fill_rate` metric，部分 mismatch 也处理），我们是 all-or-nothing |
+| `agent_sdk_trainer.py` LCM padding + DataProto bridge / Dr.GRPO / stage2 audit | **A 用 verl-main**（已确认） | base:our18/vm313 | 我们 18 行=padding，verl-main:998 字节级覆盖；verl-main 另有 bridge/Dr.GRPO 更全 |
+| `distributed_npu_lock.py` | **C 已 port** ✅ | base:our37/vm0 | verl-main 没改；已 port 我们的 device_ids（physical id 8-15 支持）|
+| `create_mock_npu_operator_data.py` | **A 用 verl-main**（已确认） | base:our4/vm9 | verl-main 覆盖我们的 ×4 + 多修 prompt list[dict] bug |
+| `.gitignore` | **已并入** ✅ | base:our4/vm9 | res*.log + .codemate/ 并入 verl-main |
+| `runner.py` | **B 待 reconcile** | base:our405/vm386 | 两边各 ~400 行大改，需 3-way |
 
 ### 2.2 Config / 基础设施（openhands-refactoring 独有）
 
@@ -83,19 +81,20 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
    - `remote_eval_worker.py`（整文件）
    - `config/.env.example` + `config/qwen30b.env`
    - `OPENHANDS_REFACTORING_LOG.md`
-2. **C 类并入 openhands_agent.py**（port 独有函数）：
-   - HTTP worker：`_run_remote_eval_worker` + tar helpers + `rollout` 里的路由
-   - reward：`_impl_newer_than_metrics` + `_snapshot_success_as_best`
-   - **决策**：HTTP worker 作主路径，bind-mount 作 fallback 或移除
+2. **C 类并入 openhands_agent.py（仅 HTTP worker，路线无关）**：
+   - HTTP worker：`_run_remote_eval_worker` + tar helpers + 常量 + `rollout` 路由改 1 行
+   - bind-mount `_run_openhands_container` 保留作 localhost fallback
+   - **reward 不在此阶段**（路线绑定 triton metrics.json，见 §4）
 3. **B 类 reconcile**（逐行，要小心）：
-   - `openhands_agent.py` reward / workspace 函数
-   - `agent_sdk_engine.py` rollout_logprobs + _dprint（保留 verl-main 更新的部分）
-   - `distributed_npu_lock.py`
-   - `runner.py`、`create_mock_npu_operator_data.py`
-4. **A 类**：直接用 verl-main（padding、DataProto bridge、Dr.GRPO）。
+   - `runner.py`（两边各 ~400 行，唯一剩下的大 B）
+   - 其余 B 已实测落地：distributed_npu_lock(C port✅) / .gitignore(并入✅) /
+     create_mock + agent_sdk_trainer + agent_sdk_engine(均判 A 用 verl-main)
+4. **A 类**：直接用 verl-main（padding、DataProto bridge、Dr.GRPO、rollout_logprobs、
+   create_mock prompt 修复）。
 5. **验证**（不跑训练）：py_compile + bash -n + worker@localhost 单 rollout 冒烟。
 
-估算：**3-5 人天**，主要成本在 openhands_agent.py + agent_sdk_engine.py 的 B 类 reconcile。
+估算（修正后）：**1.5-3 人天**，主要成本在 openhands_agent.py HTTP worker 并入 +
+runner.py 的 3-way reconcile。reward 推迟到 skills 阶段后，当前阶段范围明显缩小。
 
 ## 4. 下一阶段（推迟）：triton skills 移植
 
@@ -111,24 +110,31 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
   2. `AGENTS.md` / `INSTRUCTIONS.md`：AscendC Phase 流程 → triton 流程
   3. `operator_pipeline.sh`（155 diff 行 AscendC↔triton）：验证后端
      evaluate_ascendc.sh / evaluate_tilelang.sh → triton 验证
-  4. reward：`metrics.json` schema ↔ `_npu_operator_reward` triton 对齐
+  4. **reward（从当前阶段移来）**：整块 port openhands-refactoring 的
+     `_npu_operator_reward` + `_impl_newer_than_metrics` + `_snapshot_success_as_best`
+     （读 triton `metrics.json`：success/correctness_ok + 防 stale + best 快照），
+     替换 verl-main 的 AscendC `trace.md`/Phase reward。必须跟 operator_pipeline.sh
+     的 triton 输出 schema（metrics.json）同步换，否则 reward 读不到。
   5. 数据集：verl-main NPUKernelBench（AscendC）→ triton KernelBench 数据
      （openhands-refactoring `prepare_kernelbench_openhands_data.py` 是 triton）
   6. port `validate_triton_impl.py`、`ascend_op_gen_agent_triton.md`
+  7. `_setup_npu_operator_workspace`：换 triton PKG 后可能要调（impl 路径
+     `src/{op}_triton_ascend_impl.py` vs AscendC `output/{op}/model_new_ascendc.py`）
 
 ## 5. 风险 / 待确认
 
-1. **B 类 reconcile 是真成本** —— openhands_agent.py 和 agent_sdk_engine.py
-   从不同 pqy 基线 diverge，不能盲选一边。每个共同函数要做 3-way 对比
-   （5daa24c0 base + verl-main + openhands-refactoring）。
-2. **rollout_logprobs**：openhands-refactoring 有 logprob padding；port 前需
-   verify verl-main 是否已有等价实现（避免双实现）。
+1. **openhands_agent.py reconcile 是真成本** —— 从不同 pqy 基线 diverge，
+   reward 已确认推迟到 skills 阶段，当前只并 HTTP worker（路线无关）。
+2. ~~rollout_logprobs~~ **已 verify**：verl-main 更完善（量化 mismatch +
+   `rollout_log_probs_fill_rate` metric），用 verl-main，我们的不并。
 3. **HTTP worker vs bind-mount 共存**：决定 bind-mount 是否作 same-host 快路径
-   保留还是移除。保留两者 = 两条代码路径都要测。
+   保留还是移除。当前决定：保留 bind-mount 作 localhost fallback（HTTP worker
+   `_run_remote_eval_worker` 内部 `if not REMOTE_EVAL_URL: 走 bind-mount`）。
 4. **verl-main 有未提交工作 + in-progress merge**（你的 qwen36）—— 在从
-   origin/verl-main 拉的新分支上做，绝不碰你 local 的 verl-main。
-5. **distributed_npu_lock.py 已 diverge（37 行）** —— 两边都改，需真实 diff
-   review，不能假设相同。
+   origin/verl-main 拉的新分支 `verl-main-merge` 上做，绝不碰你 local 的 verl-main。
+   PR 已撤（删 remote 分支），纯本地操作，你 review 后再 push。
+5. ~~distributed_npu_lock.py~~ **已确认 + port**：verl-main 没改（base diff=0），
+   不是两边都改；已 port 我们的 device_ids 支持。
 
 ## 6. 不要做的事（别重蹈先前的错）
 
@@ -138,3 +144,31 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
 - ❌ 别假设 verl-main newer = 每个函数都更好 —— reward 改进
   （_snapshot_success_as_best）和 HTTP worker 是我们的且有价值
 - ❌ 当前阶段别动 skills —— 独立议题，要用户的 triton skills 仓
+- ❌ 别把 reward 函数当"通用防 stale"并入 —— 它绑定 triton metrics.json schema，
+  跟 AscendC trace.md 不兼容，属 skills 阶段
+
+## 7. reconcile 实测进展（2026-05-29，在 verl-main-merge 分支）
+
+逐文件做了 3-way 对比（5daa24c0 base / verl-main / openhands-refactoring），
+精确分类（按相对 base 的改动量，非两分支当前 diff）。已落地的 commit 在
+local `verl-main-merge`，未 push（你 review 后再 push）。
+
+| 文件 | 实测结论 | 状态 |
+|---|---|---|
+| `distributed_npu_lock.py` | C：verl-main base diff=0，port 我们的 device_ids | ✅ done (d81be77f) |
+| `.gitignore` | 两边改不同段，并入 res*.log + .codemate/ | ✅ done (d81be77f) |
+| `create_mock_npu_operator_data.py` | A：verl-main 覆盖 ×4 + 多修 prompt list[dict] bug | ✅ 用 verl-main |
+| `agent_sdk_trainer.py` | A：我们 18 行=padding，verl-main:998 已覆盖；verl-main 另有 bridge/Dr.GRPO | ✅ 用 verl-main |
+| `agent_sdk_engine.py` | A：rollout_logprobs verl-main 更优；_dprint gate 记可选 TODO | ✅ 用 verl-main |
+| `openhands_agent.py` | C 当前并 HTTP worker；reward 推迟 skills 阶段；其余保留 verl-main | ⏳ 待实施 |
+| `runner.py` | B：两边各 ~400 行，待 3-way reconcile | ⏳ 待做 |
+
+**关键发现（修正了 §2.1 先前分类）**：
+- reward（`_npu_operator_reward` + 防 stale helpers）**不是通用改进，是 triton
+  路线绑定**：我们读 `metrics.json`，verl-main 读 `trace.md`。从"当前 C 类必须并"
+  改为"skills 阶段一起换"。当前并会破坏 verl-main AscendC pipeline。
+- 先前用"两分支当前 diff 行数"分类不准（把 verl-main 没改的 distributed_npu_lock
+  误判 B）。改用"相对 base 的双侧改动量"才能区分 A/B/C。
+
+**当前阶段剩余工作**：openhands_agent.py HTTP worker 并入 + runner.py reconcile
++ C 类干净加（remote_eval_worker.py / config/ / LOG.md）+ 静态验证。
