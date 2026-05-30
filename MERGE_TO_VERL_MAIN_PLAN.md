@@ -172,3 +172,30 @@ local `verl-main-merge`，未 push（你 review 后再 push）。
 
 **当前阶段剩余工作**：openhands_agent.py HTTP worker 并入 + runner.py reconcile
 + C 类干净加（remote_eval_worker.py / config/ / LOG.md）+ 静态验证。
+
+### 7.1 verl-main 持续演进的影响（rebase 跟进）
+
+verl-main-merge 已 rebase 到 `origin/verl-main@1464f0c0`（2026-05-30）。新增：
+
+- `cd264486` docs（F2 hardcoded workspace path）
+- **`1464f0c0` refactor(trainer): 删除 stage2 F3 all-drop guard** ⚠️
+
+**⚠️ F3 all-drop guard 删除对我们的风险（skills 阶段必查）**：
+
+被删的 guard：当一个 batch 所有 uid 都被 drop（`is_correct=False` 或
+`repeat_counts=0`）时 `continue` 跳过该 batch，否则下游
+`union/balance_batch/old_log_prob` 会 **crash on empty DataProto**。
+
+verl-main 为对齐 verl（"train every batch unconditionally"）删了它，基于
+**AscendC reward** 的 is_correct 判定。但其原始注释明说触发场景是
+"real-reward start-up: agent doesn't write impl → is_correct=False for every
+rollout → whole batch drop" —— **这正是 triton 稀疏 reward 初期的常态**
+（KernelBench 难，初期大量无有效 impl）。
+
+风险：skills 阶段换成 triton reward（`metrics.json` correctness_ok）后，
+all-drop 比 AscendC 更易发生，empty DataProto crash 风险回归。
+
+**处置**：当前 trainer 判 A（跟随 verl-main 删 guard，不在当前阶段动）。
+skills 阶段换 triton reward 时，**必须重新评估是否要恢复 all-drop guard**
+（或等价的空 batch 保护），并跟 rejection_sample / compact_filtering 配置
+一起测稀疏 reward 初期是否 crash。记入 §4 skills 阶段 reward 任务的前置检查。
