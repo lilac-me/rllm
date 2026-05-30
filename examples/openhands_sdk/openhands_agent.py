@@ -46,6 +46,10 @@ import stat
 import subprocess
 import tempfile
 import uuid
+import io
+import tarfile
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse, urlunparse
 from typing import Any
 from pathlib import Path
@@ -83,6 +87,19 @@ _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
 _KEEP_CONTAINER = os.environ.get("KEEP_OPENHANDS_CONTAINER", "0") == "1"
 _KEEP_WORKSPACE = os.environ.get("KEEP_OPENHANDS_WORKSPACE", "0") == "1"
 # _OPENHANDS_ASCEND_VISIBLE_DEVICES = os.environ.get("OPENHANDS_ASCEND_VISIBLE_DEVICES", "").strip()
+
+# HTTP remote eval worker (multi-host rollout architecture). Empty URL → fall
+# back to same-machine docker run inside _run_remote_eval_worker. Paired with
+# examples/openhands_sdk/remote_eval_worker.py. See MERGE_TO_VERL_MAIN_PLAN.md §1.
+_OPENHANDS_REMOTE_EVAL_URL = os.environ.get("OPENHANDS_REMOTE_EVAL_URL", "").strip().rstrip("/")
+_OPENHANDS_EVAL_DEVICE_IDS = os.environ.get("OPENHANDS_EVAL_DEVICE_IDS", "").strip()
+_OPENHANDS_EVAL_DEVICE_COUNT = os.environ.get("OPENHANDS_EVAL_DEVICE_COUNT", "").strip()
+if not _OPENHANDS_EVAL_DEVICE_COUNT:
+    _OPENHANDS_EVAL_DEVICE_COUNT = str(
+        len([x for x in _OPENHANDS_EVAL_DEVICE_IDS.split(",") if x.strip()])
+        if _OPENHANDS_EVAL_DEVICE_IDS
+        else 1
+    )
 
 # ---------------------------------------------------------------------------
 # NPU operator workspace setup
@@ -456,6 +473,116 @@ def _to_container_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HTTP remote eval worker (multi-host rollout) — ported from openhands-refactoring.
+# Empty OPENHANDS_REMOTE_EVAL_URL → falls back to _run_openhands_container below
+# (same-machine docker run). Non-empty → POST workspace tar to remote worker.
+# ---------------------------------------------------------------------------
+
+def _tar_directory_b64(path: str, arcname: str = ".") -> str:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(path, arcname=arcname)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _manifest_directory(path: str, limit: int = 80) -> list[str]:
+    root = Path(path)
+    if not root.exists():
+        return []
+    items: list[str] = []
+    for item in root.rglob("*"):
+        rel = item.relative_to(root).as_posix()
+        items.append(rel + ("/" if item.is_dir() else ""))
+        if len(items) >= limit:
+            items.append("...")
+            break
+    return items
+
+
+def _extract_tar_b64_into(encoded: str, destination: str) -> None:
+    raw = base64.b64decode(encoded.encode("ascii"))
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        dest = Path(destination).resolve()
+        for member in tar.getmembers():
+            target = (dest / member.name).resolve()
+            if dest != target and dest not in target.parents:
+                raise ValueError(f"unsafe tar member path: {member.name}")
+        tar.extractall(destination)
+
+
+def _run_remote_eval_worker(
+    workspace: str,
+    proxied_url: str,
+    instruction: str,
+    *,
+    task: dict[str, Any] | None = None,
+) -> int:
+    if not _OPENHANDS_REMOTE_EVAL_URL:
+        return _run_openhands_container(workspace, proxied_url, instruction, task=task)
+
+    payload = {
+        "workspace_tar_gz_b64": _tar_directory_b64(workspace, arcname="workspace"),
+        "workspace_manifest": _manifest_directory(workspace),
+        "proxied_url": proxied_url,
+        "instruction": instruction,
+        "task": task or {},
+        "image": _OPENHANDS_IMAGE,
+        "model_name": _MODEL_NAME,
+        "max_iterations": _MAX_ITERATIONS,
+        "container_timeout": _CONTAINER_TIMEOUT,
+        "eval_device_ids": _OPENHANDS_EVAL_DEVICE_IDS,
+        "eval_device_count": _OPENHANDS_EVAL_DEVICE_COUNT,
+        "observer_api_url": os.environ.get(
+            "OPENHANDS_REMOTE_OBSERVER_API_URL",
+            os.environ.get("OBSERVER_API_URL", ""),
+        ),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_OPENHANDS_REMOTE_EVAL_URL}/run",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    timeout = int(os.environ.get("OPENHANDS_REMOTE_EVAL_TIMEOUT", str(_CONTAINER_TIMEOUT + 300)))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"remote eval worker HTTP {exc.code}: {body[:1000]}") from exc
+
+    if "agent_workdir_tar_gz_b64" in result:
+        agent_dir = Path(workspace) / "agent_workdir"
+        if agent_dir.exists():
+            shutil.rmtree(agent_dir)
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        _extract_tar_b64_into(result["agent_workdir_tar_gz_b64"], str(agent_dir.parent))
+
+    result_for_log = {k: v for k, v in result.items() if k != "agent_workdir_tar_gz_b64"}
+    try:
+        (Path(workspace) / "agent_workdir").mkdir(parents=True, exist_ok=True)
+        (Path(workspace) / "agent_workdir" / "remote_eval_result.json").write_text(
+            json.dumps(result_for_log, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.debug("[openhands-remote] failed to write remote_eval_result.json", exc_info=True)
+
+    if result.get("worker_error"):
+        logger.warning("[openhands-remote] worker_error=%s", result.get("worker_error"))
+
+    exit_code = int(result.get("exit_code", -1))
+    if exit_code != 0:
+        logger.warning("[openhands-remote] exit_code=%s result=%s", exit_code, result_for_log)
+
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
 # OpenHands container launch
 # ---------------------------------------------------------------------------
 
@@ -765,7 +892,9 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     # decide whether to re-enable normalization.
     reward = 0.0
     try:
-        output = _run_openhands_container(
+        # Route through HTTP worker (multi-host); empty OPENHANDS_REMOTE_EVAL_URL
+        # makes _run_remote_eval_worker fall back to _run_openhands_container.
+        output = _run_remote_eval_worker(
             workspace, proxied_url, instruction, task=task
         )
         metrics_dir = workspace + "/agent_workdir"
