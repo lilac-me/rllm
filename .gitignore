@@ -185,6 +185,8 @@ tmp/
 
 # Ignore debug logs and run result logs
 logs/
+res*.log
+.codemate/
 rllm/*.json
 
 # Ignore the big datasets
