@@ -40,11 +40,28 @@
 set -euo pipefail
 set -x
 
+# -----------------------------------------------------------------------------
+# Load deployment config (model/path/network/image/memory/topology). Override
+# the file via RLLM_CONFIG_FILE. Topology via RLLM_TOPOLOGY (single|multi).
+# Exports: MODEL_PATH, PROXY_PORT, NIC_NAME, OPENHANDS_IMAGE, OPENHANDS_DATASET,
+# OPENHANDS_REMOTE_EVAL_URL, OPENHANDS_EVAL_DEVICE_IDS,
+# OPENHANDS_CONTAINER_HOST_ALIAS, OPENHANDS_WORKSPACE_TEMP_HOST_DIR,
+# OPENHANDS_ARTIFACT_DIR, TRACE_DB_PATH, PROFILE_SAVE_PATH, OOM_SNAPSHOT_PATH,
+# RLLM_LOG_DIR, PYTORCH_NPU_ALLOC_CONF, ASCEND_RT_VISIBLE_DEVICES.
+# See config/.env.example.
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${RLLM_CONFIG_FILE:-$SCRIPT_DIR/config/qwen36.env}"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: config not found: $CONFIG_FILE (cp config/.env.example to config/qwen36.env)" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
 # First time
 export FORCE_BUILD=0
-export OPENHANDS_DATASET=mock_npu
-export MODEL_PATH=/home/docker/Qwen3.6-35B-A3B
-export PROXY_PORT=5000
+# OPENHANDS_DATASET / MODEL_PATH / PROXY_PORT come from config
 
 # export ASCEND_LAUNCH_BLOCKING=1  # debug only — NPU 同步执行模式便于看 stack trace；正式跑不要开
 
@@ -126,7 +143,7 @@ else
     echo "[stage1] WARN: set MEGATRON_BRIDGE_DIR=<path-to-NVIDIA-NeMo/Megatron-Bridge clone> and re-run."
 fi
 
-export OPENHANDS_IMAGE=openhands-triton-env:v1
+# export OPENHANDS_IMAGE=openhands-triton-env:v1   # <- from config
 
 export HYDRA_FULL_ERROR=1
 
@@ -137,11 +154,11 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128
+# export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128   # <- from config
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   # <- from config
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
@@ -173,7 +190,7 @@ export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/open
 # on main container startup), otherwise the sibling OpenHands container's
 # `-v {workspace}:/opt/workspace` resolves on host dockerd to an empty dir →
 # child container sees empty /opt/workspace → entrypoint.py missing → exit 127.
-OPENHANDS_WORKSPACE_TEMP_HOST_DIR="/home/docker/openhands_workspace"  # 同步 openhands_agent.py
+# OPENHANDS_WORKSPACE_TEMP_HOST_DIR="/home/docker/openhands_workspace"  # 同步 openhands_agent.py   # <- from config
 for _dir in "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" "${OPENHANDS_ARTIFACT_DIR}"; do
     if [ ! -d "${_dir}" ]; then
         echo "[stage1 precheck] ERROR: required dir does not exist: ${_dir}" >&2
@@ -273,13 +290,13 @@ RANKS="[0]"
 DISCRETE=False
 
 # profiling NPU options
-SAVE_PATH="/workspace/results/profile_data/all"
+SAVE_PATH="${PROFILE_SAVE_PATH}"   # from config
 LEVEL="level1"
 CONTENTS=['npu','cpu','memory']
 ANALYSIS=True
 
 export OOM_SNAPSHOT_ENABLE=1
-export OOM_SNAPSHOT_PATH="/workspace/results/profile_data"
+# export OOM_SNAPSHOT_PATH="/workspace/results/profile_data"   # <- from config
 
 if [[ "$MODEL_PATH" == *"Qwen3-Coder"* ]] || [[ "$MODEL_PATH" == *"Qwen3.6"* ]]; then
     TOOL_PARSER=qwen3_coder
