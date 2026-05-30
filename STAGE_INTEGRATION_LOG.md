@@ -8,24 +8,27 @@
 
 # 🚀 Pre-context for new conversation（30 秒回到上下文）
 
-**新对话从这里开始读**。整合工作已完成 cherry-pick + squash 阶段，处于待环境验证 + cleanup 收尾状态。
+**新对话从这里开始读**。整合工作已完成 cherry-pick + squash + stage3+ cleanup，处于待环境验证状态。
 
 ## TL;DR
 
 | Quick fact | Value |
 |---|---|
 | 整合分支 | `verl-main` (本地分支，未 push) |
-| 当前 HEAD | `f8845ff3` "docs: Stage2 review + squash decision (5 commits)" |
+| 当前 HEAD | `fbf23ff4` "fix: restore stage1 parity lost during integration squash" |
 | 起点 | `b2538771` "fix time" (obs 分支 cherry-pick 之一) |
-| ahead | **18 commits ahead of b2538771** |
-| 已完成 | W1 cherry-pick / W2 squash / W3 squash (拆 3) / Stage2 squash (拆 5) / commit message rewrite / 整合分支用户接手指南 / Layer A 静态验证 |
-| 待做 | (1) stage3+ cleanup commit (不需要环境) / (2) Layer B 启动验证 (需 NPU) / (3) Layer C 训练验证 (需 NPU + 真实数据) |
+| ahead | **21 commits ahead of b2538771** |
+| 已完成 | W1 cherry-pick / W2 squash / W3 squash (拆 3) / Stage2 squash (拆 5) / commit message rewrite / 整合分支用户接手指南 / Layer A 静态验证 / **stage3+ cleanup commit** / **Layer 0 树对比 (vs qwen36-openhands-stage1) + 修复 2 处 parity 偏差** |
+| 待做 | (1) Layer B 启动验证 (需 NPU) / (2) Layer C 训练验证 (需 NPU + 真实数据) |
 | 关键源仓 | rllm 本地 `/Users/yeji/Documents/Code/Python/Qwen36/rllm` |
 | 关键 log 文档 | 本文件 `STAGE_INTEGRATION_LOG.md` + `STAGE2_FIT_LOOP_AUDIT.md` + `QWEN36_OPENHANDS_AGENT_RL_PLAN.md` |
 
 ## verl-main 当前 commit 列表（按时间倒序，新 → 旧）
 
 ```
+fbf23ff4 fix: restore stage1 parity lost during integration squash  ← Layer 0 树对比修复
+5db2efa3 chore: stage3+ cleanup — remove dbg() helper + reconcile plan reference  ← stage3+ cleanup
+12ca70d0 docs: add pre-context + followup checklist for new conversation handoff
 f8845ff3 docs: Stage2 review + squash decision (5 commits)
 fa750e61 fix(train-script): DooD precheck FATAL
 50bc9f96 feat(stage1): Dr.GRPO + std0 metric (drop random fallback)
@@ -549,6 +552,25 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 - 如果偶发 trajectory 异常 = 必须修
 
 **优先级**：🟡 中（stage2 sanity 阶段先观察 metric，撞了再修）
+
+---
+
+### F2: OpenHands workspace_temp 是 hardcode 路径 + precheck 太刚
+
+**症状**：DooD 子容器的 workspace 宿主路径写死成 `/home/docker/openhands_workspace`，启动 precheck 对它做"目录存在 + 可写 + 不能落在 overlay/tmpfs"三道硬检查，无 env 逃生口。换部署环境（不同用户 home、host 本身是容器导致 `findmnt` 把真 bind mount 误报成 overlay）时，会在启动期被 `exit 1` 直接拦死。
+
+**位置**：
+- `examples/openhands_sdk/train_openhands_qwen36_npu.sh:176` — `OPENHANDS_WORKSPACE_TEMP_HOST_DIR="/home/docker/openhands_workspace"`（hardcode）+ 177-209 precheck（存在/可写/fstype 三关，全是 `exit 1`）
+- `examples/openhands_sdk/openhands_agent.py` — 同一路径在 rollout 侧也写死，两处必须手工同步（注释写了"同步 openhands_agent.py"）
+
+**为什么现在是 hardcode**：plan §14.5 把 `/home/docker/openhands_workspace` 锁成 stage1 固定值，配套 precheck 是为了把"100% trajectory drop"这种隐性失败提前到启动期 fail-fast（audit 教训第 12 条）。当时只服务单一 NPU 部署，写死最简单。
+
+**robust 化方向**（stage3+ 做，三选一或组合）：
+1. **路径可配**：`OPENHANDS_WORKSPACE_TEMP_HOST_DIR` 改成可被 env 覆盖（train.sh + openhands_agent.py 从同一个 env 读，消除两处手工同步）
+2. **加逃生口**：`STAGE1_SKIP_WORKSPACE_PRECHECK=1` 跳过 fstype 那道关（跟 `KEEP_OPENHANDS_CONTAINER` / HCCL opt-in 一个风格），给"我确信挂载没问题但 findmnt 误报"的场景留口子
+3. **换更准的探测**：把 fstype 启发式换成真正的 DooD 往返测试 —— main container 在 workspace 写一个 sentinel 文件，`docker run --rm -v {workspace}:/probe <img> cat /probe/sentinel` 通过宿主 dockerd 读回来，能读到才算 mount 真的 host-visible。比 fstype 猜测准，直接验的就是"子容器到底看不看得到文件"。
+
+**优先级**：🟡 中（当前 hardcode 在锁定的单一部署能跑；换环境 / 多用户 / host-is-container 时才撞，撞到先用方向 2 的逃生口顶过去）
 
 ---
 
