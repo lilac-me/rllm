@@ -29,6 +29,21 @@
    reconcile 进 stage1 的 `verl-main`。在 `verl-main-merge` 分支。**未 push**，
    等 user review + 冒烟 + push。
 
+### 文档地图（阅读顺序）
+
+仓根目录 md 分两批 —— stage1 既有 + 本会话新增：
+
+| 文档 | 来源 | 何时读 |
+|---|---|---|
+| **本文件** `HANDOFF_PRE_CONTEXT.md` | 本会话 | **最先** — 全局索引 |
+| `MERGE_TO_VERL_MAIN_PLAN.md` | 本会话 | 接 OpenHands merge — 逐文件 reconcile 决策 + §7 进度 |
+| `OPENHANDS_REFACTORING_LOG.md` | 本会话 | KU1-8 知识（DooD/padding/lock/LiteLLM 等） |
+| `QWEN36_OPENHANDS_AGENT_RL_PLAN.md`（160KB） | stage1 既有 | 接 stage1 训练细节 — Qwen3.6 主计划（并行/MoE/megatron flags/§ 编号被各 commit 引用） |
+| `STAGE_INTEGRATION_LOG.md` | stage1 既有 | stage1 整合演进日志（F1-F3 findings 等，F3=本会话提到的 all-drop guard） |
+| `STAGE2_FIT_LOOP_AUDIT.md` / `UPSTREAM_DELTA_*.md` | stage1 既有 | fit-loop 审计 / 上游 delta 分析 |
+
+接 OpenHands merge 线 → 读前 3 个。接 stage1 训练线 → 加读 QWEN36 plan + STAGE_INTEGRATION_LOG。
+
 ---
 
 ## 2. 仓库 / 分支地图
