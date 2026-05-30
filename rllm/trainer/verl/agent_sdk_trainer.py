@@ -249,11 +249,6 @@ class AgentSdkTrainer(RayPPOTrainer):
         solve_all = 0
         solve_partial = 0
         num_tasks = 0
-        # stage2 audit F3: count of batches where every uid was dropped before
-        # building `batch`. Without this guard the downstream union/balance_batch/
-        # old_log_prob crashes on an empty DataProto. Reset at the end of each
-        # successful step alongside solve_*/num_tasks below.
-        skipped_all_drop = 0
         termination_counts = Counter()
         workflow_metrics = defaultdict(list)
         metrics = {}
@@ -363,24 +358,6 @@ class AgentSdkTrainer(RayPPOTrainer):
                     # collect and log termination reasons
                     termination_reasons = episode_unique_batch.non_tensor_batch["termination_reasons"]
                     termination_counts.update(termination_reasons)
-
-                    # stage2 audit F3: skip this batch if every uid was dropped (or
-                    # repeat_counts came back all-zero so unique_uids is empty).
-                    # Without this guard, the downstream union/balance_batch/
-                    # old_log_prob path crashes on an empty DataProto. Real-reward
-                    # start-up is the common trigger: agent doesn't write an impl
-                    # file → is_correct=False for every rollout → drop_uids covers
-                    # the whole batch. Continue without bumping global_steps so
-                    # this attempt isn't counted as a training step.
-                    if len(drop_uids) == len(unique_uids):
-                        skipped_all_drop += 1
-                        print(
-                            f"[fit_agent] step={self.global_steps}: all "
-                            f"{len(unique_uids)} uids dropped "
-                            f"(is_correct=False or repeat_counts=0); "
-                            f"skipping batch (cumulative skipped={skipped_all_drop})"
-                        )
-                        continue
 
                     if not self.config.rllm.rejection_sample.enable:
                         batch = new_batch
@@ -777,12 +754,6 @@ class AgentSdkTrainer(RayPPOTrainer):
                 metrics["batch/solve_none"] = solve_none / num_tasks
                 metrics["batch/solve_all"] = solve_all / num_tasks
                 metrics["batch/solve_partial"] = solve_partial / num_tasks
-                # stage2 audit F3: emit count of batches skipped since last
-                # successful step. Steady-state should be ~0; sustained > 0
-                # signals real-reward is producing too few is_correct=True
-                # episodes (or transform_results_for_verl returning all-zero
-                # repeat_counts) — either way training is starving.
-                metrics["batch/skipped_all_drop"] = skipped_all_drop
 
                 for key, value in workflow_metrics.items():
                     metrics[f"batch/{key}"] = np.mean(value)
@@ -802,7 +773,6 @@ class AgentSdkTrainer(RayPPOTrainer):
                 solve_all = 0
                 solve_partial = 0
                 num_tasks = 0
-                skipped_all_drop = 0
                 termination_counts = Counter()
                 workflow_metrics = defaultdict(list)
                 metrics = {}

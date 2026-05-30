@@ -574,6 +574,34 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 
 ---
 
+## 相对 verl 的偏差清单（AgentSdkTrainer fit loop）
+
+> **原则（用户校准 2026-05-30）**：`AgentSdkTrainer.fit_agent` 尽量对齐 verl `RayPPOTrainer.fit` 的动作；**非必要的添加不保留**。本节记录 stage1/2 在训练循环里相对 verl 多出来的东西及其去留，后续改动按此对齐。
+>
+> verl 基线动作（`verl/verl/trainer/ppo/ray_trainer.py`）：每个 batch **无条件** `compute_advantage`(:1575) → `update_actor`(:1599) → `update_weights` → `global_steps += 1`(:1694)。**没有** reward-based 的"跳过这批 / 不计 step"。verl 自己的 "rejection sampling"(:1565 `compute_rollout_correction_and_add_to_batch`) 是 **IS-weight rollout 校正 + 加 metrics**，**不丢整批、不跳 step** —— 跟 rllm 的 drop 是两回事。
+
+### 已移除
+
+| 偏差 | 来源 | 处理 |
+|---|---|---|
+| **F3 全 drop guard**：`if len(drop_uids)==len(unique_uids): continue`（一批全失败就静默跳过、且 `continue` 在 `global_steps+=1` 之前 → 不计 step） | stage2 commit `f258836b`（"stage2 audit F3"，BryanChen408 2026-05-29） | **删除**（commit 见下）。配套删 `skipped_all_drop` 变量（init/reset）+ `batch/skipped_all_drop` metric |
+
+**删除后行为（= verl）**：
+- **有 step、reward 0 的批** → 照训（GRPO `/(std+eps)` → advantage=0 → 空梯度 → `global_steps+1`）。`rejection_sample.enable=False` 时 `batch = new_batch`（整批），不会变空，训练安全。→ 修掉了"reward 恒 0 时一批接一批刷 rollout、一个 step 都完不成"的退化。
+- **真空批（0 step / `unique_uids` 空）** → 不再静默跳过 → 下游 `union/balance_batch/old_log_prob` 撞 empty DataProto **自然崩 surface**。这是有意为之:**空 = 异常（容器挂/trace 对不齐/vLLM 500/flush race，见 `agent_sdk_engine.py:314,361` 的 `empty` flag），该停下来查,不加 graceful 兜底**。
+
+### 保留（gated，关闭即 inert，不破坏 verl 对齐）
+
+| 偏差 | 来源 | 说明 |
+|---|---|---|
+| **拒绝采样 `drop_uids`**（组内**全错** `not .any()` **或全对** `.all()` 就丢，`agent_sdk_trainer.py:~323-334`） | rllm（DAPO 式动态采样，非 verl 机制） | 由 `rllm.rejection_sample.enable` 控制。stage2 锁为 **False** → `batch = new_batch` 用整批，`drop_uids` 仅在 `enable=True` 时用于 `rejection_mask`。关闭时 inert，留着无害,故**不动** |
+
+### 为什么 verl 没有真空批、AgentSdk 有
+
+verl 的纯 vLLM `generate` 永远产出 token → 永远 ≥1 step → 从不撞空批,所以 verl 不需要任何空批兜底。AgentSdk 的 **OpenHands rollout 可能 0 step**（容器 exit 127 / docker.sock 不通 / 容器超时被杀 / metadata slug 路由失败导致 trace 不对齐 / 调用 500 含 GDN 崩 / flush 未同步）。这是 agent 路径特有的**异常**,现在的策略是**让它自然崩 surface,而非静默跳过**。
+
+---
+
 ## verl-main cherry-pick 计划（W1 阶段）
 
 | commit | 已在分支祖先 | 需 cherry-pick | 顺序 |
@@ -605,6 +633,7 @@ workflow 层 catch 这个 RuntimeError，决定是 drop 还是 retry。
 | 2026-05-29 | W3 squash 拆分（初版 1 commit → 拆 3 commit） | W2 squash 合理是因为 11 个 commits 是同一 feature 演进；W3 11 个 commits 跨 OpenHands runtime / 训练脚本 config / Trainer 核心架构 bridge 三个完全不同子系统，1 commit 让 trainer bridge 这种核心架构修复在 git log 不可见；拆 3 个 commit 每个 logical scope 单一 |
 | 2026-05-29 | Commit message rewrite — 6 个 commits 移除 stage1 日志绑定（W2.X / plan §13.x） | 用户校准要求整合分支独立于 stage1 工作日志；用 git filter-branch --msg-filter 一次性重写，commit content 不变；只更新过期 SHA 在 log 文档里的引用 |
 | 2026-05-29 | Stage2 squash 拆 5 commit | 继承 W3 拆分精神——8 个 input commits 跨 audit/observability / runtime / 算法决策 / precheck 4-5 个子系统；按 logical sub-theme 拆 5 个 commit 让每个 scope 单一；audit + observability 合并 1 commit 因为三者性质强相关（都是 audit 主线产物）|
+| 2026-05-30 | 删除 stage2 F3 全 drop guard，对齐 verl（详见 §"相对 verl 的偏差清单"） | 用户校准：fit loop 对齐 verl、非必要添加不保留。F3（`f258836b`）让全失败批静默跳过且不计 step → reward 恒 0 时退化成"刷 rollout 不训练"；verl 是每批无条件 train。删 F3 后:reward-0-有 step 照训(advantage=0)、真空批自然崩 surface（空=异常不加兜底）。gated 的 rejection sampling 关闭即 inert,保留不动 |
 
 ---
 
