@@ -26,9 +26,13 @@ from typing import Any
 
 # Host path used as the `-v` source for OpenHands containers' NPU file-lock
 # directory. MUST exist on the host filesystem (where the worker runs), since
-# this is what `docker run -v <here>:/shared/device-locks` will see. Hard-coded
-# to match openhands_agent.py and the container's EVAL_LOCK_DIR.
-_SHARED_NPU_LOCK_DIR = "/tmp/shared_npu_lock"
+# this is what `docker run -v <here>:/shared/device-locks` will see.
+# Overridable via OPENHANDS_EVAL_LOCK_DIR so the lock dir can live anywhere
+# (e.g. under the launch dir for a fully portable worker). The default keeps the
+# legacy /tmp path so it still matches openhands_agent.py's same-host fallback
+# and the container's EVAL_LOCK_DIR. This is the single source of truth — the
+# per-request bind-mount source (_run_request) reuses this constant.
+_SHARED_NPU_LOCK_DIR = os.environ.get("OPENHANDS_EVAL_LOCK_DIR", "/tmp/shared_npu_lock")
 
 # Worker-side GC window: files older than this in work-dir / lock-dir are
 # considered orphaned (worker / OpenHands container crashed without cleanup)
@@ -141,7 +145,7 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
     if not eval_device_count:
         eval_device_count = str(len([x for x in eval_device_ids.split(",") if x.strip()]) if eval_device_ids else 1)
 
-    lock_dir = os.environ.get("OPENHANDS_EVAL_LOCK_DIR", "/tmp/shared_npu_lock")
+    lock_dir = _SHARED_NPU_LOCK_DIR  # single source of truth (honors OPENHANDS_EVAL_LOCK_DIR)
     Path(lock_dir).mkdir(mode=0o755, parents=True, exist_ok=True)
 
     cmd = [
