@@ -373,6 +373,14 @@ class AgentExecutionEngine:
             reward = await loop.run_in_executor(self.executor, env.compute_final_reward)
             reward_time = time.time() - start_time
             cur_step.reward = reward
+
+        # Capture per-step eval info (speedup / correctness / compiled) from
+        # the env before closing it, so the trainer can surface "fast" metrics
+        # alongside the existing "pass" metrics during validation.
+        env_eval_info = None
+        if hasattr(env, "last_eval_info"):
+            env_eval_info = env.last_eval_info
+
         # Closing environment using the executor.
         await loop.run_in_executor(self.executor, env.close)
         if termination_reason:
@@ -416,6 +424,7 @@ class AgentExecutionEngine:
                     "total_time": total_time,
                     "token_mismatch": 0.0 if is_valid_trajectory else 1.0,
                 },
+                "env_eval_info": env_eval_info or {},
             }
             return token_result
         elif mode == "Conversation":
@@ -428,6 +437,7 @@ class AgentExecutionEngine:
                 "chat_completions": agent.chat_completions,
                 "mc_returns": [step.mc_return for step in trajectory.steps][: len(episode_steps)],
                 "termination_reason": termination_reason,
+                "env_eval_info": env_eval_info or {},
             }
             return steps_result
         else:

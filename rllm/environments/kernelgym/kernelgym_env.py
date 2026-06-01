@@ -170,6 +170,22 @@ class KernelGymEnv(MultiTurnEnvironment):
         
         # 用于存储每次 get_reward_and_next_obs 返回的 meta_data
         self.meta_info_history = list()
+
+    @property
+    def last_eval_info(self) -> dict:
+        """Return a flat dict of pass/fast metrics from the latest env step.
+
+        Safe to call from the async engine after the trajectory loop ends.
+        Returns empty defaults when no evaluation has run yet.
+        """
+        if not self.meta_info_history:
+            return {"speedup": 0.0, "correctness": False, "compiled": False}
+        m = self.meta_info_history[-1]
+        return {
+            "speedup": float(m.get("performance", 0.0) or 0.0),
+            "correctness": bool(m.get("correctness", False)),
+            "compiled": bool(m.get("compilation", False)),
+        }
         
         #! 配置信息
         self.config = config

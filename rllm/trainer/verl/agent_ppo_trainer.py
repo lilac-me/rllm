@@ -594,6 +594,10 @@ class AgentPPOTrainer(RayPPOTrainer):
         rewards_lst = []
         data_source_lst = []
         uid_lst = []
+        # Per-sample eval metrics from the environment (speedup / correctness / compiled).
+        speedup_lst = []
+        correctness_lst = []
+        compiled_lst = []
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             test_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
@@ -625,6 +629,13 @@ class AgentPPOTrainer(RayPPOTrainer):
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
             uid_lst.append(test_batch.non_tensor_batch["uid"])
 
+            # Collect per-sample eval info when available.
+            nb = test_batch.non_tensor_batch
+            if "env_eval_speedup" in nb:
+                speedup_lst.append(nb["env_eval_speedup"])
+                correctness_lst.append(nb["env_eval_correctness"])
+                compiled_lst.append(nb["env_eval_compiled"])
+
         reward_tensor = torch.cat(rewards_lst, dim=0)  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         # evaluate test_score based on data source
@@ -651,6 +662,22 @@ class AgentPPOTrainer(RayPPOTrainer):
             # take highest score
             data_source_uid_pass_rates[data_source][uid] = max(data_source_uid_pass_rates[data_source][uid], reward_tensor[i].item())
 
+        # Aggregate per-sample eval info (speedup / correctness / compiled) by
+        # data source alongside the existing pass@k metrics.
+        has_eval_info = len(speedup_lst) > 0
+        if has_eval_info:
+            all_speedups = np.concatenate(speedup_lst, axis=0)
+            all_correctness = np.concatenate(correctness_lst, axis=0)
+            all_compiled = np.concatenate(compiled_lst, axis=0)
+            data_source_speedup: dict[str, list[float]] = {}
+            data_source_correctness: dict[str, list[bool]] = {}
+            data_source_compiled: dict[str, list[bool]] = {}
+            for i in range(all_speedups.shape[0]):
+                ds = data_sources[i]
+                data_source_speedup.setdefault(ds, []).append(float(all_speedups[i]))
+                data_source_correctness.setdefault(ds, []).append(bool(all_correctness[i]))
+                data_source_compiled.setdefault(ds, []).append(bool(all_compiled[i]))
+
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             # clip rewards to be between 0 and 1
@@ -663,6 +690,19 @@ class AgentPPOTrainer(RayPPOTrainer):
             for uid, pass_score in pass_rates.items():
                 pass_k_lst.append(pass_score >= 1)  # assuming 1 means passed
             metric_dict[f"val/test_score/pass@k/{data_source}"] = np.mean(pass_k_lst)
+
+        if has_eval_info:
+            for data_source in data_source_compiled:
+                compiled_arr = np.array(data_source_compiled[data_source], dtype=np.float32)
+                correctness_arr = np.array(data_source_correctness[data_source], dtype=np.float32)
+                speedup_arr = np.array(data_source_speedup[data_source], dtype=np.float32)
+                # "pass" metrics
+                metric_dict[f"val/compile_rate/{data_source}"] = float(np.mean(compiled_arr))
+                metric_dict[f"val/correctness_rate/{data_source}"] = float(np.mean(correctness_arr))
+                # "fast" metric: mean speedup among correct samples
+                correct_mask = correctness_arr >= 1.0
+                if correct_mask.sum() > 0:
+                    metric_dict[f"val/mean_speedup_correct/{data_source}"] = float(speedup_arr[correct_mask].mean())
 
         return metric_dict
 
@@ -755,6 +795,10 @@ class AgentPPOTrainer(RayPPOTrainer):
         chat_completions = []
         traj_metrics = []
         metrics = {}
+        # Per-trajectory eval info from the environment.
+        traj_speedups = []
+        traj_correctness = []
+        traj_compiled = []
 
         for traj in trajectories:
             # ['prompt_tokens', 'response_tokens', 'response_masks', 'trajectory_reward', 'idx', 'chat_completions', 'metrics']
@@ -770,6 +814,11 @@ class AgentPPOTrainer(RayPPOTrainer):
             traj_scores.append(traj["trajectory_reward"])
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
+
+            eval_info = traj.get("env_eval_info", {}) or {}
+            traj_speedups.append(float(eval_info.get("speedup", 0.0)))
+            traj_correctness.append(bool(eval_info.get("correctness", False)))
+            traj_compiled.append(bool(eval_info.get("compiled", False)))
 
         # Flatten traj_metrics into a dict of lists
         traj_metrics = {k: [d[k] for d in traj_metrics] for k in traj_metrics[0]}
@@ -857,7 +906,13 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         self.visualize_trajectory(DataProto.from_dict(tensors=tensor_batch))
 
-        return DataProto.from_dict(tensors=tensor_batch), metrics
+        non_tensor_batch = {}
+        if traj_speedups:
+            non_tensor_batch["env_eval_speedup"] = np.array(traj_speedups, dtype=np.float32)
+            non_tensor_batch["env_eval_correctness"] = np.array(traj_correctness, dtype=bool)
+            non_tensor_batch["env_eval_compiled"] = np.array(traj_compiled, dtype=bool)
+
+        return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch), metrics
 
     def visualize_trajectory(self, tensor_batch, sample_idx=0, max_samples=1, mask_key="response_mask"):
         """
@@ -946,6 +1001,10 @@ class AgentPPOTrainer(RayPPOTrainer):
         training_rewards = []
         all_mc_returns = []  # Monte Carlo returns for each episode
         chat_completions = []
+        # Per-step eval metrics from the environment (speedup / correctness / compiled).
+        all_steps_speedup = []
+        all_steps_correctness = []
+        all_steps_compiled = []
         # the last step will have reward assigned and be used for advantage calculation
 
         for episode in steps:
@@ -954,6 +1013,11 @@ class AgentPPOTrainer(RayPPOTrainer):
             training_reward = episode["trajectory_reward"]
             mc_returns = episode["mc_returns"]
             termination_reason = episode.get("termination_reason")
+
+            env_eval_info = episode.get("env_eval_info", {}) or {}
+            ep_speedup = float(env_eval_info.get("speedup", 0.0))
+            ep_correctness = bool(env_eval_info.get("correctness", False))
+            ep_compiled = bool(env_eval_info.get("compiled", False))
 
             if not episode_steps:
                 raise ValueError(f"Trajectory idx={idx} contains zero steps, cannot build step-wise training batch.")
@@ -1013,6 +1077,10 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_steps_step_num.extend([len(episode_steps) for _ in range(len(episode_steps))])
             all_steps_step_ids.extend([f"{uids[idx]}_step{i}" for i in range(len(episode_steps))])
             all_steps_masked_out.extend([masked_out for _ in range(len(episode_steps))])
+
+            all_steps_speedup.extend([ep_speedup for _ in range(len(episode_steps))])
+            all_steps_correctness.extend([ep_correctness for _ in range(len(episode_steps))])
+            all_steps_compiled.extend([ep_compiled for _ in range(len(episode_steps))])
 
         if chat_completions:
             save_dir = os.path.join(self.config.trainer.default_local_dir, "chat_completions")
@@ -1124,6 +1192,12 @@ class AgentPPOTrainer(RayPPOTrainer):
             "batch_id": np.array([batch_id for _ in range(len(all_steps_idx_list))]),  # in case need to differentiate which iteration the step is coming from
             "step_ids": np.array(all_steps_step_ids),
         }
+        # Attach per-step eval info so the validation loop can surface speedup /
+        # correctness / compiled breakdowns alongside the existing reward metric.
+        if all_steps_speedup:
+            non_tensor_batch["env_eval_speedup"] = np.array(all_steps_speedup, dtype=np.float32)
+            non_tensor_batch["env_eval_correctness"] = np.array(all_steps_correctness, dtype=bool)
+            non_tensor_batch["env_eval_compiled"] = np.array(all_steps_compiled, dtype=bool)
 
         meta_info = {"repeat_counts": [x + 1 for x in step_numbers]}
 
