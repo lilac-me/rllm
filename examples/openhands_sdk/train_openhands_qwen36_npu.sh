@@ -181,69 +181,6 @@ export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-1}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-1800}"
 export OPENHANDS_ARTIFACT_DIR="${OPENHANDS_ARTIFACT_DIR:-/workspace/results/openhands_results}"
 
-# ------------------------------------------------------------------------------
-# DooD runtime dirs precheck (plan §13.23, audit 教训第 12 条)
-# ------------------------------------------------------------------------------
-# These two dirs must exist + be writable from inside the main container.
-# OPENHANDS_WORKSPACE_TEMP_HOST_DIR is the bigger trap: it MUST be a same-path
-# bind mount from host (`-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
-# on main container startup), otherwise the sibling OpenHands container's
-# `-v {workspace}:/opt/workspace` resolves on host dockerd to an empty dir →
-# child container sees empty /opt/workspace → entrypoint.py missing → exit 127.
-# OPENHANDS_WORKSPACE_TEMP_HOST_DIR="/home/docker/openhands_workspace"  # 同步 openhands_agent.py   # <- from config
-for _dir in "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" "${OPENHANDS_ARTIFACT_DIR}"; do
-    if [ ! -d "${_dir}" ]; then
-        echo "[stage1 precheck] ERROR: required dir does not exist: ${_dir}" >&2
-        echo "  On host: mkdir -p ${_dir}" >&2
-        echo "  Main container startup MUST add: -v ${_dir}:${_dir}" >&2
-        exit 1
-    fi
-    if ! touch "${_dir}/.stage1_precheck" 2>/dev/null; then
-        echo "[stage1 precheck] ERROR: dir not writable: ${_dir}" >&2
-        exit 1
-    fi
-    rm -f "${_dir}/.stage1_precheck"
-done
-# Hard check: workspace_temp dir MUST live under a host bind mount, NOT on the
-# main container's overlay layer (that defeats DooD — sibling container would see
-# empty /opt/workspace and fail with exit 127). `findmnt -T` walks up the mount
-# tree, so mounting an ancestor like `-v /home/docker:/home/docker` (or `/home`)
-# is correctly accepted here.
-# Was WARN-only before; promoted to FATAL because overlay/tmpfs guarantees the
-# DooD child container fails on every rollout → 100% trajectory drop, no useful
-# work happens. Better to fail at startup with a clear message than to spend
-# debug rounds on "rollout always drops".
-# findmnt may not be present in all images — skip silently if missing.
-if command -v findmnt >/dev/null 2>&1; then
-    _fstype=$(findmnt -no FSTYPE -T "${OPENHANDS_WORKSPACE_TEMP_HOST_DIR}" 2>/dev/null || echo "")
-    if [ "${_fstype}" = "overlay" ] || [ "${_fstype}" = "tmpfs" ]; then
-        echo "[stage1 precheck] FATAL: ${OPENHANDS_WORKSPACE_TEMP_HOST_DIR} sits on '${_fstype}' fs (not a bind mount)." >&2
-        echo "  Child OpenHands containers will see empty /opt/workspace and fail (exit 127), causing 100% trajectory drop." >&2
-        echo "  Fix: restart main container with -v <host_path>:<container_path>; mounting any ancestor (e.g. -v /home/docker:/home/docker or -v /home:/home) also works." >&2
-        exit 1
-    fi
-    unset _fstype
-fi
-
-# Hard check: DooD itself is wired up. main container needs the host docker
-# daemon socket mounted (-v /var/run/docker.sock:/var/run/docker.sock) so the
-# `docker run` inside _run_openhands_container can reach the host dockerd.
-# Without this, every rollout's `docker run` returns "Cannot connect to the
-# Docker daemon" non-zero exit → empty trajectory → 100% drop, same symptom as
-# the overlay-workspace trap. Train script entered rollout phase fine because
-# ray/vllm don't need docker; the failure only surfaces at first rollout.
-# Sanity-checked here so the failure mode is "fail-fast at startup", not "all
-# trajectories drop after model load". Lesson from container migration debug
-# 2026-05-28: missing docker.sock was the actual root cause after several
-# wrong-direction hypotheses.
-if ! docker ps >/dev/null 2>&1; then
-    echo "[stage1 precheck] FATAL: docker CLI cannot reach a daemon from inside this container." >&2
-    echo "  Likely cause: missing '-v /var/run/docker.sock:/var/run/docker.sock' on main container startup." >&2
-    echo "  DooD (Docker-outside-of-Docker) will not work — every rollout's docker run will fail with" >&2
-    echo "  'Cannot connect to the Docker daemon' and the trajectory will be empty → 100% drop." >&2
-    echo "  Fix: restart main container with the docker.sock bind mount above." >&2
-    exit 1
-fi
 
 # ------------------------------------------------------------------------------
 # Training parameters
@@ -281,7 +218,7 @@ PROXY_PORT="${PROXY_PORT:-4000}"
 TRACE_DB_PATH="${TRACE_DB_PATH:-/workspace/results/rllm-openhands-traces.db}"
 PROJECT_NAME="${PROJECT_NAME:-rllm-openhands-qwen36}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-stage1-qwen36-npu}"
-logs=/workspace/results/verl-rllm-qwen36-npu.log
+logs="${RLLM_LOG_DIR:-/workspace/results}/verl-rllm-qwen36-npu.log"
 
 # profiling configuration
 PROFILE_STEPS="[1]"

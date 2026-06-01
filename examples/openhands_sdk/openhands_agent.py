@@ -23,11 +23,6 @@ Environment Variables:
                                   Default: openai/openhands-model
     OPENHANDS_MAX_ITERATIONS    : Max agent iterations, default 30
     OPENHANDS_CONTAINER_TIMEOUT : Seconds to wait for container, default 600
-    KEEP_OPENHANDS_CONTAINER    : "1" to keep the docker container after each
-                                  rollout (debug). Default "0" → docker rm -f
-                                  after logs are archived. Set to "1" only on
-                                  interactive debug sessions; long runs will
-                                  exhaust docker storage otherwise.
     KEEP_OPENHANDS_WORKSPACE    : "1" to keep the per-rollout workspace dir
                                   after archive (debug). Default "0" → rmtree
                                   after archive. Same caveat as above —
@@ -43,7 +38,6 @@ import logging
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import uuid
 import io
@@ -81,16 +75,16 @@ _MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
 _CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
 _ARTIFACT_DIR = os.environ.get("OPENHANDS_ARTIFACT_DIR", "")
 _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
-# stage2 B: debug knobs. Default off → runtime cleans up containers/workspaces
-# after each rollout so multi-step training doesn't exhaust docker storage or
-# the host filesystem. Set to "1" only for interactive inspection.
-_KEEP_CONTAINER = os.environ.get("KEEP_OPENHANDS_CONTAINER", "0") == "1"
+# stage2 B: debug knob. Default off → runtime cleans up the per-rollout workspace
+# after each rollout so multi-step training doesn't exhaust the host filesystem.
+# Set to "1" only for interactive inspection.
 _KEEP_WORKSPACE = os.environ.get("KEEP_OPENHANDS_WORKSPACE", "0") == "1"
 # _OPENHANDS_ASCEND_VISIBLE_DEVICES = os.environ.get("OPENHANDS_ASCEND_VISIBLE_DEVICES", "").strip()
 
-# HTTP remote eval worker (multi-host rollout architecture). Empty URL → fall
-# back to same-machine docker run inside _run_remote_eval_worker. Paired with
-# examples/openhands_sdk/remote_eval_worker.py. See MERGE_TO_VERL_MAIN_PLAN.md §1.
+# HTTP remote eval worker (multi-host rollout architecture). Required: rollouts
+# POST the packed workspace to this URL. With no URL set, _run_remote_eval_worker
+# raises (the same-host docker-run fallback was removed). Paired with
+# examples/openhands_sdk/remote_eval_worker.py; launch via start_remote_worker.sh.
 _OPENHANDS_REMOTE_EVAL_URL = os.environ.get("OPENHANDS_REMOTE_EVAL_URL", "").strip().rstrip("/")
 _OPENHANDS_EVAL_DEVICE_IDS = os.environ.get("OPENHANDS_EVAL_DEVICE_IDS", "").strip()
 _OPENHANDS_EVAL_DEVICE_COUNT = os.environ.get("OPENHANDS_EVAL_DEVICE_COUNT", "").strip()
@@ -235,11 +229,15 @@ _NPU_INSTRUCTION_TEMPLATE = """生成ascendC算子，npu=0，算子描述文件�
 def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str:
     pwd = Path(__file__).parent
     _WORKSPACE_PKG = pwd / "workspace"
-    # DooD: must be a host path also bind-mounted into the main container at the
-    # SAME path, since the sibling container's `-v {workspace}:/opt/workspace` is
-    # resolved by the host dockerd. Requires `-v /home/docker/openhands_workspace:/home/docker/openhands_workspace`
-    # on main container startup. See plan §13.23.
-    workspace_temp = Path("/home/docker/openhands_workspace")
+    # Per-rollout staging dir (trainer-side, ephemeral): the workspace bundle is
+    # copied here and the per-sample files injected, then it is packed and POSTed
+    # to the remote eval worker (_run_remote_eval_worker) and deleted. It is NEVER
+    # bind-mounted into a container on this side, so it only needs to be writable
+    # scratch — no /home/docker, no same-path bind mount. Honors
+    # OPENHANDS_WORKSPACE_TEMP_HOST_DIR; defaults to a gitignored package-relative
+    # dir (examples/openhands_sdk/workspace_temp) so the checkout stays portable.
+    _ws_temp_env = os.environ.get("OPENHANDS_WORKSPACE_TEMP_HOST_DIR", "").strip()
+    workspace_temp = Path(_ws_temp_env) if _ws_temp_env else Path(__file__).resolve().parent / "workspace_temp"
     workspace_temp.mkdir(parents=True, exist_ok=True)
     workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=workspace_temp)
     op_name = task.get("op_name", "operator")
@@ -474,7 +472,7 @@ def _to_container_url(url: str) -> str:
 
 # ---------------------------------------------------------------------------
 # HTTP remote eval worker (multi-host rollout) — ported from openhands-refactoring.
-# Empty OPENHANDS_REMOTE_EVAL_URL → falls back to _run_openhands_container below
+# OPENHANDS_REMOTE_EVAL_URL is required; an empty value raises (same-host fallback removed).
 # (same-machine docker run). Non-empty → POST workspace tar to remote worker.
 # ---------------------------------------------------------------------------
 
@@ -518,7 +516,12 @@ def _run_remote_eval_worker(
     task: dict[str, Any] | None = None,
 ) -> int:
     if not _OPENHANDS_REMOTE_EVAL_URL:
-        return _run_openhands_container(workspace, proxied_url, instruction, task=task)
+        raise RuntimeError(
+            "OPENHANDS_REMOTE_EVAL_URL is not set. Rollouts now require the remote "
+            "eval worker; the same-host docker-run fallback (_run_openhands_container) "
+            "was removed. Launch examples/openhands_sdk/start_remote_worker.sh and set "
+            "OPENHANDS_REMOTE_EVAL_URL (see config/qwen36.env)."
+        )
 
     payload = {
         "workspace_tar_gz_b64": _tar_directory_b64(workspace, arcname="workspace"),
@@ -581,202 +584,6 @@ def _run_remote_eval_worker(
 
     return exit_code
 
-
-# ---------------------------------------------------------------------------
-# OpenHands container launch
-# ---------------------------------------------------------------------------
-
-def _run_openhands_container(
-    workspace: str,
-    proxied_url: str,
-    instruction: str,
-    *,
-    task: dict[str, Any] | None = None,
-) -> str:
-    """Start an OpenHands headless container, wait for completion, return logs.
-
-    Args:
-        workspace:    Host-side workspace directory (mounted into container).
-        proxied_url:  LiteLLM proxy URL with embedded rllm metadata slug.
-                      Passed as LLM_BASE_URL so rllm can track all LLM calls.
-        instruction:  Task instruction (also written to INSTRUCTIONS.md).
-    """
-    # TODO(遗留): 禁止 agent 外网（如误 apt）目前仅靠 workspace/AGENTS.md 软约束。若需硬隔离，在此
-    # 组装 docker cmd 时加入 --network（例如宿主机预先 docker network create --internal …），并验证
-    # 仍能访问 host.docker.internal 上的 LiteLLM；勿用 network=none 除非 LLM 不依赖宿主机 HTTP。
-    task = task or {}
-    container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
-    op_name = task.get("op_name", "operator")
-    arch = task.get("arch", "ascend910b1")
-    operator_backend = str(task.get("operator_backend", "ascendc"))
-
-    path = Path("/tmp/shared_npu_lock")
-    path.mkdir(mode=0o755, parents=True, exist_ok=True)
-
-    # TODO(遗留): Ascend NPU 入容器所需的 docker --device / 额外 -v 挂载（如 /dev/davinci*、驱动相关路径）
-    # 待按 CANN 与所用基础镜像文档确定，并与 OPENHANDS_ASCEND_VISIBLE_DEVICES 一起在真机验证。
-    # 当前仅挂载 workspace、entrypoint 及注入 ASCEND_RT_VISIBLE_DEVICES（若设置）。
-    cmd = [
-        "docker", "run",
-        #"--rm",  # TODO
-        "-d",
-        "--name", container_name,
-        "--network", "host",
-        "--ipc", "host",
-        "--shm-size", "500g",
-        "--privileged",
-        "-e", f"LLM_BASE_URL={proxied_url}",
-        "-e", "LLM_API_KEY=EMPTY",
-        "-e", f"LLM_MODEL=openai/{_MODEL_NAME}",
-        "-e", f"OPERATOR_BACKEND={operator_backend}",
-        "-e", f"OPERATOR_ARCH={arch}",
-        "-e", f"OPERATOR_NAME={op_name}",
-        
-        "-e", "http_proxy=", 
-        "-e", "https_proxy=",
-        "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1",
-        "-e", "WORKSPACE_BASE=/opt/workspace/agent_workdir",
-        "-e", f"OBSERVER_API_URL=http://host.docker.internal:18858",
-        "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
-        
-        # 评估专用
-        "-e", "EVAL_LOCK_DIR=/shared/device-locks",
-        "-e", "EVAL_DEVICE_PREFIX=npu",
-        "-e", "EVAL_DEVICE_COUNT=1",
-        "-e", "EVAL_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES",
-        "-e", "EVAL_RETRY_INTERVAL=1.0",
-        "-e", "EVAL_TIMEOUT=None",
-        "-e", "EVAL_VERBOSE=true",
-        
-        # "--device", "/dev/davinci0",
-        # "--device", "/dev/davinci1",
-        # "--device", "/dev/davinci2",
-        # "--device", "/dev/davinci3",
-        # "--device", "/dev/davinci4",
-        # "--device", "/dev/davinci5",
-        # "--device", "/dev/davinci6",
-        # "--device", "/dev/davinci7",
-        # "--device", "/dev/davinci_manager",
-        # "--device", "/dev/hisi_hdc",
-        # "--device", "/dev/devmm_svm",
-        
-        "-v", "/dev:/dev",
-        "-v", "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
-        "-v", "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro",
-        "-v", "/usr/local/dcmi:/usr/local/dcmi:ro",
-        "-v", "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro",
-        "-v", "/etc/ascend_install.info:/etc/ascend_install.info:ro",
-        "-v", "/usr/local/sbin:/usr/local/sbin:ro",
-        "-v", "/etc/localtime:/etc/localtime:ro",
-        "-v", "/etc/timezone:/etc/timezone:ro",
-        "-v", "/mnt/pipeline-data:/mnt/pipeline-data",
-        #"-v", "/opt/DPC:/opt/DPC",
-
-        # os.environ["OBSERVER_API_URL"] = "http://127.0.0.1:18858"
-        "-v", f"{workspace}:/opt/workspace",
-        "-v", f"/tmp/shared_npu_lock:/shared/device-locks",   # 共享文件锁所在路径
-        # "-v", f"/home/g00841271/rllm-071/examples/openhands_sdk/workspace_debug:/opt/workspace",
-        "--entrypoint", f"/opt/workspace/entrypoint.py",
-        "--add-host", "host.docker.internal:host-gateway",
-    ]
-    cmd.extend([_OPENHANDS_IMAGE,])
-    
-    import shlex
-    print("DEBUG CMD:", " ".join(shlex.quote(c) for c in cmd), flush=True)
-    try:
-        # docker run -d returns immediately with the container ID, so no
-        # timeout needed here. The long wait happens at `docker wait` below.
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-        )
-        output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
-        if result.returncode != 0:
-            logger.warning(
-                "[openhands] Container %s exited with code %d",
-                container_name, result.returncode,
-            )
-            return output
-
-        # stage2 B: enable _CONTAINER_TIMEOUT on docker wait so a hung
-        # container can't block the whole training step indefinitely.
-        # Default 600s (env OPENHANDS_CONTAINER_TIMEOUT). On timeout we
-        # docker-kill, archive whatever logs the container produced, and
-        # return -1 so the upstream rollout treats it as a failed episode.
-        wait_result = subprocess.run(
-            ["docker", "wait", container_name],
-            capture_output=True,
-            timeout=_CONTAINER_TIMEOUT,
-        )
-
-        try:
-            exit_code = int(wait_result.stdout.decode().strip())
-        except Exception as e: # TODO
-            logger.error(f"exit_code error, {e}")
-            exit_code = -1
-
-        # 获取并保存日志
-        logs_result = subprocess.run(
-            ["docker", "logs", container_name],
-            capture_output=True,
-        )
-
-        logs = logs_result.stdout + logs_result.stderr
-        with open(workspace+"/agent_workdir/conversation.log", "wb") as f:
-            f.write(logs)
-
-        with open(workspace+"/agent_workdir/conversation_result.json", "w") as f:
-            json.dump({
-                "container": container_name,
-                "exit_code": exit_code,
-                "timestamp": time.time(),
-            }, f, indent=2)
-
-        return exit_code
-
-    except subprocess.TimeoutExpired:
-        # stage2 B: archive partial logs before killing so a hung container
-        # still produces inspectable artifacts. Best-effort — if any of these
-        # fail we still want the kill to happen.
-        logger.error(
-            "[openhands] Container %s exceeded %ds wait timeout; killing and archiving partial logs",
-            container_name, _CONTAINER_TIMEOUT,
-        )
-        try:
-            logs_result = subprocess.run(
-                ["docker", "logs", container_name],
-                capture_output=True,
-                timeout=30,
-            )
-            logs = logs_result.stdout + logs_result.stderr
-            with open(workspace+"/agent_workdir/conversation.log", "wb") as f:
-                f.write(logs)
-            with open(workspace+"/agent_workdir/conversation_result.json", "w") as f:
-                json.dump({
-                    "container": container_name,
-                    "exit_code": -1,
-                    "timeout": True,
-                    "timeout_seconds": _CONTAINER_TIMEOUT,
-                    "timestamp": time.time(),
-                }, f, indent=2)
-        except Exception:
-            logger.exception("[openhands] Failed to archive logs for timed-out container %s", container_name)
-        subprocess.run(["docker", "kill", container_name], capture_output=True)
-        return -1
-    except Exception:
-        logger.exception("[openhands] Failed to run container %s", container_name)
-        return -1
-    finally:
-        # stage2 B: default cleanup with a debug escape hatch. Long runs
-        # accumulate ~N_steps * rollout_n containers without this; even short
-        # 10-step sanity runs leave 40+ stopped containers behind.
-        if _KEEP_CONTAINER:
-            print(f"[openhands] KEEP_OPENHANDS_CONTAINER=1; kept container {container_name}")
-        else:
-            subprocess.run(
-                ["docker", "rm", "-f", container_name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
 
 # ---------------------------------------------------------------------------
 # Rollout entry point
@@ -892,8 +699,9 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     # decide whether to re-enable normalization.
     reward = 0.0
     try:
-        # Route through HTTP worker (multi-host); empty OPENHANDS_REMOTE_EVAL_URL
-        # makes _run_remote_eval_worker fall back to _run_openhands_container.
+        # Route through the HTTP remote eval worker (required). Empty
+        # OPENHANDS_REMOTE_EVAL_URL now raises inside _run_remote_eval_worker
+        # (the same-host docker-run fallback was removed).
         output = _run_remote_eval_worker(
             workspace, proxied_url, instruction, task=task
         )
@@ -912,9 +720,9 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
         _archive_npu_artifacts(workspace, task, trace_label, reward)
         # stage2 B: default cleanup with debug escape hatch. _archive_npu_artifacts
         # above already copied everything important to OPENHANDS_ARTIFACT_DIR;
-        # the workspace itself is per-rollout scratch (DooD host-visible bind
-        # mount path). Without rmtree, each rollout leaves ~10s-100s of MB
-        # behind under /home/docker/openhands_workspace.
+        # the workspace itself is per-rollout scratch (packed, POSTed to the remote
+        # worker, then disposable). Without rmtree, each rollout leaves ~10s-100s of
+        # MB behind under the staging dir.
         if _KEEP_WORKSPACE:
             logger.info("[openhands] KEEP_OPENHANDS_WORKSPACE=1; kept %s", workspace)
         else:
