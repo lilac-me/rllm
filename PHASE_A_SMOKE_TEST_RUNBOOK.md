@@ -77,7 +77,7 @@ trainer (--network host；走 remote 路径时本身不调 docker)
 
 关键事实（都核对过）：
 
-- 单机拓扑下 `OPENHANDS_REMOTE_EVAL_URL` 非空（`config/qwen36.env:51`）→ 走 **HTTP worker** 路径。
+- 单机拓扑下 `OPENHANDS_REMOTE_EVAL_URL` 非空（`config/qwen36.env:32`）→ 走 **HTTP worker** 路径。
   **同机 docker-run 兜底已删除**：URL 为空不再回退，而是直接 `raise`（`openhands_agent.py:518`）。
 - **trainer 全程零 docker 调用**（rollout 只发 HTTP，`openhands_agent.py:705`）。
   真正 `docker run` OpenHands 容器的是 worker（`remote_eval_worker.py:151-194`）。docker 需求只在 worker——
@@ -89,7 +89,7 @@ trainer (--network host；走 remote 路径时本身不调 docker)
   agent 流程完全由挂载的 `agent_workdir/AGENTS.md`（AscendC）决定。**A 阶段无害；Phase B 接 triton 路由前需确保 payload 里 operator_backend 正确。**
 - `max_iterations=1` 经 **payload** 从 trainer 传给 worker（`openhands_agent.py:534` → `remote_eval_worker.py:132`），
   覆盖 worker 自己的 env 默认值 30。
-- LiteLLM proxy 由 trainer 自动起（子进程），**不用手动起**；端口 `PROXY_PORT=5000`（`config/qwen36.env:20`）。
+- LiteLLM proxy 由 trainer 自动起（子进程），**不用手动起**；端口 `PROXY_PORT=5000`（`config/qwen36.env:18`）。
 
 ---
 
@@ -106,10 +106,10 @@ python3 -c "import pandas as pd; d=pd.read_parquet('examples/openhands_sdk/rl_si
 #   ⚠️ 缺 parquet → verl 数据加载阶段直接崩
 
 # 1.2 镜像存在（plumbing 只需能起容器跑 entrypoint.py；算子 toolchain 不必跑通）
-docker image inspect openhands-triton-env:v1 >/dev/null && echo IMAGE_OK   # config/qwen36.env:25
+docker image inspect openhands-triton-env:v1 >/dev/null && echo IMAGE_OK   # config/qwen36.env:23
 
 # 1.3 NPU：16 张可见。trainer 用 0-7，worker 在 8-15 起容器，互不重叠
-npu-smi info                                             # config/qwen36.env:68(0-7) vs :38(8-15)
+npu-smi info                                             # config/qwen36.env:56(0-7) vs :35(8-15)
 ```
 
 ### §2 启动 eval worker（用 launcher，端口已自动桥接）
@@ -132,7 +132,7 @@ launcher 替你处理（见 `examples/openhands_sdk/start_remote_worker.sh`）�
   lock dir 能搬走依赖已改的 `remote_eval_worker.py:35`（读 env），bind 源复用同一常量做单一真相源（`:148`）。
 - **桥接端口命名**：把 `EVAL_WORKER_PORT`（config 的变量名，默认 16881）传成 worker 的 `--port`。
   worker 自身默认 18880 且读 `OPENHANDS_REMOTE_EVAL_PORT`（`remote_eval_worker.py:337`），而 trainer POST 到 16881
-  （`config/qwen36.env:31` → URL `:51`）——launcher 替你对齐，不会再 connection refused。
+  （`config/qwen36.env:29` → URL `:32`）——launcher 替你对齐，不会再 connection refused。
 - **fail-fast 检查 Ascend 驱动路径**（`/usr/local/Ascend/driver`、`/usr/local/dcmi`、`npu-smi`、
   `/etc/ascend_install.info`、`/dev`）：宿主机 NPU 驱动、不可搬，缺了直接报错（容器挂载 `remote_eval_worker.py:175-181`）。
 - **`--host 127.0.0.1`** 走 loopback：前提 trainer 以 `--network host` 跑（或也在宿主机上），127.0.0.1 才互通。
@@ -167,7 +167,7 @@ curl -fsS -X POST http://127.0.0.1:16881/admin/reset-locks   # remote_eval_worke
 
 ```bash
 export LITELLM_LOCAL_MODEL_COST_MAP=True
-RLLM_TOPOLOGY=single bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
+bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 ```
 
 ### §5 看什么（pass / fail 信号）
@@ -210,7 +210,7 @@ RLLM_TOPOLOGY=single bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
    operator_backend 正确，否则路由会错。
 6. **2 个 safety net 默认缺失**（§3 的 (a)(b)；(c) 孤儿清扫已进 launcher）：不补也可能跑通，但 KU8(LiteLLM flaky)/锁残留会偶发性卡跑，建议补。
 7. **reward 低是预期**，不要据此判断失败（§5）。A 阶段唯一判据是环路是否连续推进。
-8. **NPU 分配**：trainer 0-7、OpenHands 8-15，互斥（`config/qwen36.env:38,68`）。别让别的进程占 8-15。
+8. **NPU 分配**：trainer 0-7、OpenHands 8-15，互斥（`config/qwen36.env:35,56`）。别让别的进程占 8-15。
 
 ---
 

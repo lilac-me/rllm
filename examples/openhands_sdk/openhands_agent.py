@@ -95,6 +95,15 @@ if not _OPENHANDS_EVAL_DEVICE_COUNT:
         else 1
     )
 
+# Hostname the OpenHands container uses to reach the LiteLLM proxy (which runs on
+# the TRAIN host, bound to 0.0.0.0 — train…npu.sh sets rllm.sdk.proxy.host=0.0.0.0).
+# Single-host: host.docker.internal (the container's docker host IS the train host).
+# Multi-host: set OPENHANDS_CONTAINER_HOST_ALIAS to the TRAIN host's IP, since the
+# container runs on a different machine than the proxy. Consumed by _to_container_url.
+_CONTAINER_HOST_ALIAS = (
+    os.environ.get("OPENHANDS_CONTAINER_HOST_ALIAS", "").strip() or "host.docker.internal"
+)
+
 # ---------------------------------------------------------------------------
 # NPU operator workspace setup
 # ---------------------------------------------------------------------------
@@ -460,12 +469,14 @@ def _trace_label_from_routing_metadata(metadata: dict[str, Any]) -> str:
 
 
 def _to_container_url(url: str) -> str:
-    """Replace localhost/127.0.0.1 with host.docker.internal so the URL
-    is reachable from inside an OpenHands Docker container."""
+    """Rewrite a localhost/127.0.0.1 proxy URL to a host reachable from inside the
+    OpenHands container. Target = OPENHANDS_CONTAINER_HOST_ALIAS (default
+    host.docker.internal for single-host; the TRAIN host's IP for multi-host, where
+    the container runs on a different machine than the proxy)."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
     if host in ("localhost", "127.0.0.1"):
-        netloc = parsed.netloc.replace(host, "host.docker.internal", 1)
+        netloc = parsed.netloc.replace(host, _CONTAINER_HOST_ALIAS, 1)
         url = urlunparse(parsed._replace(netloc=netloc))
     return url
 

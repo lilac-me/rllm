@@ -41,8 +41,9 @@ set -euo pipefail
 set -x
 
 # -----------------------------------------------------------------------------
-# Load deployment config (model/path/network/image/memory/topology). Override
-# the file via RLLM_CONFIG_FILE. Topology via RLLM_TOPOLOGY (single|multi).
+# Load deployment config (model/path/network/image/memory). Override the file via
+# RLLM_CONFIG_FILE. Eval worker location is set directly in the config (no topology
+# switch); defaults are single-host.
 # Exports: MODEL_PATH, PROXY_PORT, NIC_NAME, OPENHANDS_IMAGE, OPENHANDS_DATASET,
 # OPENHANDS_REMOTE_EVAL_URL, OPENHANDS_EVAL_DEVICE_IDS,
 # OPENHANDS_CONTAINER_HOST_ALIAS, OPENHANDS_WORKSPACE_TEMP_HOST_DIR,
