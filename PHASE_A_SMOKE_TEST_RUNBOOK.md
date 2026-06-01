@@ -5,7 +5,7 @@
 > `rollout → HTTP worker → OpenHands 容器 → 产物回传 → reward → advantage → backward → optimizer step → 下一个 batch`。
 >
 > **范围**：只验 **plumbing（环路连通性）**，reward 不动。
-> `OPENHANDS_MAX_ITERATIONS=1` 下 agent 产不出完整算子，reward 会默认 0.2 ——
+> `OPENHANDS_MAX_ITERATIONS=1` 下 agent 产不出 impl 文件，reward = **0.0**（`openhands_agent.py:344`）——
 > **这是预期且 OK 的**，不是失败。算子真正生成质量属于后续阶段，不在 Phase A 范围。
 >
 > 全文判断均带 `file:line` 引用（相对 repo 根 = `rllm-merge-tmp/`），便于核对/调试。
@@ -65,29 +65,29 @@ rsync -av --exclude '.git' /path/to/rllm-merge-tmp/ <npu-host>:/path/to/rllm/
 ```
 trainer (--network host；走 remote 路径时本身不调 docker)
   ├─ 启动 LiteLLM proxy 子进程  :5000      ← rllm.sdk.proxy.mode=subprocess（train…npu.sh:480）
-  ├─ rollout() → HTTP POST → http://127.0.0.1:16881/run   （openhands_agent.py:545）
+  ├─ rollout() → HTTP POST → http://127.0.0.1:16881/run   （openhands_agent.py:556）
   │                              │
   │                          remote_eval_worker.py（独立进程，**跑在 NPU 宿主机上裸起，非 DooD**）
   │                              └─ docker run 一个 OpenHands 容器（NPU 8-15，宿主机 dockerd）
   │                                   ├─ LLM_BASE_URL → host.docker.internal:5000 → LiteLLM proxy → vLLM
   │                                   ├─ 跑 AGENTS.md Phase 0-7（AscendC bundle）
   │                                   └─ 产物 tar 回传
-  └─ _npu_operator_reward(task, ...) 读 trace.md → reward（openhands_agent.py:326-383）
+  └─ _npu_operator_reward(task, ...) 读 trace.md → reward（openhands_agent.py:335-392）
 ```
 
 关键事实（都核对过）：
 
 - 单机拓扑下 `OPENHANDS_REMOTE_EVAL_URL` 非空（`config/qwen36.env:32`）→ 走 **HTTP worker** 路径。
-  **同机 docker-run 兜底已删除**：URL 为空不再回退，而是直接 `raise`（`openhands_agent.py:518`）。
-- **trainer 全程零 docker 调用**（rollout 只发 HTTP，`openhands_agent.py:705`）。
+  **同机 docker-run 兜底已删除**：URL 为空不再回退，而是直接 `raise`（`openhands_agent.py:529`）。
+- **trainer 全程零 docker 调用**（rollout 只发 HTTP，`openhands_agent.py:716`）。
   真正 `docker run` OpenHands 容器的是 worker（`remote_eval_worker.py:151-194`）。docker 需求只在 worker——
   worker 固定**跑在宿主机上裸起**，用宿主 dockerd，是普通 docker、**不是 DooD**。trainer 不需要 docker，也不需要 docker.sock。
 - `operator_backend` 对 Phase A **路由无影响**：worker 默认 `"triton"`（`remote_eval_worker.py:135`），
-  trainer 把整个 `task` 透传进 payload（`openhands_agent.py:531`），其中若带 operator_backend 即覆盖；
+  trainer 把整个 `task` 透传进 payload（`openhands_agent.py:542`），其中若带 operator_backend 即覆盖；
   但 `cfg.operator_backend` **只在测试里被引用**（`workspace/tests/test_config.py:102,163`），
   runner/entrypoint 都不据它分流（`workspace/rllm_entrypoint/runner.py:84` 的 task_scope 是注释掉的）——
   agent 流程完全由挂载的 `agent_workdir/AGENTS.md`（AscendC）决定。**A 阶段无害；Phase B 接 triton 路由前需确保 payload 里 operator_backend 正确。**
-- `max_iterations=1` 经 **payload** 从 trainer 传给 worker（`openhands_agent.py:534` → `remote_eval_worker.py:132`），
+- `max_iterations=1` 经 **payload** 从 trainer 传给 worker（`openhands_agent.py:545` → `remote_eval_worker.py:132`），
   覆盖 worker 自己的 env 默认值 30。
 - LiteLLM proxy 由 trainer 自动起（子进程），**不用手动起**；端口 `PROXY_PORT=5000`（`config/qwen36.env:18`）。
 
@@ -175,7 +175,7 @@ bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 | 现象 | 判定 |
 |---|---|
 | 越过第一个 rollout，打印 reward、loss/grad，**step 2 开始**，能连续推进多个 step | ✅ **plumbing 通了（A 阶段达标）** |
-| reward 恒为 0.2 / 偏低 / 不变 | ✅ **预期**——`max_iter=1` agent 产不出 trace.md 成功串（`openhands_agent.py:349` 命中才 0.8，否则 `:339` 默认 0.2）。只验 plumbing，无所谓 |
+| reward 恒为 **0.0**（偶有 0.2/偏低/不变） | ✅ **预期**——`max_iter=1` 产不出 impl 文件 `output/{op}/model_new_ascendc.py` → `openhands_agent.py:344` 直接 return 0.0（默认 0.2 需 impl 已存在，见 `:348`；成功串命中才 0.8，见 `:357`）。只验 plumbing，无所谓 |
 | 第一个 rollout 卡很久 | ⏳ 正常——NPU vLLM/HCCL 初始化慢，超时设了 24h（`train…npu.sh:110-111`）；不是 hang |
 | `empty DataProto` / "all trajectories dropped" 崩溃 | ❌ **真 plumbing 断了，别压制**——见下 |
 
@@ -186,8 +186,8 @@ bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 每个 rollout 的 `docker run` 都失败 / worker 不可达 / 产物没回传。**查根因，不要绕过。**
 
 **辅助观测点**：
-- worker 端 `[remote-eval] ...` 日志；容器非零 exit 会被记（`openhands_agent.py:583`）。
-- 每个 rollout 写 `agent_workdir/remote_eval_result.json`（`openhands_agent.py:571`）——看 exit_code / worker_error。
+- worker 端 `[remote-eval] ...` 日志；容器非零 exit 会被记（`openhands_agent.py:594`）。
+- 每个 rollout 写 `agent_workdir/remote_eval_result.json`（`openhands_agent.py:582`）——看 exit_code / worker_error。
 - 孤儿容器/锁堆积 → 下一轮抢不到 NPU，回 §3(c) 清理。
 
 ---
@@ -198,7 +198,7 @@ bash examples/openhands_sdk/train_openhands_qwen36_npu.sh
 2. **端口双名**：worker 读 `OPENHANDS_REMOTE_EVAL_PORT`（默认 18880），config 用 `EVAL_WORKER_PORT=16881`。
    两者**不是同一个变量**——worker 必须 `--port 16881`（§2）。
 3. **同机 DooD 兜底 + 预检已删除**：rollout 现在只走 remote HTTP worker；`OPENHANDS_REMOTE_EVAL_URL` 为空会直接
-   `raise`（`openhands_agent.py:518`），不再有同机 docker-run 退路。train 脚本那段无条件 docker/overlay/bind-mount
+   `raise`（`openhands_agent.py:529`），不再有同机 docker-run 退路。train 脚本那段无条件 docker/overlay/bind-mount
    预检也一并删了 → trainer 不再需要本机 docker。trainer 暂存目录改为启动相对路径、Python 自动创建
    （`OPENHANDS_WORKSPACE_TEMP_HOST_DIR` 可覆盖，默认 `examples/openhands_sdk/workspace_temp`）。
 4. **worker 固定宿主机裸起 → work-dir 无 bind-mount 约束**（§2）：worker 用宿主 dockerd，
