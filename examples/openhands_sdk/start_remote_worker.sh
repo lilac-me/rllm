@@ -62,6 +62,23 @@ fi
 export OPENHANDS_EVAL_LOCK_DIR="$LOCK_DIR"
 export OPENHANDS_IMAGE OPENHANDS_EVAL_DEVICE_IDS
 
+# --- clear orphan eval containers from a crashed prior worker run ------------
+# Each rollout container (rllm-openhands-eval-*, remote_eval_worker.py:129) is
+# normally `docker rm -f`'d in the worker's per-request finally (:236). A worker
+# KILLED mid-rollout leaves orphans that still hold NPUs + file locks → the next
+# run collides. Worker startup = clean slate (no rollouts in flight), so sweep
+# them here — mirrors the worker's startup lock-clear (remote_eval_worker.py:345-347).
+# ASSUMES ONE WORKER PER HOST: a blanket prefix sweep also kills a sibling
+# worker's in-flight containers. Set WORKER_SKIP_ORPHAN_SWEEP=1 to skip.
+# Best-effort: docker absent / rm failures never abort the launch (|| true).
+if [[ "${WORKER_SKIP_ORPHAN_SWEEP:-0}" != "1" ]]; then
+    orphans="$(docker ps -aq --filter "name=rllm-openhands-eval-" 2>/dev/null || true)"
+    if [[ -n "$orphans" ]]; then
+        echo "[start-worker] removing $(echo "$orphans" | wc -l | tr -d ' ') orphan eval container(s)"
+        echo "$orphans" | xargs docker rm -f >/dev/null 2>&1 || true
+    fi
+fi
+
 echo "[start-worker] state dir : $WORKER_STATE_DIR"
 echo "[start-worker] work_dir  : $WORK_DIR"
 echo "[start-worker] lock_dir  : $LOCK_DIR"

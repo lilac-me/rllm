@@ -27,7 +27,7 @@ Branch base: `5daa24c0` (offload buffer, last common ancestor with stage1).
 - **Single-host config**: `OPENHANDS_REMOTE_EVAL_URL=http://127.0.0.1:16881`, worker runs on the host (not in dev container).
 - **Multi-host config**: `OPENHANDS_REMOTE_EVAL_URL=http://<eval-host-ip>:16881`.
 
-The legacy "same-machine docker run" branch in [openhands_agent.py:626-627](examples/openhands_sdk/openhands_agent.py:626) (`_run_openhands_container`) is **dead code** in any DooD deployment. Kept for backwards compat with non-DooD setups; can be deleted once we're sure no one needs it.
+~~The legacy "same-machine docker run" branch (`_run_openhands_container`) is **dead code** in any DooD deployment. Kept for backwards compat with non-DooD setups; can be deleted once we're sure no one needs it.~~ **DELETED 2026-06-01**: `_run_openhands_container` and the same-host DooD path were removed; rollouts are now remote-worker-only and an empty `OPENHANDS_REMOTE_EVAL_URL` fails fast (`openhands_agent.py:518`).
 
 ### D2. Worker GC at startup + per-trainer-restart lock reset
 
@@ -251,7 +251,7 @@ Recorded as an upstream contribution candidate.
 - `--network host` on dev container is required for trainer ↔ host-worker on `127.0.0.1` to work (verified via `ip route` showing host LAN as default).
 - `/tmp/shared_npu_lock` must be created **on the host** by the worker, not by the trainer in the dev container, because the `docker run -v` source is interpreted on the host fs.
 - HTTP body size for workspace transfer is ~130 KB base64-encoded; not a bottleneck.
-- `_run_openhands_container` in `openhands_agent.py` (the legacy non-HTTP path) **never worked under DooD**. 51-step BS=2 runs succeeded only because they went via HTTP (worker on host 51, trainer on host 65) — multi-host topology accidentally avoided the DooD path bug.
+- `_run_openhands_container` in `openhands_agent.py` (the legacy non-HTTP path) **never worked under DooD**. 51-step BS=2 runs succeeded only because they went via HTTP (worker on host 51, trainer on host 65) — multi-host topology accidentally avoided the DooD path bug. **(Deleted 2026-06-01 — remote-worker-only now.)**
 
 ## Rejected approaches (don't propose again)
 

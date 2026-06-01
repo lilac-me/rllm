@@ -44,7 +44,7 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
 |---|---|---|---|
 | `openhands_agent.py` HTTP worker（`_run_remote_eval_worker` + `_tar_directory_b64` + `_manifest_directory` + `_extract_tar_b64_into` + `_metadata_for_proxy_url`）| **C 当前并** | 独有 | 路线无关的 rollout 执行机制（docker run OpenHands 容器）。当前阶段并入 + rollout 路由改 1 行 |
 | `openhands_agent.py` reward（`_npu_operator_reward` + `_impl_newer_than_metrics` + `_snapshot_success_as_best`）| **推迟 skills 阶段** | 独有/diverge | ⚠️ **路线绑定**：我们读 triton `metrics.json`（success/correctness_ok + 防stale + best快照），verl-main 读 AscendC `trace.md`（Phase 3/4），两套完全不同。跟 triton skills + operator_pipeline.sh 死绑，必须一起换。当前并入会破坏 verl-main AscendC pipeline → reward 全 0 |
-| `openhands_agent.py` `_setup_npu_operator_workspace` / `_run_openhands_container` / `_archive_npu_artifacts` / `rollout` 其余 | **A 保留 verl-main** | — | 配套 verl-main AscendC PKG；`_run_openhands_container`（bind-mount）作 HTTP worker 的 localhost fallback |
+| `openhands_agent.py` `_setup_npu_operator_workspace` / `_archive_npu_artifacts` / `rollout` 其余 | **A 保留 verl-main** | — | 配套 verl-main AscendC PKG。`_run_openhands_container`（bind-mount localhost fallback）**已于 2026-06-01 删除**：纯 remote worker，`OPENHANDS_REMOTE_EVAL_URL` 为空即 fail-fast |
 | `remote_eval_worker.py` | **C** | 独有（verl-main 无此文件） | HTTP worker server + GC + /health + /admin/reset-locks |
 | `agent_sdk_engine.py` `_ENGINE_DEBUG`/`_dprint` gate | **C 可选 TODO** | base:63 的一部分 | env-gated debug print。verl-main 无。纯调试辅助，本阶段先不并（插入点要匹配 verl-main 结构有风险），记可选增强 |
 | `agent_sdk_engine.py` rollout_logprobs padding | **A 用 verl-main**（已确认） | base:80 的一部分 | 已实测：verl-main 更完善（量化 mismatch + `rollout_log_probs_fill_rate` metric，部分 mismatch 也处理），我们是 all-or-nothing |
@@ -68,7 +68,7 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
 - Dr.GRPO + std0 metric（`50bc9f96`）
 - stage2 audit + observability metrics（`f258836b`）
 - NPUKernelBench AscendC 数据集（level2/3/4，约 500 文件）—— **AscendC，见 §4**
-- bind-mount DooD fix（`34cfe866`）—— 被 HTTP worker 取代但无害
+- bind-mount DooD fix（`34cfe866`）—— 被 HTTP worker 取代；**同机 `_run_openhands_container` 路径已于 2026-06-01 删除**
 
 ## 3. 当前阶段执行计划（代码合并，不含 skills）
 
@@ -83,7 +83,7 @@ bind-mount 是 HTTP worker 在 `worker=localhost` 时的退化特例，且砍掉
    - `OPENHANDS_REFACTORING_LOG.md`
 2. **C 类并入 openhands_agent.py（仅 HTTP worker，路线无关）**：
    - HTTP worker：`_run_remote_eval_worker` + tar helpers + 常量 + `rollout` 路由改 1 行
-   - bind-mount `_run_openhands_container` 保留作 localhost fallback
+   - ~~bind-mount `_run_openhands_container` 保留作 localhost fallback~~ → **已删除（2026-06-01）**：纯 remote worker，URL 为空 fail-fast
    - **reward 不在此阶段**（路线绑定 triton metrics.json，见 §4）
 3. **B 类 reconcile**（逐行，要小心）：
    - `runner.py`（两边各 ~400 行，唯一剩下的大 B）
@@ -127,9 +127,9 @@ runner.py 的 3-way reconcile。reward 推迟到 skills 阶段后，当前阶段
    reward 已确认推迟到 skills 阶段，当前只并 HTTP worker（路线无关）。
 2. ~~rollout_logprobs~~ **已 verify**：verl-main 更完善（量化 mismatch +
    `rollout_log_probs_fill_rate` metric），用 verl-main，我们的不并。
-3. **HTTP worker vs bind-mount 共存**：决定 bind-mount 是否作 same-host 快路径
-   保留还是移除。当前决定：保留 bind-mount 作 localhost fallback（HTTP worker
-   `_run_remote_eval_worker` 内部 `if not REMOTE_EVAL_URL: 走 bind-mount`）。
+3. **HTTP worker vs bind-mount 共存**：~~决定 bind-mount 是否作 same-host 快路径
+   保留还是移除。当前决定：保留 bind-mount 作 localhost fallback~~ → **已解决（2026-06-01）：移除**。
+   `_run_openhands_container` 已删，`_run_remote_eval_worker` 内 `if not REMOTE_EVAL_URL:` 改为 fail-fast `raise`。
 4. **verl-main 有未提交工作 + in-progress merge**（你的 qwen36）—— 在从
    origin/verl-main 拉的新分支 `verl-main-merge` 上做，绝不碰你 local 的 verl-main。
    PR 已撤（删 remote 分支），纯本地操作，你 review 后再 push。
