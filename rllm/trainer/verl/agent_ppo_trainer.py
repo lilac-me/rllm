@@ -672,11 +672,16 @@ class AgentPPOTrainer(RayPPOTrainer):
             data_source_speedup: dict[str, list[float]] = {}
             data_source_correctness: dict[str, list[bool]] = {}
             data_source_compiled: dict[str, list[bool]] = {}
+            # Per-uid max speedup for fast@k (take best across all rollouts of the same problem).
+            data_source_uid_speedup: dict[str, dict[str, float]] = {}
             for i in range(all_speedups.shape[0]):
                 ds = data_sources[i]
                 data_source_speedup.setdefault(ds, []).append(float(all_speedups[i]))
                 data_source_correctness.setdefault(ds, []).append(bool(all_correctness[i]))
                 data_source_compiled.setdefault(ds, []).append(bool(all_compiled[i]))
+                uid = uid_tensor[i]
+                uid_speedups = data_source_uid_speedup.setdefault(ds, {})
+                uid_speedups[uid] = max(uid_speedups.get(uid, 0.0), float(all_speedups[i]))
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
@@ -703,6 +708,15 @@ class AgentPPOTrainer(RayPPOTrainer):
                 correct_mask = correctness_arr >= 1.0
                 if correct_mask.sum() > 0:
                     metric_dict[f"val/mean_speedup_correct/{data_source}"] = float(speedup_arr[correct_mask].mean())
+
+            fast_k_thresholds = self.config.rllm.get("fast_k_thresholds", [1.0, 1.2, 1.5, 2.0])
+            for data_source, uid_speedups in data_source_uid_speedup.items():
+                total = len(uid_speedups)
+                if total == 0:
+                    continue
+                for k in fast_k_thresholds:
+                    cnt = sum(1 for s in uid_speedups.values() if s >= k)
+                    metric_dict[f"val/fast@{k}/{data_source}"] = cnt / total
 
         return metric_dict
 
