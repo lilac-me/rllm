@@ -154,16 +154,18 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # vLLM / NPU
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-# export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128   # <- from config
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-# export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   # <- from config
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15   # <- from config
 
 export TOKENIZERS_PARALLELISM=true
 export VLLM_LOGGING_LEVEL=WARN
 export HYDRA_FULL_ERROR=1
+
+export LITELLM_LOCAL_MODEL_COST_MAP="True"
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
@@ -365,7 +367,7 @@ ARGS=(
 
   # Stage1 并行：单节点 8 NPU，TP=2 PP=1 CP=1 EP=4 ETP=1
   actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2
-  actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
+  actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2
   actor_rollout_ref.actor.megatron.context_parallel_size=1
   actor_rollout_ref.actor.megatron.expert_model_parallel_size=4
   actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
@@ -405,7 +407,7 @@ ARGS=(
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=False         # plan §0.2 与 actor 套一致
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384   # cap >= prompt+response（同 actor）
   actor_rollout_ref.ref.megatron.tensor_model_parallel_size=2
-  actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1
+  actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2
   actor_rollout_ref.ref.megatron.context_parallel_size=1
   actor_rollout_ref.ref.megatron.expert_model_parallel_size=4
   actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1
