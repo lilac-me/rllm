@@ -23,6 +23,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from op_route import op_route  # noqa: E402  路由键复用同一套逻辑（默认 triton）
+
 
 # Host path used as the `-v` source for OpenHands containers' NPU file-lock
 # directory. MUST exist on the host filesystem (where the worker runs), since
@@ -236,6 +240,100 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _snapshot_canonical(workspace: str, judge_root: str) -> None:
+    """E1: agent 容器运行前，把 canonical 的固定入口 + 评测脚本 + 参考快照到 agent 写不到的 judge 目录。
+    见 EXTERNAL_SCORER_DESIGN.md §3.3 / §5.2 E1。此刻 agent 还没跑，内容可信。"""
+    src_aw = os.path.join(workspace, "agent_workdir")
+    dst_aw = os.path.join(judge_root, "agent_workdir")
+    for sub in ("tools", os.path.join(".agents", "skills", "triton-op-verifier"), "src"):
+        s = os.path.join(src_aw, sub)
+        if os.path.isdir(s):
+            d = os.path.join(dst_aw, sub)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copytree(s, d, dirs_exist_ok=True)
+
+
+def _run_judge(judge_root: str, request: dict[str, Any]) -> dict[str, Any]:
+    """对提交 impl 用 canonical 快照重跑固定入口 triton_eval_pipeline.sh（干净容器、同镜像），读回 metrics。"""
+    task = request.get("task") or {}
+    op_name = task.get("op_name", "operator")
+    image = request.get("image") or os.environ.get("OPENHANDS_IMAGE", "openhands-triton-env:v1")
+    name = f"rllm-triton-judge-{uuid.uuid4().hex[:12]}"
+    eval_device_ids = str(request.get("eval_device_ids") or os.environ.get("OPENHANDS_EVAL_DEVICE_IDS", "")).strip()
+    eval_device_count = str(request.get("eval_device_count") or os.environ.get("OPENHANDS_EVAL_DEVICE_COUNT", "")).strip()
+    if not eval_device_count:
+        eval_device_count = str(len([x for x in eval_device_ids.split(",") if x.strip()]) if eval_device_ids else 1)
+    lock_dir = _SHARED_NPU_LOCK_DIR
+    Path(lock_dir).mkdir(mode=0o755, parents=True, exist_ok=True)
+    aw = "/opt/workspace/agent_workdir"
+    cmd = [
+        "docker", "run", "--rm", "--name", name,
+        "--network", "host", "--ipc", "host",
+        "--shm-size", os.environ.get("OPENHANDS_DOCKER_SHM_SIZE", "500g"), "--privileged",
+        "-e", "EVAL_LOCK_DIR=/shared/device-locks",
+        "-e", "EVAL_DEVICE_PREFIX=npu",
+        "-e", f"EVAL_DEVICE_COUNT={eval_device_count}",
+        "-e", f"EVAL_DEVICE_IDS={eval_device_ids}",
+        "-e", "EVAL_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES",
+        "-v", "/dev:/dev",
+        "-v", "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
+        "-v", "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro",
+        "-v", "/usr/local/dcmi:/usr/local/dcmi:ro",
+        "-v", "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro",
+        "-v", "/etc/ascend_install.info:/etc/ascend_install.info:ro",
+        "-v", "/usr/local/sbin:/usr/local/sbin:ro",
+        "-v", f"{judge_root}:/opt/workspace",
+        "-v", f"{lock_dir}:/shared/device-locks",
+        "--add-host", "host.docker.internal:host-gateway",
+        "--entrypoint", "bash",
+        image,
+        f"{aw}/tools/triton_eval_pipeline.sh",
+        "--op_name", op_name,
+        "--impl", f"{aw}/output/submission/{op_name}_impl.py",
+        "--task", f"{aw}/src/{op_name}.py",
+        "--out_dir", f"{aw}/judge_out",
+    ]
+    if os.path.exists(os.path.join(judge_root, "agent_workdir", "src", f"{op_name}.json")):
+        cmd += ["--json", f"{aw}/src/{op_name}.json"]
+    try:
+        subprocess.run(
+            cmd, capture_output=True,
+            timeout=int(request.get("judge_timeout") or os.environ.get("OPENHANDS_JUDGE_TIMEOUT", "1800")),
+        )
+    except Exception as exc:
+        return {"success": False, "ast_check_ok": False, "correctness_ok": False,
+                "error": f"judge container failed: {exc!r}", "error_type": "judge_container_failed"}
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    mpath = os.path.join(judge_root, "agent_workdir", "judge_out", "metrics.json")
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as f:
+                return json.load(f)
+        except Exception as exc:
+            return {"success": False, "error": f"judge metrics unreadable: {exc!r}", "error_type": "judge_metrics_unreadable"}
+    return {"success": False, "ast_check_ok": False, "correctness_ok": False,
+            "error": "judge produced no metrics.json", "error_type": "judge_no_metrics"}
+
+
+def _judge_and_record(workspace: str, judge_root: str, request: dict[str, Any], agent_dir: Path) -> None:
+    """agent 跑完后：把提交 impl 放进 judge 快照、重跑、把 judge metrics 写进 agent_workdir（随 tar 回传给 reward）。"""
+    task = request.get("task") or {}
+    op_name = task.get("op_name", "operator")
+    sub = os.path.join(workspace, "agent_workdir", "output", "submission", f"{op_name}_impl.py")
+    if os.path.exists(sub):
+        jdst = os.path.join(judge_root, "agent_workdir", "output", "submission", f"{op_name}_impl.py")
+        os.makedirs(os.path.dirname(jdst), exist_ok=True)
+        shutil.copy2(sub, jdst)
+        metrics = _run_judge(judge_root, request)
+    else:
+        metrics = {"success": False, "ast_check_ok": False, "correctness_ok": False,
+                   "error": f"no submission at output/submission/{op_name}_impl.py", "error_type": "submission_missing"}
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "judge_metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RemoteOpenHandsEval/0.1"
 
@@ -304,8 +402,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(200, payload)
                 return
 
+            task = request.get("task") or {}
+            _is_triton = op_route(task) == "triton"
+            _judge_root = os.path.join(tmp_root, "judge")
+            if _is_triton:
+                _snapshot_canonical(workspace, _judge_root)  # E1: canonical 快照（agent 跑之前）
+
             exit_code = _run_container(workspace, request)
             agent_dir = Path(workspace) / "agent_workdir"
+            if _is_triton:
+                _judge_and_record(workspace, _judge_root, request, agent_dir)  # judge 重跑 → agent_workdir/judge_metrics.json
             payload: dict[str, Any] = {
                 "exit_code": exit_code,
                 "tmp_root": tmp_root,

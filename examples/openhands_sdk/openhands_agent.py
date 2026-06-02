@@ -235,6 +235,15 @@ _NPU_INSTRUCTION_TEMPLATE = """生成ascendC算子，npu=0，算子描述文件�
 """
 
 
+_TRITON_INSTRUCTION_TEMPLATE = """生成 Triton-Ascend 算子。算子描述文件为 src/{op_name}.py。
+最终实现写到 output/submission/{op_name}_impl.py（类名 ModelNew）。
+"""
+
+# 路由逻辑抽到 op_route.py（仅依赖 os/shutil、无 NPU/rllm 依赖，便于单元测试；见 EXTERNAL_SCORER_DESIGN.md §7）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from op_route import op_route as _op_route  # noqa: E402
+
+
 def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str:
     pwd = Path(__file__).parent
     _WORKSPACE_PKG = pwd / "workspace"
@@ -255,7 +264,13 @@ def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str
     task_code = task.get("task_code", "")
 
 
-    shutil.copytree(_WORKSPACE_PKG, workspace, dirs_exist_ok=True)
+    route = _op_route(task)
+    # 共享容器 infra（entrypoint/runner/Dockerfile/tests）拷过去，跳过两个 agent_workdir 变体；
+    # 再按 route 把已分好的 agent_workdir.{route} 装配成运行时 agent_workdir。triton 路径零 AscendC（§7）。
+    shutil.copytree(_WORKSPACE_PKG, workspace, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("agent_workdir.*"))
+    shutil.copytree(_WORKSPACE_PKG / f"agent_workdir.{route}",
+                    os.path.join(workspace, "agent_workdir"), dirs_exist_ok=True)
     os.utime(workspace, None)
 
     # for name in _OPERATOR_SEED_NAMES:
@@ -275,8 +290,9 @@ def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str
             f.write(_MOCK_PIPELINE_SCRIPT)
         os.chmod(mock_path, 0o755)
 
+    _instr_tmpl = _TRITON_INSTRUCTION_TEMPLATE if route == "triton" else _NPU_INSTRUCTION_TEMPLATE
     with open(os.path.join(workspace, "agent_workdir", "INSTRUCTIONS.md"), "w") as f:
-        f.write(_NPU_INSTRUCTION_TEMPLATE.format(op_name=op_name))
+        f.write(_instr_tmpl.format(op_name=op_name))
 
     if task_code:
         src_dir = os.path.join(workspace, "agent_workdir", "src")
@@ -284,17 +300,26 @@ def _setup_npu_operator_workspace(task: dict[str, Any], trace_label: str) -> str
         with open(os.path.join(src_dir, f"{op_name}.py"), "w") as f:
             f.write(task_code)
 
-        # 从 NPUKernelBench 查找并复制 .json 测试用例文件
-        benchmark_dir = os.path.join(workspace, "agent_workdir", "src", "NPUKernelBench")
-        json_found = False
-        for level in ["level0", "level1", "level2", "level3", "level4"]:
-            level_dir = os.path.join(benchmark_dir, level)
-            if os.path.exists(level_dir):
-                candidate_json = os.path.join(level_dir, f"{op_name}.json")
-                if os.path.exists(candidate_json):
-                    shutil.copy2(candidate_json, os.path.join(src_dir, f"{op_name}.json"))
-                    json_found = True
-                    break
+        if route == "triton":
+            # triton 路径：多 case 的 .json 由数据集条目携带（task['task_json']），不查 NPUKernelBench
+            json_found = False
+            _task_json = task.get("task_json", "")
+            if _task_json:
+                with open(os.path.join(src_dir, f"{op_name}.json"), "w") as f:
+                    f.write(_task_json)
+                json_found = True
+        else:
+            # 从 NPUKernelBench 查找并复制 .json 测试用例文件
+            benchmark_dir = os.path.join(workspace, "agent_workdir", "src", "NPUKernelBench")
+            json_found = False
+            for level in ["level0", "level1", "level2", "level3", "level4"]:
+                level_dir = os.path.join(benchmark_dir, level)
+                if os.path.exists(level_dir):
+                    candidate_json = os.path.join(level_dir, f"{op_name}.json")
+                    if os.path.exists(candidate_json):
+                        shutil.copy2(candidate_json, os.path.join(src_dir, f"{op_name}.json"))
+                        json_found = True
+                        break
 
         # 如果找不到，创建空的 .json 文件（AGENTS.md Phase 2 需要）
         if not json_found:
@@ -330,6 +355,27 @@ def _reward_from_metrics(perf: dict[str, Any]) -> float:
     perf_data = perf.get("perf_data") or {}
     speedup = float(perf_data.get("speedup_vs_torch", 1.0))
     return min(0.5 + 0.5 * (speedup / 2.0), 1.0)
+
+
+def _triton_judge_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
+    """Triton 路径权威 reward = worker 侧 judge 对**提交 impl** 重跑固定入口 triton_eval_pipeline.sh
+    得到的 metrics（agent 写不到）。worker 把它写进 agent_workdir/judge_metrics.json，随 tar 回传到这里。
+    见 EXTERNAL_SCORER_DESIGN.md §3.3。"""
+    del output
+    path = os.path.join(workspace_dir, "agent_workdir", "judge_metrics.json")
+    metrics = _has_metrics(path)
+    if metrics is None:
+        logger.warning("[openhands-triton] no judge_metrics.json at %s -> reward=0.0", path)
+        return 0.0
+    if metrics.get("error_type") == "submission_missing":
+        logger.info("[openhands-triton] no submission -> reward=0.0")
+        return 0.0
+    reward = _reward_from_metrics(metrics)
+    logger.info("[openhands-triton] judge reward=%.3f success=%s error_type=%s",
+                reward, metrics.get("success"), metrics.get("error_type"))
+    # TODO(E2): judge 基础设施错误（B 类: judge_no_metrics/judge_container_failed/NPU OOM）应"丢样本(mask)"
+    #           而非给低分——需 trainer 侧 valid_mask 配合；当前先按 _reward_from_metrics 给分。
+    return reward
 
 
 def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
@@ -717,7 +763,10 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
             workspace, proxied_url, instruction, task=task
         )
         metrics_dir = workspace + "/agent_workdir"
-        reward = _npu_operator_reward(task, metrics_dir, output)
+        if _op_route(task) == "triton":
+            reward = _triton_judge_reward(task, workspace, output)  # chunk 3 接入 worker judge
+        else:
+            reward = _npu_operator_reward(task, metrics_dir, output)
         logger.info(
             "[openhands] trace_label=%s reward=%.3f instruction=%s",
             trace_label, reward, instruction[:80],
