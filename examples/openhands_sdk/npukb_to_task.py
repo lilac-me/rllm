@@ -56,29 +56,37 @@ def _norm_dtypes(spec: str) -> set[str]:
     return out
 
 
-def _check_model(src: str, path: str) -> None:
-    """确认 Model 可用、__init__ 无需外部参数、且文件未自带输入函数。失败即报错（不猜）。"""
+def _inspect(src: str, path: str) -> dict:
+    """探测 task 契约：Model/forward 必须有；返回已自带哪些输入函数 + __init__ 必填参数数。"""
     tree = ast.parse(src)
     model = next((n for n in ast.walk(tree)
                   if isinstance(n, ast.ClassDef) and n.name == "Model"), None)
     if model is None:
         sys.exit(f"[npukb] {path}: 未找到 class Model —— 不是 KernelBench 风格的参考文件")
-    has_forward = any(isinstance(b, ast.FunctionDef) and b.name == "forward" for b in model.body)
-    if not has_forward:
+    if not any(isinstance(b, ast.FunctionDef) and b.name == "forward" for b in model.body):
         sys.exit(f"[npukb] {path}: Model 缺 forward()")
     init = next((b for b in model.body
                  if isinstance(b, ast.FunctionDef) and b.name == "__init__"), None)
-    if init is not None:
-        # 去掉 self；带默认值的参数可不传，故只看“必填”参数
-        pos = init.args.args[1:]
-        n_required = len(pos) - len(init.args.defaults)
-        if n_required > 0:
-            sys.exit(f"[npukb] {path}: Model.__init__ 需要 {n_required} 个参数，"
-                     f"但 json 不携带 init 参数；请手工写 get_init_inputs() 后再用。")
+    init_required = 0
+    if init is not None:  # 去掉 self；带默认值的可不传，只数“必填”
+        init_required = len(init.args.args[1:]) - len(init.args.defaults)
     funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    clash = funcs & {"get_inputs", "get_input_groups", "get_init_inputs"}
-    if clash:
-        sys.exit(f"[npukb] {path}: 文件已自带 {sorted(clash)}，无需转换（避免覆盖）。")
+    return {
+        "has_init": "get_init_inputs" in funcs,
+        "has_inputs": "get_inputs" in funcs,
+        "has_groups": "get_input_groups" in funcs,
+        "init_required": init_required,
+    }
+
+
+def _write(body: str, out: str | None, note: str) -> None:
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(body)
+        print(f"[npukb] {note} -> {out}", file=sys.stderr)
+    else:
+        sys.stdout.write(body)
+        print(f"[npukb] {note}", file=sys.stderr)
 
 
 def _tensor_expr(dtype: str, shape: list[int]) -> str:
@@ -116,7 +124,22 @@ def main() -> None:
 
     with open(args.op_py, encoding="utf-8") as f:
         head = f.read()
-    _check_model(head, args.op_py)
+    info = _inspect(head, args.op_py)
+
+    # 有的 NPUKernelBench 变体的 {op}.py 已是 verify 格式（自带 get_init_inputs + get_inputs/
+    # get_input_groups）——原样透传，不读 json、不覆盖。只自带其一视为不完整，报错让人工补。
+    if info["has_init"] and (info["has_inputs"] or info["has_groups"]):
+        _write(head, args.out, "已是 verify 格式，原样透传（无需 json）")
+        return
+    present = [k for k, v in (("get_init_inputs", info["has_init"]),
+                              ("get_inputs", info["has_inputs"]),
+                              ("get_input_groups", info["has_groups"])) if v]
+    if present:
+        sys.exit(f"[npukb] {args.op_py}: 自带 {present} 但不完整"
+                 f"（需 get_init_inputs + get_inputs/get_input_groups）；请手工补全后再用。")
+    if info["init_required"] > 0:
+        sys.exit(f"[npukb] {args.op_py}: Model.__init__ 需要 {info['init_required']} 个参数，"
+                 f"但 json 不携带 init 参数；请手工写 get_init_inputs() 后再用。")
 
     json_path = args.json or os.path.splitext(args.op_py)[0] + ".json"
     if not os.path.isfile(json_path):
@@ -147,14 +170,7 @@ def main() -> None:
     body += "\n\ndef get_input_groups():\n    return [\n"
     body += "".join(f"        {g},\n" for g in groups)
     body += "    ]\n"
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(body)
-        print(f"[npukb] wrote {args.out}: {len(groups)} cases", file=sys.stderr)
-    else:
-        sys.stdout.write(body)
-        print(f"[npukb] {len(groups)} cases", file=sys.stderr)
+    _write(body, args.out, f"baked {len(groups)} cases")
 
 
 if __name__ == "__main__":
