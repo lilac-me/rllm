@@ -171,22 +171,6 @@ class KernelGymEnv(MultiTurnEnvironment):
         # 用于存储每次 get_reward_and_next_obs 返回的 meta_data
         self.meta_info_history = list()
 
-    @property
-    def last_eval_info(self) -> dict:
-        """Return a flat dict of pass/fast metrics from the latest env step.
-
-        Safe to call from the async engine after the trajectory loop ends.
-        Returns empty defaults when no evaluation has run yet.
-        """
-        if not self.meta_info_history:
-            return {"speedup": 0.0, "correctness": False, "compiled": False}
-        m = self.meta_info_history[-1]
-        return {
-            "speedup": float(m.get("performance", 0.0) or 0.0),
-            "correctness": bool(m.get("correctness", False)),
-            "compiled": bool(m.get("compilation", False)),
-        }
-        
         #! 配置信息
         self.config = config
         self.server_url = str(config["server_url"])
@@ -221,11 +205,27 @@ class KernelGymEnv(MultiTurnEnvironment):
         self._worker = _HybridHttpWorker(
             self.server_url, self.rate_limit, int(self.timeout), self.acquire_timeout
         )
-        
+
         # 指示消息是否会直接透传至KernelGym
         self.message_passthrough = message_passthrough
 
         self.logger = logging.getLogger(__name__)
+
+    @property
+    def last_eval_info(self) -> dict:
+        """Return a flat dict of pass/fast metrics from the latest env step.
+
+        Safe to call from the async engine after the trajectory loop ends.
+        Returns empty defaults when no evaluation has run yet.
+        """
+        if not self.meta_info_history:
+            return {"speedup": 0.0, "correctness": False, "compiled": False}
+        m = self.meta_info_history[-1]
+        return {
+            "speedup": float(m.get("performance", 0.0) or 0.0),
+            "correctness": bool(m.get("correctness", False)),
+            "compiled": bool(m.get("compilation", False)),
+        }
 
 
     def calculate_reward_like_kernel(self, result: Dict[str, Any]) -> Dict[str, Any]:
