@@ -57,7 +57,7 @@
 ### T0 — 路由单测（开发机，无 NPU）
 ```bash
 cd examples/openhands_sdk && python3 tests/test_op_route.py
-# 期望：ALL 3 PASS
+# 期望：ALL 1 PASS（默认 triton + 大小写 + 显式 ascendc）
 ```
 
 ### T1 — AST 闸门（开发机，无 NPU；validate 是纯 AST）
@@ -111,5 +111,5 @@ find <rollout workspace>/agent_workdir/.agents/skills -maxdepth 1 -type d   # �
 
 ### 验收判据
 - T0/T1 开发机即可过；**T2 是开训硬门槛**（pipeline 自己得先正确）。
-- T5 看到 `judge reward=` 且产物/裁剪/judge_metrics 三项齐 → 链路打通，可放量。
+- T5 看到 `judge reward=` 且产物/单路径纯净(无 ascendc)/judge_metrics 三项齐 → 链路打通，可放量。
 - 失败定位顺序：T2（pipeline）→ T3（评测脚本）→ T4（judge 容器）→ T5（路由/产物/回传）。
