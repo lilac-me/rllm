@@ -82,6 +82,8 @@ metrics = {
 }
 (out / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
+  # ①短路用：记录本次评测对应的 impl+task 内容哈希（与刚写的 metrics.json 对应）。
+  [[ -n "${CUR_HASH:-}" ]] && printf "%s" "${CUR_HASH}" > "${OUT_DIR}/.last_eval.hash" 2>/dev/null || true
 }
 
 # ----- 失败时把要点回显到 stdout：agent 据此直接修复，无需读 metrics.json 之外的脚本 -----
@@ -161,6 +163,20 @@ if [[ ! -f "${TASK_FILE}" ]]; then
   write_metrics false false false "" "" "" "task file missing"; exit 1
 fi
 
+# ----- ①内容哈希短路：impl+task 与上次评测完全相同 → 复用上次 metrics.json，跳过 NPU verify+benchmark -----
+# 省最贵的 NPU 重跑（agent 常对未改动代码"再验证一次"）。仅 in-loop 生效：judge 每次用全新
+# judge_root、无 .last_eval.hash → 始终重跑。哈希由 write_metrics 在每个终态写入，与 metrics.json 对应。
+CUR_HASH=$(python3 -c "import hashlib,sys;h=hashlib.sha256()
+for p in sys.argv[1:]:
+    h.update(open(p,'rb').read())
+print(h.hexdigest())" "${IMPL_FILE}" "${TASK_FILE}" 2>/dev/null || echo "")
+if [[ -n "${CUR_HASH}" && -f "${OUT_DIR}/.last_eval.hash" && -f "${OUT_DIR}/metrics.json" \
+      && "${CUR_HASH}" == "$(cat "${OUT_DIR}/.last_eval.hash" 2>/dev/null)" ]]; then
+  echo "[triton-eval] impl 未改动（与上次评测一致）→ 复用 ${OUT_DIR}/metrics.json，跳过 NPU verify+benchmark"
+  python3 -c "import json;d=json.load(open('${OUT_DIR}/metrics.json'));p=d.get('perf_data') or {};print('[triton-eval] cached metrics: success=%s ast_check_ok=%s correctness_ok=%s speedup_vs_torch=%s'%(d.get('success'),d.get('ast_check_ok'),d.get('correctness_ok'),p.get('speedup_vs_torch')))" 2>/dev/null || true
+  exit 0
+fi
+
 # verify_dir：verify.py/benchmark.py 按 import 名加载 {op}_torch / {op}_{IMPL_NAME}
 VERIFY_DIR="${OUT_DIR}/verify_tmp"; rm -rf "${VERIFY_DIR}"; mkdir -p "${VERIFY_DIR}"
 cp "${TASK_FILE}" "${VERIFY_DIR}/${OP_NAME}_torch.py"
@@ -204,7 +220,8 @@ FW=$(python3 -c "import json;print(json.load(open('${PERF_JSON}'))['framework'][
 IMPL_LAT=$(python3 -c "import json;print(json.load(open('${PERF_JSON}'))['implementation']['avg_latency_ms'])" 2>/dev/null || echo "")
 SP=$(python3 -c "import json;print(json.load(open('${PERF_JSON}'))['speedup_vs_torch'])" 2>/dev/null || echo "")
 write_metrics true true true "${FW}" "${IMPL_LAT}" "${SP}" ""
-echo "[triton-eval] done — metrics.json written; speedup_vs_torch=${SP}"
+# ③成功也把结构化字段回显 stdout，agent 无需再单开一步 view metrics.json
+echo "[triton-eval] done — success=true ast_check_ok=true correctness_ok=true speedup_vs_torch=${SP}  (详见 ${OUT_DIR}/metrics.json，无需另开一步读)"
 
 # ----- R1: 留存"迄今最优正确版"，供 judge/reward 取 best（优化绝不把分数拉低）-----
 # best impl 落在 submission 同目录的 {op}_impl.best.py；best metrics 落在 OUT_DIR/metrics.best.json。

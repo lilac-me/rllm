@@ -85,6 +85,14 @@ chk() { if [[ "$2" == "$3" ]]; then echo "  PASS $1"; else echo "  FAIL $1: got 
 run 0.30 1; chk "first success → best=v1@0.3"           "$(best_ver)|$(best_sp)" "VERSION 1|0.3"
 run 0.10 2; chk "slower-but-correct → best STAYS v1@0.3" "$(best_ver)|$(best_sp)" "VERSION 1|0.3"
 run 0.85 3; chk "faster → best=v3@0.85"                  "$(best_ver)|$(best_sp)" "VERSION 3|0.85"
+
+# ① hash short-circuit: re-run the SAME impl (v3, unchanged) → reuse metrics, skip NPU.
+# STUB_SP=0.99 would update best IF benchmark ran; short-circuit means it does NOT.
+sc_out=$(STUB_SP=0.99 bash "${WS}/tools/triton_eval_pipeline.sh" \
+         --op_name softmax --impl "${IMPL}" --task "${WS}/src/softmax.py" 2>&1)
+if echo "${sc_out}" | grep -q "未改动"; then echo "  PASS ① re-run unchanged → short-circuit"; else echo "  FAIL ① no short-circuit msg"; fail=1; fi
+chk "① short-circuit skips re-eval → best untouched (not 0.99)" "$(best_ver)|$(best_sp)" "VERSION 3|0.85"
+
 run_fail 4; chk "correctness FAIL → best STAYS v3@0.85"  "$(best_ver)|$(best_sp)" "VERSION 3|0.85"
 
 [[ "${fail}" == "0" ]] && echo "ALL PASS" || { echo "FAILED"; exit 1; }

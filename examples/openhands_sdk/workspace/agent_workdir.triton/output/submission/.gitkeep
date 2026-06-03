@@ -1,0 +1,3 @@
+# Pre-created so the agent never spends a turn on `mkdir -p output/submission`.
+# The submission {op_name}_impl.py (and the pipeline-maintained {op_name}_impl.best.py)
+# land here. Keep this directory in the workspace template.

@@ -76,9 +76,9 @@ while iteration < max_iterations:
 
 ### Phase 3: 性能优化（可选；最多 2 轮，不劣化即可）
 
-> 一如既往**只改** `output/submission/{op_name}_impl.py`。固定入口会在每次 `success==true`
-> 时自动留存"迄今最优正确版"（`{op_name}_impl.best.py`），**评测/奖励以最优正确版为准**——
-> 所以优化失败**不会降低成绩**，可放心尝试；但**别无限试**，按下面硬上限收敛。
+> 一如既往**只改** `output/submission/{op_name}_impl.py`（目录已预置，无需 mkdir）。固定入口会在
+> 每次 `success==true` 时自动留存"迄今最优正确版"（`{op_name}_impl.best.py`），**评测/奖励以最优正确版
+> 为准**——所以优化失败**不会降低成绩**，**也无需手动 `cp` 备份/还原**；放心尝试，但**别无限试**，按下面硬上限收敛。
 
 ```
 opt_iter = 0; max_opt_iterations = 2
