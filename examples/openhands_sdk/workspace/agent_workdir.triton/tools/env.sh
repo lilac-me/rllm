@@ -31,8 +31,16 @@ export AST_CHECK_PYTHON="${AST_CHECK_PYTHON:-python3}"
 
 
 rm -rf /root/.triton/cache/
- 
+
+# 厂商 set_env.sh 假设 LD_LIBRARY_PATH/CMAKE_PREFIX_PATH 已存在；在 pipeline 的 set -u 下，
+# 它的 `export X=/cann/...:$X` 会因 X 未定义报 "unbound variable"，该 export 失败 →
+# Ascend/triton 库路径没拼上 → 后续 verify 编译/运行 kernel 失败。
+# 先把这俩补成空、临时关 nounset 再 source，结束恢复 -u。
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+set +u
 source /opt/conda/envs/evaluator-py311/Ascend/ascend-toolkit/set_env.sh
+set -u
 
 export TRITON_DEBUG=1
 export TRITON_ALLWAYS_COMPILE=1

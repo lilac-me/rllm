@@ -13,12 +13,17 @@ verify.py 直接 import 的 task 文件。
 产物即 ``create_mock_npu_operator_data.py`` 里 ``extra_info['task_code']`` 的内容
 （同时把原 ``.json`` 作为 ``extra_info['task_json']`` 携带即可，见 WORK_LOG §5 T5）。
 
+注意：有的 NPUKernelBench 变体的 ``{op}.py`` 已自带 ``get_input_groups()``，但它在**运行时
+``open()`` 读 sibling ``{op}.json``**（非自包含）。直接当 task_code 会在 pipeline 里因改名/路径
+对不上而 ``FileNotFoundError``——对这种用 ``--bake`` 强制烘焙成自包含（剥掉读文件那段、用 json 重建）。
+
 用法：
     python3 npukb_to_task.py <op.py> [--json <op.json>] [-o out.py]
-                            [--max-cases N] [--dtypes f32,f16,bf16]
+                            [--max-cases N] [--dtypes f32,f16,bf16] [--bake]
     # --json 缺省=同名 <op>.json；-o 缺省=stdout
+    # --bake：无视已有输入函数，从 json 强制重建自包含（runtime 读 json 的变体必须加）
 例：
-    python3 npukb_to_task.py \
+    python3 npukb_to_task.py --bake \
       /path/AscendOpGenAgent/benchmarks/NPUKernelBench/level1/4_Abs.py \
       --max-cases 12 -o abs.py
 """
@@ -89,6 +94,28 @@ def _write(body: str, out: str | None, note: str) -> None:
         print(f"[npukb] {note}", file=sys.stderr)
 
 
+def _strip_input_fns(src: str) -> str:
+    """删掉模块级 get_inputs/get_input_groups/get_init_inputs 定义（连其装饰器/函数体）。
+
+    用于 --bake：有的 NPUKernelBench 变体的 get_input_groups 会在运行时 open() 读 sibling
+    json（非自包含）。pipeline 把 task 改名成 {op}_torch.py 放进 verify_tmp 后，那个 json 名
+    /路径对不上 → FileNotFoundError。剥掉后用 json 重建自包含版，彻底去掉运行时文件依赖。
+    """
+    tree = ast.parse(src)
+    drop: set[int] = set()
+    for node in tree.body:  # 只看模块顶层
+        if isinstance(node, ast.FunctionDef) and node.name in (
+            "get_inputs", "get_input_groups", "get_init_inputs"
+        ):
+            start = min([d.lineno for d in node.decorator_list] + [node.lineno])
+            for ln in range(start, node.end_lineno + 1):
+                drop.add(ln)
+    if not drop:
+        return src
+    kept = [l for i, l in enumerate(src.splitlines(keepends=True), 1) if i not in drop]
+    return "".join(kept).rstrip("\n") + "\n"
+
+
 def _tensor_expr(dtype: str, shape: list[int]) -> str:
     if dtype not in _DTYPE:
         sys.exit(f"[npukb] 不认识的 dtype: {dtype!r}（请在 _DTYPE 里补充）")
@@ -120,26 +147,34 @@ def main() -> None:
     ap.add_argument("-o", "--out", default=None, help="输出路径（缺省=stdout）")
     ap.add_argument("--max-cases", type=int, default=0, help="只取前 N 个 case（0=全部）")
     ap.add_argument("--dtypes", default="", help="只保留这些 dtype 的 case，如 f32,f16,bf16")
+    ap.add_argument("--bake", action="store_true",
+                    help="强制从 sibling json 烘焙成自包含：剥掉原有 get_inputs/get_input_groups/"
+                         "get_init_inputs（含运行时 open() 读 json 的写法）再用 json 重建")
     args = ap.parse_args()
 
     with open(args.op_py, encoding="utf-8") as f:
         head = f.read()
     info = _inspect(head, args.op_py)
 
-    # 有的 NPUKernelBench 变体的 {op}.py 已是 verify 格式（自带 get_init_inputs + get_inputs/
-    # get_input_groups）——原样透传，不读 json、不覆盖。只自带其一视为不完整，报错让人工补。
-    if info["has_init"] and (info["has_inputs"] or info["has_groups"]):
-        _write(head, args.out, "已是 verify 格式，原样透传（无需 json）")
-        return
-    present = [k for k, v in (("get_init_inputs", info["has_init"]),
-                              ("get_inputs", info["has_inputs"]),
-                              ("get_input_groups", info["has_groups"])) if v]
-    if present:
-        sys.exit(f"[npukb] {args.op_py}: 自带 {present} 但不完整"
-                 f"（需 get_init_inputs + get_inputs/get_input_groups）；请手工补全后再用。")
+    if not args.bake:
+        # 默认：已是自包含 verify 格式 → 原样透传；只自带其一视为不完整。
+        # 注意：若 get_input_groups 运行时 open() 读 sibling json（非自包含），透传后会在 pipeline 里
+        # 因改名/路径对不上而 FileNotFoundError——这种用 --bake 强制烘焙成自包含。见 WORK_LOG §5 准备。
+        if info["has_init"] and (info["has_inputs"] or info["has_groups"]):
+            _write(head, args.out, "已是 verify 格式，原样透传（无需 json）；若它运行时读 json 请改用 --bake")
+            return
+        present = [k for k, v in (("get_init_inputs", info["has_init"]),
+                                  ("get_inputs", info["has_inputs"]),
+                                  ("get_input_groups", info["has_groups"])) if v]
+        if present:
+            sys.exit(f"[npukb] {args.op_py}: 自带 {present} 但不完整"
+                     f"（需 get_init_inputs + get_inputs/get_input_groups）；补全或用 --bake 重建。")
+
     if info["init_required"] > 0:
         sys.exit(f"[npukb] {args.op_py}: Model.__init__ 需要 {info['init_required']} 个参数，"
                  f"但 json 不携带 init 参数；请手工写 get_init_inputs() 后再用。")
+    if args.bake:
+        head = _strip_input_fns(head)   # 去掉原有（可能读文件的）输入函数，下面用 json 重建自包含版
 
     json_path = args.json or os.path.splitext(args.op_py)[0] + ".json"
     if not os.path.isfile(json_path):
@@ -170,7 +205,8 @@ def main() -> None:
     body += "\n\ndef get_input_groups():\n    return [\n"
     body += "".join(f"        {g},\n" for g in groups)
     body += "    ]\n"
-    _write(body, args.out, f"baked {len(groups)} cases")
+    _write(body, args.out,
+           f"baked {len(groups)} cases（自包含{('，已剥离原输入函数' if args.bake else '')}）")
 
 
 if __name__ == "__main__":

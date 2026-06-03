@@ -63,7 +63,8 @@ def classify(t):
     l = t.lower()
     if "implementation file missing" in l: return "implementation_missing"
     if "task file missing" in l: return "task_missing"
-    if "ast" in l: return "ast_check_failed"
+    if "ast退化" in l or "ast_check" in l or "ast check" in l: return "ast_check_failed"
+    if "get_input" in l or ("filenotfounderror" in l and ".json" in l): return "input_load_failed"
     if "ub overflow" in l: return "triton_ub_overflow"
     if "bishenghir" in l or "bishengir" in l: return "triton_compile_failed"
     if "tritontostructured" in l or "pointer analysis" in l: return "triton_lowering_failed"
