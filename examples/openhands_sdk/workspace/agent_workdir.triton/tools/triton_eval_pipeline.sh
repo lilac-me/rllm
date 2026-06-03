@@ -205,3 +205,25 @@ IMPL_LAT=$(python3 -c "import json;print(json.load(open('${PERF_JSON}'))['implem
 SP=$(python3 -c "import json;print(json.load(open('${PERF_JSON}'))['speedup_vs_torch'])" 2>/dev/null || echo "")
 write_metrics true true true "${FW}" "${IMPL_LAT}" "${SP}" ""
 echo "[triton-eval] done — metrics.json written; speedup_vs_torch=${SP}"
+
+# ----- R1: 留存"迄今最优正确版"，供 judge/reward 取 best（优化绝不把分数拉低）-----
+# best impl 落在 submission 同目录的 {op}_impl.best.py；best metrics 落在 OUT_DIR/metrics.best.json。
+# 仅在 speedup 比已存 best 更高（或尚无 best）时更新；首个 success 必留存。
+IMPL_BEST="${IMPL_FILE%.py}.best.py"
+BEST_METRICS="${OUT_DIR}/metrics.best.json"
+PREV_BEST_SP=$(python3 -c "import json;print(json.load(open('${BEST_METRICS}'))['perf_data']['speedup_vs_torch'])" 2>/dev/null || echo "")
+UPDATE_BEST=$(PREV="${PREV_BEST_SP}" CUR="${SP}" python3 -c "
+import os
+prev, cur = os.environ.get('PREV',''), os.environ.get('CUR','')
+try:
+    print('1' if (prev == '' or float(cur) > float(prev)) else '0')
+except Exception:
+    print('1' if prev == '' else '0')
+" 2>/dev/null || echo "1")
+if [[ "${UPDATE_BEST}" == "1" ]]; then
+  cp "${IMPL_FILE}" "${IMPL_BEST}" 2>/dev/null || true
+  cp "${OUT_DIR}/metrics.json" "${BEST_METRICS}" 2>/dev/null || true
+  echo "[triton-eval] best updated: $(basename "${IMPL_BEST}") (speedup_vs_torch=${SP})"
+else
+  echo "[triton-eval] best kept (current ${SP} ≤ best ${PREV_BEST_SP})"
+fi

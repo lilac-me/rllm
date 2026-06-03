@@ -74,18 +74,21 @@ while iteration < max_iterations:
 到达 max_iterations 仍未 success → 任务失败结束。
 ```
 
-### Phase 3: 性能优化（可选，不劣化即可）
+### Phase 3: 性能优化（可选；最多 2 轮，不劣化即可）
+
+> 一如既往**只改** `output/submission/{op_name}_impl.py`。固定入口会在每次 `success==true`
+> 时自动留存"迄今最优正确版"（`{op_name}_impl.best.py`），**评测/奖励以最优正确版为准**——
+> 所以优化失败**不会降低成绩**，可放心尝试；但**别无限试**，按下面硬上限收敛。
 
 ```
-while 有优化点:
+opt_iter = 0; max_opt_iterations = 2
+while opt_iter < max_opt_iterations:
+    opt_iter += 1
     1) 调 triton-latency-optimizer 就地重写 output/submission/{op_name}_impl.py
-       （先备份当前版本，便于回退）
     2) 重新运行固定入口评测，读 metrics.json：
-       - correctness 未过        → 回退到上一版，结束优化
-       - speedup_vs_torch 有提升  → 保留
-       - 无提升                  → 回退到上一版
+       - success 且 speedup_vs_torch 较前更高 → 入口已自动刷新最优；continue 再试
+       - 否则（correctness 未过 / 无提升 / 失败）  → 立即结束 Phase 3
     3) optimizer 报告无更多优化点 → 结束
-最终留在 output/submission/{op_name}_impl.py 的就是提交物。
 ```
 
 ---
@@ -147,6 +150,7 @@ PyTorch 退化子类型（`error_type` 含 ast/退化信息时）：
 | 评测 | 必须经 `tools/triton_eval_pipeline.sh`；禁止自创测试、禁止改/读 `tools/`、`scripts/` 内容 |
 | 禁止 PyTorch 退化 | forward 禁用 torch.*/F.* 计算 |
 | Phase 2 最大迭代 | 5 次 |
+| Phase 3 最大迭代 | 2 次；首次 correctness 未过/无提升即结束（入口自动保最优正确版，失败不降分） |
 | A 类连续上限 | 同一子类连续 ≥ 3 次自动终止 |
 | 语言 | 思考/分析用中文；代码/路径用英文 |
 

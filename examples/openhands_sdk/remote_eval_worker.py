@@ -320,11 +320,18 @@ def _judge_and_record(workspace: str, judge_root: str, request: dict[str, Any], 
     """agent 跑完后：把提交 impl 放进 judge 快照、重跑、把 judge metrics 写进 agent_workdir（随 tar 回传给 reward）。"""
     task = request.get("task") or {}
     op_name = task.get("op_name", "operator")
-    sub = os.path.join(workspace, "agent_workdir", "output", "submission", f"{op_name}_impl.py")
+    sub_dir = os.path.join(workspace, "agent_workdir", "output", "submission")
+    # R1: judge 评"迄今最优正确版" {op}_impl.best.py（由固定入口在每次 success 时留存）；
+    # 没有 best（从未 success）才退回最终 {op}_impl.py。judge 会重验，故取 best 安全——
+    # 这样 Phase 3 的优化尝试即便把 _impl.py 改坏，也绝不会把 reward 拉到已达成的最优之下。
+    sub_best = os.path.join(sub_dir, f"{op_name}_impl.best.py")
+    sub_final = os.path.join(sub_dir, f"{op_name}_impl.py")
+    sub = sub_best if os.path.exists(sub_best) else sub_final
     if os.path.exists(sub):
         jdst = os.path.join(judge_root, "agent_workdir", "output", "submission", f"{op_name}_impl.py")
         os.makedirs(os.path.dirname(jdst), exist_ok=True)
         shutil.copy2(sub, jdst)
+        print(f"[remote-eval] judge scoring {os.path.basename(sub)}", flush=True)
         metrics = _run_judge(judge_root, request)
     else:
         metrics = {"success": False, "ast_check_ok": False, "correctness_ok": False,
