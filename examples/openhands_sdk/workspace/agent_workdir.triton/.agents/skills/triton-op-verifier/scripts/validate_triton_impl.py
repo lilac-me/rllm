@@ -372,12 +372,23 @@ def _violation_for_functional_qual(node, qual, attr):
 
 
 def _violation_for_tensor_method(node, qual, attr):
-    """处理被禁止的 tensor 方法调用。"""
+    """处理被禁止的 tensor 方法调用。
+
+    仅针对「张量方法」形式 `x.min()` / `x.sum()`（qual 为对象名）判退化。
+    裸函数形式 `min(a, b)` / `max(a, b)`（qual is None）是 Python 内置函数：
+    其多实参形式作用于标量（对两个张量调用 `min(t1, t2)` 会在运行时抛
+    "Boolean value of Tensor is ambiguous"），是 grid/BLOCK 等 launch 配置
+    算术，AGENTS.md 明确允许（"分配、形状检查、launch kernel"），不算退化。
+    """
     if attr not in FORBIDDEN_TENSOR_METHODS:
         return None
     # 排除已知安全的 qual（torch/F/triton 已在上面处理）
     skip_quals = {"torch", "F", "triton"} | FUNCTIONAL_QUALIFIERS
     if qual in skip_quals:
+        return None
+    # 放行标量 launch 配置算术：裸 min()/max() 的多参形式
+    # （如 grid_size = min(M, num_cores)）。单参形式 min(iterable) 仍按退化处理。
+    if qual is None and attr in {"min", "max"} and len(node.args) >= 2:
         return None
     return {
         "line": node.lineno,

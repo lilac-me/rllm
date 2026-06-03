@@ -84,6 +84,32 @@ metrics = {
 PY
 }
 
+# ----- 失败时把要点回显到 stdout：agent 据此直接修复，无需读 metrics.json 之外的脚本 -----
+# 目的：避免 agent 因终端信息太少而去翻 tools/、scripts/（AGENTS.md 禁止）。
+emit_ast_fail() {            # $1 = validator 的 --json 输出
+  AST_JSON="$1" python3 - <<'PY' || true
+import json, os
+try:
+    d = json.loads(os.environ.get("AST_JSON", "") or "{}")
+except Exception:
+    d = {}
+rt = d.get("regression_type")
+desc = {1: "完全无 Triton kernel（纯 PyTorch）",
+        2: "有 kernel 但 forward() 未调用",
+        3: "部分计算仍用 PyTorch（需全部移入 kernel）"}.get(rt, "")
+if rt:
+    print(f"  退化类型 Type{rt}: {desc}")
+for v in ((d.get("checks", {}).get("no_forbidden_torch_ops", {}) or {}).get("violations", []) or []):
+    print(f"  第{v.get('line')}行: {v.get('call')} — {v.get('reason')}")
+if d.get("suggestion"):
+    print(f"  修复建议: {d['suggestion']}")
+PY
+}
+emit_fail_tail() { printf '%s\n' "$1" | tail -n 30; }   # $1 = 错误文本（取末 30 行，限制 context）
+fail_hint() {               # 统一指引：读 metrics.json、改 submission、勿碰 tools/scripts
+  echo "  ↳ 完整结果见 ${OUT_DIR}/metrics.json（字段 error / error_type）；据此修改 output/submission/ 后重跑本入口。禁止读改 tools/ 或 .agents/skills/*/scripts/。"
+}
+
 # ----- 参数解析（只接受这些；没有 warmup/repeats/skip_framework 等危险开关）-----
 OP_NAME="" IMPL_FILE="" TASK_FILE="" JSON_FILE="" OUT_DIR="" SELF_CHECK=0
 while [[ $# -gt 0 ]]; do
@@ -147,7 +173,8 @@ cp "${IMPL_FILE}" "${VERIFY_DIR}/${OP_NAME}_${IMPL_NAME}.py"
 echo "[triton-eval] Step1 AST check"
 if ! AST_OUT=$("${AST_CHECK_PYTHON}" "${VERIFIER_SCRIPTS}/validate_triton_impl.py" "${IMPL_FILE}" --json 2>&1); then
   rm -rf "${VERIFY_DIR}"; write_metrics false false false "" "" "" "AST退化检查失败: ${AST_OUT}"
-  echo "[triton-eval] AST FAILED"; exit 1
+  echo "[triton-eval] AST FAILED — 退化检测未通过（error_type=ast_check_failed）"
+  emit_ast_fail "${AST_OUT}"; fail_hint; exit 1
 fi
 
 # Step 2: 数值正确性（NPU，抢设备锁）
@@ -156,7 +183,8 @@ if ! VERIFY_ERR=$("${OPERATOR_PYTHON}" "${VERIFIER_SCRIPTS}/verify.py" \
       --op_name "${OP_NAME}" --verify_dir "${VERIFY_DIR}" --triton_impl_name "${IMPL_NAME}" \
       --timeout "${VERIFY_TIMEOUT}" 2>&1); then
   rm -rf "${VERIFY_DIR}"; write_metrics true false false "" "" "" "数值验证失败: ${VERIFY_ERR}"
-  echo "[triton-eval] verify FAILED"; exit 1
+  echo "[triton-eval] verify FAILED"
+  emit_fail_tail "${VERIFY_ERR}"; fail_hint; exit 1
 fi
 
 # Step 3: 性能（NPU，抢锁）—— 注意：不传 --skip_framework/--framework_latency_ms/--verify_not_required
@@ -166,7 +194,8 @@ if ! BENCH_ERR=$("${OPERATOR_PYTHON}" "${VERIFIER_SCRIPTS}/benchmark.py" \
       --op_name "${OP_NAME}" --verify_dir "${VERIFY_DIR}" --triton_impl_name "${IMPL_NAME}" \
       --warmup "${WARMUP}" --repeats "${REPEATS}" --output "${PERF_JSON}" 2>&1); then
   rm -rf "${VERIFY_DIR}"; write_metrics true true false "" "" "" "性能测试失败: ${BENCH_ERR}"
-  echo "[triton-eval] benchmark FAILED"; exit 1
+  echo "[triton-eval] benchmark FAILED"
+  emit_fail_tail "${BENCH_ERR}"; fail_hint; exit 1
 fi
 rm -rf "${VERIFY_DIR}"
 
