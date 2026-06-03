@@ -229,4 +229,14 @@ find <ws>/agent_workdir/.agents/skills -maxdepth 1 -type d   # 单路径纯净�
 
 4. **`error_type` 误判**：`triton_eval_pipeline.sh` 的 `classify()` 用 `"ast" in l` 太宽，把上面的 `FileNotFoundError`（读 json）误标 `ast_check_failed`。**修复**：`ast` 判定收窄为 `ast退化`/`ast_check`/`ast check`，并新增 `input_load_failed`（命中 `get_input`/`.json` FileNotFound）。
 
-> 验收现状：**T0–T3 已绿**（T3 用自包含 task：good `success=True` / bad `correctness_ok=False`，闸门方向正确）。下一步 T4（judge 隔离）→ T5（完整 rollout，数据须用 `--bake` 的自包含 task_code）。
+> **验收现状（2026-06-03）：T0–T4 已绿。**
+> - T0/T1 开发机 AST；T2 容器内 self-check；T3 单算子手动评测：自包含 task，good `success=True` / bad `correctness_ok=False`（闸门方向正确）。
+> - **T4 judge 隔离已过**：judge 只拿 **最小 canonical 快照**（tools+verifier+src，agent 碰不到）+ 提交物，独立重算 → 同样 good 过 / bad 被正确性闸门拦。可信 reward 链路打通。
+>
+> **下一步 = T5（完整 rollout，最终验收）**，命令见 §5 T5。与前面手测的本质区别：算子实现由 **agent 自己生成**，worker 自动起 agent 容器 + judge 容器，跑路由/reward 全链路。开跑前置：
+> 1. `task_code` 必须**自包含**（`npukb_to_task.py --bake`，或手写；**别用原始 `4_Abs.py`** 会再踩 FileNotFound）。
+> 2. 造 1 行 parquet：`extra_info` 带 `operator_backend="triton"` + `task_code`。
+> 3. `train_openhands_qwen36_npu.sh`：`data.*_files` 指向该 parquet、`rollout.n=1`、`OPENHANDS_MAX_ITERATIONS=3`、跑 1 步、`KEEP_OPENHANDS_WORKSPACE=1`。
+> 4. 核对四项：`[openhands-triton] judge reward=` 日志 / `output/submission/abs_impl.py` / `judge_metrics.json` / skills 单路径纯净（无 ascendc）。
+>
+> 注：env.sh 的 `set -u` guard、`--bake`、classify 修正均已落 commit；你 host checkout `git pull` 即可同步（不必再手动 patch）。
