@@ -11,15 +11,20 @@ N 轨迹 → 读 judge_metrics → 算 pass@k"。**不走 trainer/梯度**。
 
 ## 前置（NPU 宿主机）
 1. **同步代码**：`git pull`（拿到 eval/ + runner.py 温度&run_meta + worker 温度透传）。
-2. **重启 remote worker**：`remote_eval_worker._run_container` 的温度透传是宿主机进程改动，必须重启才生效
-   （`runner.py` 的改动随 workspace tar 进容器，**不用重建镜像**）。
+2. **启动 / 重启 remote worker**（监听 `EVAL_WORKER_PORT`，默认 **16881**，见 `config/qwen36.env:29`）：
+   ```bash
+   bash start_remote_worker.sh          # 默认 16881；或 EVAL_WORKER_PORT=16881 bash start_remote_worker.sh
+   curl http://127.0.0.1:16881/health   # 应回 {"ok": true}
+   ```
+   温度透传是宿主机进程改动 → 拉完代码必须**重启** worker 才生效（`runner.py` 的改动随 workspace tar 进容器，**不用重建镜像**）。
+   **eval 的 `OPENHANDS_REMOTE_EVAL_URL` 端口必须和这里一致**。
 3. **vLLM**：`--max-model-len 262144`（256k）+ tool-calling：`--enable-auto-tool-choice --tool-call-parser qwen3_coder`（或 hermes）。
 4. 镜像 + 设备：`OPENHANDS_IMAGE=openhands-triton-env:v1`、`OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3`。
 
 ## 怎么定 `--max-iterations`（先小批量摸 step）
 先用**宽松上限**跑几个算子，让轨迹自然收敛、不被截断，再读它实际用了多少步：
 ```bash
-EVAL_MAX_CONCURRENT=4 OPENHANDS_REMOTE_EVAL_URL=http://127.0.0.1:18880 \
+EVAL_MAX_CONCURRENT=4 OPENHANDS_REMOTE_EVAL_URL=http://127.0.0.1:16881 \
 OPENHANDS_IMAGE=openhands-triton-env:v1 OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3 \
 LLM_BASE_URL=http://127.0.0.1:8003/v1 OPENHANDS_MODEL_NAME=qwen35 \
 bash eval/run_eval.sh /home/c00937190/AscendOpGenAgent/benchmarks/NPUKernelBench \
@@ -33,7 +38,7 @@ bash eval/run_eval.sh /home/c00937190/AscendOpGenAgent/benchmarks/NPUKernelBench
 
 ## 正式跑
 ```bash
-EVAL_MAX_CONCURRENT=4 OPENHANDS_REMOTE_EVAL_URL=http://127.0.0.1:18880 \
+EVAL_MAX_CONCURRENT=4 OPENHANDS_REMOTE_EVAL_URL=http://127.0.0.1:16881 \
 OPENHANDS_IMAGE=openhands-triton-env:v1 OPENHANDS_EVAL_DEVICE_IDS=0,1,2,3 \
 LLM_BASE_URL=http://127.0.0.1:8003/v1 OPENHANDS_MODEL_NAME=qwen35 \
 EVAL_N=4 \
