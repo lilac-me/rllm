@@ -522,6 +522,9 @@ def run() -> int:
         model=cfg.llm_model,
         api_key=SecretStr(cfg.llm_api_key),
         base_url=cfg.llm_base_url or None,
+        # Sampling temperature: 0.0 default (greedy, as before). Eval sets LLM_TEMPERATURE>0
+        # so N independent rollouts diverge → pass@k is meaningful. The worker passes it via -e.
+        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.0")),
         max_output_tokens=2048,
     )
 
