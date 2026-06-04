@@ -70,4 +70,5 @@ python3 eval/eval_openhands.py --dataset <NPUKernelBench> --levels 1,2 --rollout
 - judge 评的是 `.best`（R1）→ 每条轨迹得分=这次能做到的最好正确版。
 - 数据集：level1+2 共 **61 个算子全部可烘焙**（`npukb_to_task --bake`，自包含、无运行时读 json）。
 - eval 直连 vLLM（`--llm-base-url`），**不走训练的 LiteLLM proxy / logprob 记录**。
+- **eval 自包含**：只依赖 `op_route` + 标准库，**不 import `openhands_agent`/`rllm`** → 用任意 `python3` 跑即可，无需训练环境。
 - 256k 上下文下不用 condenser、不用削 reference，模型跑全量 skills。

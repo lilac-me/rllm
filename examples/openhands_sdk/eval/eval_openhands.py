@@ -40,13 +40,17 @@ Real run (NPU host):
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -55,6 +59,83 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _OPENHANDS_DIR = _HERE.parent                       # examples/openhands_sdk
 _NPUKB_TO_TASK = _OPENHANDS_DIR / "npukb_to_task.py"
+_WORKSPACE_PKG = _OPENHANDS_DIR / "workspace"
+
+# eval is decoupled from the training module (openhands_agent imports rllm at top, which
+# isn't importable in a plain eval env). We reuse ONLY op_route (stdlib-only, no rllm) and
+# reimplement the small workspace+tar helpers below — mirrors openhands_agent but self-contained.
+sys.path.insert(0, str(_OPENHANDS_DIR))
+from op_route import op_route as _op_route  # noqa: E402
+
+# Kept in lockstep with openhands_agent._TRITON_INSTRUCTION_TEMPLATE.
+_TRITON_INSTRUCTION_TEMPLATE = (
+    "生成 Triton-Ascend 算子。算子描述文件为 src/{op_name}.py。\n"
+    "最终实现写到 output/submission/{op_name}_impl.py（类名 ModelNew）。\n"
+)
+
+
+# --- workspace + tar helpers (mirror openhands_agent; no rllm dependency) ------------------ #
+def _tar_directory_b64(path: str, arcname: str = ".") -> str:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(path, arcname=arcname)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _manifest_directory(path: str, limit: int = 80) -> list[str]:
+    root = Path(path)
+    if not root.exists():
+        return []
+    items: list[str] = []
+    for item in root.rglob("*"):
+        items.append(item.relative_to(root).as_posix() + ("/" if item.is_dir() else ""))
+        if len(items) >= limit:
+            items.append("...")
+            break
+    return items
+
+
+def _extract_tar_b64_into(encoded: str, destination: str) -> None:
+    raw = base64.b64decode(encoded.encode("ascii"))
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        dest = Path(destination).resolve()
+        for member in tar.getmembers():
+            target = (dest / member.name).resolve()
+            if dest != target and dest not in target.parents:
+                raise ValueError(f"unsafe tar member path: {member.name}")
+        tar.extractall(destination)
+
+
+def _setup_workspace(task: dict, trace_label: str) -> str:
+    """Assemble a per-rollout workspace = shared infra + agent_workdir.{route} + src/{op}.(py|json).
+
+    Faithful reimplementation of openhands_agent._setup_npu_operator_workspace (triton path)
+    without importing that rllm-coupled module.
+    """
+    ws_temp_env = os.environ.get("OPENHANDS_WORKSPACE_TEMP_HOST_DIR", "").strip()
+    workspace_temp = Path(ws_temp_env) if ws_temp_env else _OPENHANDS_DIR / "workspace_temp"
+    workspace_temp.mkdir(parents=True, exist_ok=True)
+    workspace = tempfile.mkdtemp(prefix=f"trajectory-{trace_label}-", dir=str(workspace_temp))
+
+    op_name = task.get("op_name", "operator")
+    route = _op_route(task)
+    shutil.copytree(_WORKSPACE_PKG, workspace, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("agent_workdir.*"))
+    shutil.copytree(_WORKSPACE_PKG / f"agent_workdir.{route}",
+                    os.path.join(workspace, "agent_workdir"), dirs_exist_ok=True)
+
+    with open(os.path.join(workspace, "agent_workdir", "INSTRUCTIONS.md"), "w", encoding="utf-8") as f:
+        f.write(_TRITON_INSTRUCTION_TEMPLATE.format(op_name=op_name))
+
+    task_code = task.get("task_code", "")
+    if task_code:
+        src_dir = os.path.join(workspace, "agent_workdir", "src")
+        os.makedirs(src_dir, exist_ok=True)
+        with open(os.path.join(src_dir, f"{op_name}.py"), "w", encoding="utf-8") as f:
+            f.write(task_code)
+        with open(os.path.join(src_dir, f"{op_name}.json"), "w", encoding="utf-8") as f:
+            f.write(task.get("task_json", ""))
+    return workspace
 
 _TRITON_INSTRUCTION = (
     "为算子 `{op}` 生成 Triton-Ascend 实现。参考算子在 `src/{op}.py`。请严格按 `AGENTS.md` "
@@ -211,23 +292,20 @@ def run_rollout(task: Task, i: int, cfg: argparse.Namespace, out: Path) -> TrajR
 
 
 def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Path) -> TrajResult:
-    """Real path: build workspace, POST /run, read judge_metrics.json. Reuses openhands_agent helpers."""
-    try:
-        sys.path.insert(0, str(_OPENHANDS_DIR))
-        import openhands_agent as oa  # noqa: E402
-    except Exception as e:  # pragma: no cover
-        return TrajResult(task.task_id, i, {}, {}, -1, f"import openhands_agent failed: {e!r}")
-
+    """Real path: build workspace, POST /run, read judge_metrics.json. Self-contained (no rllm)."""
     remote_url = (cfg.remote_eval_url or os.environ.get("OPENHANDS_REMOTE_EVAL_URL", "")).strip().rstrip("/")
     if not remote_url:
         return TrajResult(task.task_id, i, {}, {}, -1, "OPENHANDS_REMOTE_EVAL_URL/--remote-eval-url not set")
 
     task_dict = {"op_name": task.op_name, "arch": task.arch, "instruction": task.instruction,
                  "task_code": task.task_code, "task_json": task.task_json, "operator_backend": "triton"}
-    ws = oa._setup_npu_operator_workspace(task_dict, trace_label=f"{task.task_id}-{i}")
+    try:
+        ws = _setup_workspace(task_dict, trace_label=f"{task.task_id}-{i}")
+    except Exception as e:
+        return TrajResult(task.task_id, i, {}, {}, -1, f"setup_workspace failed: {e!r}")
     payload = {
-        "workspace_tar_gz_b64": oa._tar_directory_b64(ws, arcname="workspace"),
-        "workspace_manifest": oa._manifest_directory(ws),
+        "workspace_tar_gz_b64": _tar_directory_b64(ws, arcname="workspace"),
+        "workspace_manifest": _manifest_directory(ws),
         "proxied_url": cfg.llm_base_url or os.environ.get("LLM_BASE_URL", ""),
         "instruction": task.instruction,
         "task": task_dict,
@@ -254,11 +332,10 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
     # replacing the pre-rollout copy (mirrors openhands_agent._run_remote_eval_worker).
     if "agent_workdir_tar_gz_b64" in result:
         try:
-            import shutil
             adir0 = Path(ws) / "agent_workdir"
             if adir0.exists():
                 shutil.rmtree(adir0)
-            oa._extract_tar_b64_into(result["agent_workdir_tar_gz_b64"], ws)
+            _extract_tar_b64_into(result["agent_workdir_tar_gz_b64"], ws)
         except Exception as e:
             return TrajResult(task.task_id, i, {}, {}, -1, f"untar agent_workdir failed: {e!r}")
     judge_path = Path(ws) / "agent_workdir" / "judge_metrics.json"
@@ -289,7 +366,6 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
                 dst.write_bytes(src.read_bytes())
     # staging workspace is large (tar+extract); drop it unless asked to keep.
     if not cfg.keep_workdir:
-        import shutil
         shutil.rmtree(ws, ignore_errors=True)
 
     return TrajResult(task.task_id, i, judge, meta, int(result.get("exit_code", -1)),
