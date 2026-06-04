@@ -235,8 +235,10 @@ _NPU_INSTRUCTION_TEMPLATE = """生成ascendC算子，npu=0，算子描述文件�
 """
 
 
-_TRITON_INSTRUCTION_TEMPLATE = """生成 Triton-Ascend 算子。算子描述文件为 src/{op_name}.py。
-最终实现写到 output/submission/{op_name}_impl.py（类名 ModelNew）。
+_TRITON_INSTRUCTION_TEMPLATE = """为算子 {op_name} 生成 Triton-Ascend 实现，参考算子在 src/{op_name}.py。
+严格按 AGENTS.md 的工作流执行（设计 → 生成 → 用固定入口自测迭代），把唯一提交物写到 output/submission/{op_name}_impl.py（类名 ModelNew），
+再用固定入口 bash tools/triton_eval_pipeline.sh --op_name {op_name} --impl output/submission/{op_name}_impl.py --task src/{op_name}.py 验证，
+读 metrics.json 按 error_type 迭代直到 success。未写出提交物、且未通过固定入口验证之前，不要结束任务。
 """
 
 # 路由逻辑抽到 op_route.py（仅依赖 os/shutil、无 NPU/rllm 依赖，便于单元测试；见 EXTERNAL_SCORER_DESIGN.md §7）
