@@ -678,6 +678,18 @@ def run() -> int:
         logger.info("Conversation completed. Status=%s", exec_status)
         run_state.set_phase(AgentPhase.FINISHED)
 
+        # Eval calibration aid: persist turn/iteration counts so the eval driver can
+        # size --max-iterations (read back from agent_workdir/run_meta.json).
+        try:
+            _calls = int(getattr(run_state, "total_llm_calls", 0))
+            _max = int(cfg.max_iterations)
+            with open(os.path.join(cfg.workspace_base, "run_meta.json"), "w", encoding="utf-8") as _mf:
+                json.dump({"total_llm_calls": _calls, "iterations": int(getattr(run_state, "iteration", 0)),
+                           "max_iterations": _max, "exec_status": exec_status,
+                           "hit_cap": _calls >= _max}, _mf, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.debug("[runner] failed to write run_meta.json", exc_info=True)
+
         # ── Evaluation event ──────────────────────────────────────────────
         push_evaluate_event(
             client,

@@ -130,7 +130,12 @@ def _group_expr(inputs: list[dict]) -> str:
     parts: list[str] = []
     for item in inputs:
         if item.get("type") == "tensor":
-            parts.append(_tensor_expr(str(item["dtype"]).lower(), list(item["shape"])))
+            shape = item.get("shape")
+            if shape is None:
+                # 可选张量（required:false）在该 case 未提供 → 传 None（forward 签名里是可选位）
+                parts.append("None")
+            else:
+                parts.append(_tensor_expr(str(item["dtype"]).lower(), list(shape)))
         else:  # attr：标量/布尔/字符串/列表 —— 原样取 value
             parts.append(repr(item.get("value")))
     return "[" + ", ".join(parts) + "]"

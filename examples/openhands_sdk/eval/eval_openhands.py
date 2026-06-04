@@ -181,6 +181,7 @@ class TrajResult:
     task_id: str
     traj_idx: int
     judge: dict = field(default_factory=dict)   # judge_metrics.json (or fabricated)
+    meta: dict = field(default_factory=dict)    # run_meta.json: total_llm_calls / hit_cap / exec_status
     exit_code: int = 0
     error: str | None = None
 
@@ -189,15 +190,20 @@ def run_rollout(task: Task, i: int, cfg: argparse.Namespace, out: Path) -> TrajR
     if cfg.rollout == "mock":
         rng = random.Random(f"{cfg.seed}-{task.task_id}-{i}")
         r = rng.random()
+        iters = rng.randint(8, 30)
+        meta = {"total_llm_calls": iters, "max_iterations": cfg.max_iterations,
+                "hit_cap": iters >= cfg.max_iterations, "exec_status": "finished"}
         if r < 0.55:        # correct (+ a speedup)
             sp = round(0.2 + rng.random() * 1.4, 4)
-            return TrajResult(task.task_id, i, {"success": sp >= 1.0, "ast_check_ok": True,
-                              "correctness_ok": True, "perf_data": {"speedup_vs_torch": sp}})
-        if r < 0.8:         # ast ok, correctness fail
-            return TrajResult(task.task_id, i, {"success": False, "ast_check_ok": True,
-                              "correctness_ok": False, "perf_data": None, "error_type": "correctness_failed"})
-        return TrajResult(task.task_id, i, {"success": False, "ast_check_ok": False,
-                          "correctness_ok": False, "perf_data": None, "error_type": "ast_check_failed"})
+            judge = {"success": sp >= 1.0, "ast_check_ok": True,
+                     "correctness_ok": True, "perf_data": {"speedup_vs_torch": sp}}
+        elif r < 0.8:       # ast ok, correctness fail
+            judge = {"success": False, "ast_check_ok": True,
+                     "correctness_ok": False, "perf_data": None, "error_type": "correctness_failed"}
+        else:
+            judge = {"success": False, "ast_check_ok": False,
+                     "correctness_ok": False, "perf_data": None, "error_type": "ast_check_failed"}
+        return TrajResult(task.task_id, i, judge, meta)
 
     if cfg.rollout == "remote_worker":
         return _rollout_remote_worker(task, i, cfg, out)
@@ -210,11 +216,11 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
         sys.path.insert(0, str(_OPENHANDS_DIR))
         import openhands_agent as oa  # noqa: E402
     except Exception as e:  # pragma: no cover
-        return TrajResult(task.task_id, i, {}, -1, f"import openhands_agent failed: {e!r}")
+        return TrajResult(task.task_id, i, {}, {}, -1, f"import openhands_agent failed: {e!r}")
 
     remote_url = (cfg.remote_eval_url or os.environ.get("OPENHANDS_REMOTE_EVAL_URL", "")).strip().rstrip("/")
     if not remote_url:
-        return TrajResult(task.task_id, i, {}, -1, "OPENHANDS_REMOTE_EVAL_URL/--remote-eval-url not set")
+        return TrajResult(task.task_id, i, {}, {}, -1, "OPENHANDS_REMOTE_EVAL_URL/--remote-eval-url not set")
 
     task_dict = {"op_name": task.op_name, "arch": task.arch, "instruction": task.instruction,
                  "task_code": task.task_code, "task_json": task.task_json, "operator_backend": "triton"}
@@ -242,7 +248,7 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        return TrajResult(task.task_id, i, {}, -1, f"worker POST failed: {e!r}")
+        return TrajResult(task.task_id, i, {}, {}, -1, f"worker POST failed: {e!r}")
 
     # Extract agent_workdir (contains judge_metrics.json) back into the staging workspace,
     # replacing the pre-rollout copy (mirrors openhands_agent._run_remote_eval_worker).
@@ -254,20 +260,27 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
                 shutil.rmtree(adir0)
             oa._extract_tar_b64_into(result["agent_workdir_tar_gz_b64"], ws)
         except Exception as e:
-            return TrajResult(task.task_id, i, {}, -1, f"untar agent_workdir failed: {e!r}")
+            return TrajResult(task.task_id, i, {}, {}, -1, f"untar agent_workdir failed: {e!r}")
     judge_path = Path(ws) / "agent_workdir" / "judge_metrics.json"
     judge = {}
     if judge_path.exists():
         try:
             judge = json.loads(judge_path.read_text(encoding="utf-8"))
         except Exception as e:
-            return TrajResult(task.task_id, i, {}, -1, f"bad judge_metrics.json: {e!r}")
+            return TrajResult(task.task_id, i, {}, {}, -1, f"bad judge_metrics.json: {e!r}")
+    meta_path = Path(ws) / "agent_workdir" / "run_meta.json"   # turn count for --max-iterations calibration
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
 
     # Archive the trajectory for post-hoc inspection (submission/.best/conversation/self-report).
     if not cfg.no_archive:
         adir = out / task.task_id / f"traj_{i}"
         adir.mkdir(parents=True, exist_ok=True)
-        for rel in ("judge_metrics.json", "metrics.json",
+        for rel in ("judge_metrics.json", "run_meta.json", "metrics.json",
                     f"output/submission/{task.op_name}_impl.py",
                     f"output/submission/{task.op_name}_impl.best.py", "conversation.log"):
             src = Path(ws) / "agent_workdir" / rel
@@ -279,7 +292,7 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
         import shutil
         shutil.rmtree(ws, ignore_errors=True)
 
-    return TrajResult(task.task_id, i, judge, int(result.get("exit_code", -1)),
+    return TrajResult(task.task_id, i, judge, meta, int(result.get("exit_code", -1)),
                       result.get("worker_error"))
 
 
@@ -302,6 +315,16 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 def geomean(xs: list[float]) -> float:
     xs = [x for x in xs if x and x > 0]
     return math.exp(sum(map(math.log, xs)) / len(xs)) if xs else 0.0
+
+
+def _pct(xs: list[float], p: float) -> float | None:
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    return round(xs[f] + (xs[c] - xs[f]) * (k - f), 1)
 
 
 def _judge_correct(j: dict) -> bool:
@@ -377,7 +400,7 @@ def main() -> int:
             try:
                 per_traj[tid][i] = f.result()
             except Exception as e:  # pragma: no cover
-                per_traj[tid][i] = TrajResult(tid, i, {}, -1, f"rollout raised: {e!r}")
+                per_traj[tid][i] = TrajResult(tid, i, {}, {}, -1, f"rollout raised: {e!r}")
             done += 1
             if done % max(1, len(futs) // 20) == 0 or done == len(futs):
                 print(f"[eval] {done}/{len(futs)} rollouts", file=sys.stderr)
@@ -399,6 +422,8 @@ def main() -> int:
                               "speedup_vs_torch": _judge_speedup(x.judge),
                               "success": bool(x.judge.get("success", False)),
                               "error_type": x.judge.get("error_type"),
+                              "iterations": x.meta.get("total_llm_calls"),
+                              "hit_cap": bool(x.meta.get("hit_cap", False)),
                               "exit_code": x.exit_code, "error": x.error}
                              for x, ok in zip(trajs, correct)],
         }
@@ -411,6 +436,11 @@ def main() -> int:
     g_patk = {f"pass@{k}": round(sum(o["pass_at_k"][f"pass@{k}"] for o in op_summaries) / n, 4) for k in K}
     bests = [o["best_of_N_speedup"] for o in op_summaries]
     any_correct = sum(1 for o in op_summaries if o["num_correct"] > 0)
+    # step calibration: how many agent turns rollouts actually used (size --max-iterations off this)
+    all_meta = [x for tid in per_traj for x in per_traj[tid].values()]
+    iters = [x.meta.get("total_llm_calls") for x in all_meta
+             if isinstance(x.meta.get("total_llm_calls"), (int, float))]
+    n_hit = sum(1 for x in all_meta if x.meta.get("hit_cap"))
     summary = {
         "n_ops": n, "n_trajectories": N, "k_values": K, "temperature": cfg.temperature,
         "rollout_backend": cfg.rollout, "model": cfg.model, "dataset": cfg.dataset, "levels": cfg.levels,
@@ -421,6 +451,17 @@ def main() -> int:
             "geomean_over_correct_ops": round(geomean([b for b in bests if b > 0]), 4),
             "fast@1.0": round(sum(1 for b in bests if b >= 1.0) / n, 4),
             "fast@1.2": round(sum(1 for b in bests if b >= 1.2) / n, 4),
+        },
+        "step_calibration": {
+            "max_iterations_set": cfg.max_iterations,
+            "iterations_observed": {
+                "max": max(iters) if iters else None, "p90": _pct(iters, 0.9),
+                "median": _pct(iters, 0.5), "min": min(iters) if iters else None,
+            },
+            "pct_hit_cap": round(n_hit / len(all_meta), 4) if all_meta else 0.0,
+            "n_with_meta": len(iters),
+            "hint": "set --max-iterations ~1.3x of iterations.max; pct_hit_cap>0 ⇒ some "
+                    "rollouts were truncated (raise --max-iterations and re-probe)",
         },
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
