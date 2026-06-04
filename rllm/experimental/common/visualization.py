@@ -4,7 +4,7 @@ from typing import Any
 
 import click
 
-from rllm.agents.agent import Trajectory, TrajectoryGroup
+from rllm.types import Trajectory, TrajectoryGroup
 
 
 @dataclass
@@ -194,6 +194,10 @@ def visualize_trajectory_last_steps(
 
         print(_format_token(prompt_str, config.masked_token_style))
         print("----------------")
+
+        if len(response_ids) == 0:
+            print(_format_token("<empty response>", config.masked_token_style))
+            continue
 
         # for response string, we simply highlight the last token
         response_str_prev = abbreviate_string(tokenizer.decode(response_ids[:-1]))

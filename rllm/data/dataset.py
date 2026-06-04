@@ -172,6 +172,40 @@ class Dataset:
         return cls(data=data)
 
 
+def _wrap_rows_as_tasks(rows: list[dict[str, Any]]) -> list:
+    """Wrap dict rows as :class:`rllm.types.Task` objects.
+
+    Rows with ``task_path`` are rooted there and their ``task.toml``
+    metadata is merged in; other rows get ``dataset_dir=Path(".")``.
+    """
+    from pathlib import Path
+
+    from rllm.tasks.loader import _merge_task_toml_metadata
+    from rllm.types import Task
+
+    tasks: list[Task] = []
+    for idx, row in enumerate(rows):
+        instruction = row.get("instruction") or row.get("question") or ""
+        task_id = str(row.get("id") or row.get("task_id") or idx)
+        task_path = row.get("task_path")
+        if task_path:
+            dataset_dir = Path(task_path)
+            metadata = _merge_task_toml_metadata(dataset_dir, dict(row))
+        else:
+            dataset_dir = Path(".")
+            metadata = dict(row)
+        tasks.append(
+            Task(
+                id=task_id,
+                instruction=str(instruction),
+                metadata=metadata,
+                dataset_dir=dataset_dir,
+                sub_dir=None,
+            )
+        )
+    return tasks
+
+
 class DatasetRegistry:
     """A registry for datasets that manages storage and retrieval.
 
@@ -364,18 +398,28 @@ class DatasetRegistry:
         return [{col: col_dict[col][i] for col in col_dict} for i in range(num_rows)]
 
     @classmethod
-    def _strip_binary_columns(cls, data_list: list[dict[str, Any]], bin_cols: list[str]) -> list[dict[str, Any]]:
-        """Return copies of rows with binary columns set to ``None``.
+    def _wrap_binary_columns_for_parquet(cls, data_list: list[dict[str, Any]], bin_cols: list[str]) -> list[dict[str, Any]]:
+        """Wrap binary columns into verl-compatible ``{"bytes": ..., "path": ""}`` dicts.
 
-        Used for verl postprocessing where image data isn't needed.
+        Parquet stores raw ``bytes``/``list[bytes]`` fine, but verl's data path
+        (``verl/utils/dataset/rl_dataset.py:_build_messages``) expects each
+        image element to be either a PIL ``Image`` or a dict with a ``bytes``
+        key. We standardise on ``[{"bytes": <png-bytes>, "path": ""}, ...]``
+        so the same parquet works for both verl's native pipeline AND rLLM's
+        agent flows (which read via ``task.metadata["images"]``).
         """
-        stripped = []
+        wrapped = []
         for row in data_list:
             new_row = dict(row)
             for col in bin_cols:
-                new_row[col] = None
-            stripped.append(new_row)
-        return stripped
+                val = new_row.get(col)
+                if isinstance(val, bytes):
+                    new_row[col] = {"bytes": val, "path": ""}
+                elif isinstance(val, list):
+                    new_row[col] = [{"bytes": item, "path": ""} if isinstance(item, bytes) else item for item in val]
+                # leave None / other types untouched
+            wrapped.append(new_row)
+        return wrapped
 
     @classmethod
     def _verl_path_for(cls, dataset_path: str) -> str:
@@ -425,9 +469,12 @@ class DatasetRegistry:
             dataset_path = os.path.join(cls._DATASET_DIR, rel_path)
             cls._save_arrow_ipc(data_list, dataset_path)
 
-            # Strip binary columns for verl postprocessing (images not needed)
-            stripped = cls._strip_binary_columns(data_list, bin_cols)
-            verl_data = cls.apply_verl_postprocessing(stripped)
+            # Wrap binary columns as {"bytes": ..., "path": ""} dicts so they
+            # round-trip through parquet AND match verl's expected image format.
+            # Images flow through into ``extra_info`` so rLLM agent flows can
+            # read them via ``task.metadata["images"]``.
+            wrapped = cls._wrap_binary_columns_for_parquet(data_list, bin_cols)
+            verl_data = cls.apply_verl_postprocessing(wrapped)
             verl_dataset_path = cls._verl_path_for(dataset_path)
             verl_data_df = pd.DataFrame(verl_data)
             verl_data_df.to_parquet(verl_dataset_path)
@@ -473,15 +520,16 @@ class DatasetRegistry:
         return Dataset(data=data_list, name=name, split=split)
 
     @classmethod
-    def load_dataset(cls, name: str, split: str = "default") -> Dataset | None:
+    def load_dataset(cls, name: str, split: str = "default", *, as_tasks: bool = False) -> Dataset | None:
         """Load a dataset from the registry.
 
         Args:
             name: Name of the dataset to load
             split: Split name to load (e.g., 'train', 'test', 'default')
+            as_tasks: When True, wrap each row via :func:`_wrap_rows_as_tasks`.
 
         Returns:
-            Dataset: The loaded dataset or None if not found
+            Dataset: The loaded dataset or None if not found.
         """
         registry = cls._load_registry()
         datasets = registry.get("datasets", {})
@@ -510,6 +558,9 @@ class DatasetRegistry:
             data = pl.read_parquet(dataset_path).to_dicts()
 
         logger.info(f"Loaded dataset '{name}' split '{split}' with {len(data)} examples.")
+
+        if as_tasks:
+            data = _wrap_rows_as_tasks(data)
 
         return Dataset(data=data, name=name, split=split)
 

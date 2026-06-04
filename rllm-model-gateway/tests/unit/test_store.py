@@ -115,3 +115,37 @@ class TestFlush:
     @pytest.mark.asyncio
     async def test_flush_no_error(self, store):
         await store.flush()  # should not raise
+
+
+class TestSqliteStoreSpecific:
+    @pytest.mark.asyncio
+    async def test_sqlite_store_uses_wal_mode(self, tmp_path):
+        path = tmp_path / "gateway_traces.db"
+        store = SqliteTraceStore(db_path=str(path))
+        try:
+            await store.store_trace("t1", "s1", {"msg": "hello"})
+            conn = await store._get_conn()
+            async with conn.execute("PRAGMA journal_mode") as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row[0].lower() == "wal"
+        finally:
+            await store.close()
+
+    def test_explicit_db_path_does_not_warn(self, tmp_path, caplog):
+        path = tmp_path / "explicit.db"
+        with caplog.at_level("WARNING", logger="rllm_model_gateway.store.sqlite_store"):
+            store = SqliteTraceStore(db_path=str(path))
+        assert store.db_path == str(path)
+        assert not any("db_path not set" in rec.message for rec in caplog.records)
+
+    def test_missing_db_path_warns_and_resolves(self, tmp_path, monkeypatch, caplog):
+        # Redirect ~/.rllm into tmp_path so the test doesn't touch the user's home.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with caplog.at_level("WARNING", logger="rllm_model_gateway.store.sqlite_store"):
+            store = SqliteTraceStore(db_path=None)
+        assert store.db_path  # auto-resolved to a non-empty path
+        assert store.db_path.endswith("gateway_traces.db")
+        warnings = [rec for rec in caplog.records if "db_path not set" in rec.message]
+        assert len(warnings) == 1
+        assert store.db_path in warnings[0].message

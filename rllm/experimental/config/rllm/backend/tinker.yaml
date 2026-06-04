@@ -36,17 +36,6 @@ training:
 validation:
   group_size: ???
 
-# Sampling Configuration
-sampling:
-  train:
-    temperature: 1.0
-    top_p: 1.0
-    top_k: -1
-  val:
-    temperature: 1.0
-    top_p: 1.0
-    top_k: -1
-
 # Workflow Configuration (for workflow training mode)
 workflow:
   n_parallel_tasks: 256
@@ -74,13 +63,6 @@ data:
   train_batch_size: 32
   val_batch_size: 32
 
-# On-policy Self-Distillation (OPSD) Configuration
-opsd:
-  kl_penalty_coef: 1.0
-  kl_discount_factor: 0.0
-  teacher_messages_key: "teacher_messages"
-  teacher_policy_update_freq: -1 # -1 for always using the initial policy
-
 # Overriding the rLLM-common config with Tinker-specific ones
 # Only override if the algorithm values are not None, otherwise still use the rLLM-common config
 rllm:
@@ -88,3 +70,6 @@ rllm:
   rollout:
     n: ${oc.select:training.group_size, 8}
     n_val: ${oc.select:validation.group_size, 1}
+  algorithm:
+    rollout_correction:
+      bypass_mode: true

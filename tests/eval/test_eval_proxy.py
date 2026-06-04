@@ -1,6 +1,6 @@
 """Tests for EvalProxyManager config generation."""
 
-from rllm.experimental.eval.proxy import EvalProxyManager
+from rllm.eval.proxy import EvalProxyManager
 
 
 class TestEvalProxyManager:
@@ -53,6 +53,19 @@ class TestEvalProxyManager:
         assert pm.proxy_host == "0.0.0.0"
         assert pm.proxy_port == 8080
         assert pm.get_proxy_url() == "http://0.0.0.0:8080/v1"
+
+    def test_build_proxy_config_minimax_m3(self):
+        """MiniMax M3 should route through minimax/ LiteLLM prefix."""
+        pm = EvalProxyManager(provider="minimax", model_name="MiniMax-M3", api_key="mm-test-key")
+        config = pm.build_proxy_config()
+
+        assert "model_list" in config
+        assert len(config["model_list"]) == 1
+
+        entry = config["model_list"][0]
+        assert entry["model_name"] == "MiniMax-M3"
+        assert entry["litellm_params"]["model"] == "minimax/MiniMax-M3"
+        assert entry["litellm_params"]["api_key"] == "mm-test-key"
 
     def test_build_proxy_config_minimax_m27(self):
         """MiniMax M2.7 should route through minimax/ LiteLLM prefix."""

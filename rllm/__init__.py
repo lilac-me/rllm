@@ -5,21 +5,33 @@ Main package for the rLLM framework.
 
 import sys
 
-__all__ = ["BaseAgent", "Action", "Step", "Trajectory", "Episode", "rollout", "evaluator"]
+from rllm.utils.logging import configure_logging_from_env
+
+__all__ = ["BaseAgent", "Action", "Step", "Trajectory", "Episode", "rollout", "evaluator", "Task", "Runner"]
+
+configure_logging_from_env()
 
 
 def __getattr__(name: str):
     if name in ("rollout", "evaluator"):
-        from rllm.experimental.eval.rollout_decorator import evaluator, rollout
+        from rllm.eval.rollout_decorator import evaluator, rollout
 
         _mod = sys.modules[__name__]
         _mod.rollout = rollout
         _mod.evaluator = evaluator
         return rollout if name == "rollout" else evaluator
 
+    if name == "Task":
+        from rllm.types import Task
+
+        _mod = sys.modules[__name__]
+        _mod.Task = Task
+        return Task
+
     _agent_exports = {"BaseAgent", "Action", "Step", "Trajectory", "Episode"}
     if name in _agent_exports:
-        from rllm.agents.agent import Action, BaseAgent, Episode, Step, Trajectory
+        from rllm.agents.agent import BaseAgent
+        from rllm.types import Action, Episode, Step, Trajectory
 
         _exports = {
             "BaseAgent": BaseAgent,

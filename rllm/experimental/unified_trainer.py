@@ -13,7 +13,6 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from rllm.agents.agent import Episode, TrajectoryGroup
 from rllm.data import Dataset
 from rllm.experimental.buffer import TrajectoryGroupBuffer
 from rllm.experimental.common.advantage import (
@@ -42,6 +41,7 @@ from rllm.experimental.metrics import MetricsAggregator
 from rllm.experimental.protocol import BackendProtocol
 from rllm.experimental.rollout import RolloutEngine
 from rllm.experimental.sync_coordinator import SyncCoordinator, SyncCoordinatorConfig
+from rllm.types import Episode, TrajectoryGroup
 from rllm.utils import EpisodeLogger, Tracking, extract_source_metadata
 from rllm.workflows.store import Store
 from rllm.workflows.workflow import TerminationReason, Workflow
@@ -120,12 +120,13 @@ class UnifiedTrainer:
     ):
         """Initialize the UnifiedTrainer.
 
-        Provide exactly one of ``workflow_class`` or (``agent_flow`` AND ``evaluator``).
+        Provide exactly one of ``workflow_class``, ``agent_flow`` (with
+        ``evaluator`` or ``hooks``), or ``remote_runtime``.
         """
-        has_agent_flow = kwargs.get("agent_flow") is not None and kwargs.get("evaluator") is not None
+        has_agent_flow = kwargs.get("agent_flow") is not None and (kwargs.get("evaluator") is not None or kwargs.get("hooks") is not None)
         remote_runtime_enabled = config.rllm.get("remote_runtime", {}).get("enabled", False)
         if not has_agent_flow and not remote_runtime_enabled:
-            assert workflow_class is not None, "Either workflow_class, (agent_flow AND evaluator), or remote_runtime must be provided"
+            assert workflow_class is not None, "Either workflow_class, (agent_flow AND (evaluator OR hooks)), or remote_runtime must be provided"
 
         self.workflow_class = workflow_class
         self.workflow_args = workflow_args or {}
@@ -149,16 +150,7 @@ class UnifiedTrainer:
         self._validate_and_setup_configs()
         self._setup_logging()
 
-        # Async training config
-        async_cfg = self.rllm_config.get("async_training", {})
-        self.async_config = AsyncTrainingConfig(
-            enable=async_cfg.get("enable", False),
-            mini_batch_size=async_cfg.get("mini_batch_size", 1),
-            fwd_bwd_group_size=async_cfg.get("fwd_bwd_group_size", 1),
-            staleness_threshold=async_cfg.get("staleness_threshold", 0.0),
-            trigger_parameter_sync_step=async_cfg.get("trigger_parameter_sync_step", 1),
-            partial_rollout=async_cfg.get("partial_rollout", True),
-        )
+        self.async_config = AsyncTrainingConfig.from_config(self.rllm_config.get("async_training", {}))
 
         rollout_engine: RolloutEngine = self.backend.init_rollout_engine(
             cf_config=self.cf_config,
@@ -176,16 +168,26 @@ class UnifiedTrainer:
 
         agent_flow = kwargs.get("agent_flow")
         evaluator = kwargs.get("evaluator")
+        hooks = kwargs.get("hooks")
 
         remote_runtime_cfg = self.rllm_config.get("remote_runtime", {})
 
-        if agent_flow is not None and evaluator is not None:
-            from rllm.experimental.engine.agent_flow_engine import AgentFlowEngine
+        if agent_flow is not None and (evaluator is not None or hooks is not None):
+            from rllm.engine.agentflow_engine import AgentFlowEngine
             from rllm.experimental.engine.gateway_manager import GatewayManager
 
             gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
             self._gateway = GatewayManager(self.config, mode=gateway_mode)
-            self._gateway.start(rollout_engine)
+
+            # merge the data.max_response_length into the sampling_params; TODO(listar2000): refactor the data config group
+            training_sampling_params = {
+                **OmegaConf.to_container(self.rllm_config.rollout.train, resolve=True),
+                "max_tokens": self.config.data.max_response_length,
+            }
+            val_sampling_params = {
+                **OmegaConf.to_container(self.rllm_config.rollout.val, resolve=True),
+                "max_tokens": self.config.data.max_response_length,
+            }
 
             self.agent_workflow_engine = AgentFlowEngine(
                 agent_flow=agent_flow,
@@ -196,6 +198,9 @@ class UnifiedTrainer:
                 retry_limit=self.rllm_config.workflow.retry_limit,
                 raise_on_error=self.rllm_config.workflow.get("raise_on_error", True),
                 episode_logger=self.episode_logger,
+                train_sampling_params=training_sampling_params,
+                val_sampling_params=val_sampling_params,
+                hooks=hooks,
             )
         elif remote_runtime_cfg.get("enabled", False):
             from rllm.experimental.engine.gateway_manager import GatewayManager
@@ -209,12 +214,12 @@ class UnifiedTrainer:
 
             gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
             self._gateway = GatewayManager(self.config, mode=gateway_mode)
-            self._gateway.start(rollout_engine)
 
             remote_runtime_config = RemoteRuntimeConfig(
                 enabled=True,
                 backend=remote_runtime_cfg.get("backend", "agentcore"),
-                backend_config=dict(remote_runtime_cfg.get("backend_config", {})),
+                agentcore=dict(remote_runtime_cfg.get("agentcore", {})),
+                harbor=dict(remote_runtime_cfg.get("harbor", {})),
                 session_timeout=remote_runtime_cfg.get("session_timeout", 900.0),
             )
             self._remote_runtime = create_remote_runtime(
@@ -251,9 +256,6 @@ class UnifiedTrainer:
         """Validate and setup common configs."""
         # validate common, backend-agnostic configs
         assert self.rllm_config is not None, "rLLM config is not set"
-        # if the traj_group_adv_estimator_map is given, the user must turn `use_rllm` to True
-        if self.traj_group_adv_estimator_map and not self.rllm_config.algorithm.get("use_rllm", False):
-            raise ValueError("If `traj_group_adv_estimator_map` is given, the user must explicitly turn `rllm.algorithm.use_rllm` to True")
 
         if self.rllm_config.rejection_sample.multiplier != 1:
             assert self.rllm_config.rejection_sample.enable is True, "rejection sampling is disabled, but rejection_sample.multiplier is not 1"
@@ -261,33 +263,16 @@ class UnifiedTrainer:
         # validate backend-specific configs
         self.backend.validate_config()
 
-        # compact filtering config (used for filtering out episodes that are not valid)
         self.cf_config = CompactFilteringConfig.from_config(self.rllm_config.compact_filtering)
-
-        # transform config (used for transforming episodes to trajectory groups)
-        self.transform_config = TransformConfig(broadcast=self.rllm_config.stepwise_advantage.mode == "broadcast")
-
-        # rejection sampling config (used for rejection sampling)
-        rs_mode = "episode" if self.rllm_config.rejection_sample.enable else "none"
-
-        self.rs_config = RejectionSamplingConfig(
-            mode=rs_mode,
-            min_partial_solve_tasks=self.rllm_config.rejection_sample.min_partial_solve_tasks,
-            min_trajs_per_group=self.rllm_config.rejection_sample.min_trajs_per_group,
-            filter_uniform_groups=self.rllm_config.rejection_sample.get("filter_uniform_groups", False),
+        self.transform_config = TransformConfig.from_config(
+            self.rllm_config.get("transform", {}),
+            broadcast=self.rllm_config.stepwise_advantage.mode == "broadcast",
         )
-
-        # algorithm config (used for rLLM-native advantage computation)
-        self.algorithm_config = AlgorithmConfig(
-            estimator=self.rllm_config.algorithm.adv_estimator,
-            estimator_map=self.traj_group_adv_estimator_map,  # TODO(listar2000): see if we can make this configurable in config as well
+        self.rs_config = RejectionSamplingConfig.from_config(self.rllm_config.rejection_sample)
+        self.algorithm_config = AlgorithmConfig.from_config(
+            self.rllm_config.algorithm,
             stepwise_advantage_mode=self.rllm_config.stepwise_advantage.mode,
-            norm_adv_by_std_in_grpo=self.rllm_config.algorithm.get("norm_adv_by_std_in_grpo", True),
-            use_rllm=self.rllm_config.algorithm.get("use_rllm", False),
-            use_precomputed_advantage=self.rllm_config.algorithm.get("use_precomputed_advantage", False),
-            loss_fn=self.rllm_config.algorithm.get("loss_fn", None),
-            lr_schedule=self.rllm_config.algorithm.get("lr_schedule", "constant"),
-            warmup_steps_ratio=self.rllm_config.algorithm.get("warmup_steps_ratio", 0.0),
+            estimator_map=self.traj_group_adv_estimator_map,
         )
 
     def _setup_logging(self):
@@ -339,6 +324,9 @@ class UnifiedTrainer:
 
         await self.backend.on_train_start(trainer_state)
 
+        if hasattr(self, "_gateway") and self._gateway is not None:
+            self._gateway.start(self.backend.rollout_engine)
+
         if self.rllm_config.trainer.get("val_before_train", True):
             await self._validate_async(trainer_state)
             if self.rllm_config.trainer.get("val_only", False):
@@ -347,10 +335,13 @@ class UnifiedTrainer:
         # we start from step (1 + original start batch index)
         trainer_state.global_step += 1
 
-        # Run the training loop
-        await self._fit_async(trainer_state)
-
-        await self.backend.on_train_end(trainer_state)
+        try:
+            await self._fit_async(trainer_state)
+        finally:
+            try:
+                await self.backend.on_train_end(trainer_state)
+            except Exception:
+                logger.exception(f"{self.backend.__class__.__name__}.on_train_end() failed during fit_async() cleanup")
 
     async def _fit_async(self, trainer_state: TrainerState) -> None:
         """Dispatch to sync or concurrent training based on config."""
@@ -425,6 +416,12 @@ class UnifiedTrainer:
             return
 
         workflow_metrics, termination_counts = self._collect_workflow_metrics_from_episodes(trainer_state.episodes)
+        for key, value in workflow_metrics.items():
+            trainer_state.metrics[f"batch/{key}"] = np.mean(value)
+
+        total_counts = max(sum(termination_counts.values()), 1)
+        for r in TerminationReason:
+            trainer_state.metrics[f"batch/termination_reason/{r.value}"] = termination_counts[r.value] / total_counts
 
         # stage 2: transform episodes to trajectory groups (sync)
         trajectory_groups, transform_metrics = transform_episodes_to_trajectory_groups(trainer_state.episodes, self.transform_config, self.cf_config, traj_grouping_hook=self.traj_grouping_hook)
@@ -467,13 +464,6 @@ class UnifiedTrainer:
                 max_steps_to_visualize=2,
                 show_workflow_metadata=True,
             )
-
-        for key, value in workflow_metrics.items():
-            trainer_state.metrics[f"batch/{key}"] = np.mean(value)
-
-        total_counts = max(sum(termination_counts.values()), 1)
-        for r in TerminationReason:
-            trainer_state.metrics[f"batch/termination_reason/{r.value}"] = termination_counts[r.value] / total_counts
 
     # =========================================================================
     # Fully-asynchronous training pipeline
@@ -760,7 +750,11 @@ class UnifiedTrainer:
 
             for episode, data_source in zip(val_episodes, data_sources, strict=True):
                 for key, value in episode.metrics.items():
-                    workflow_metrics_by_source[data_source][key].append(float(value))
+                    # episode.metrics can contain non-numeric values -- skip in the workflow metrics.
+                    try:
+                        workflow_metrics_by_source[data_source][key].append(float(value))
+                    except (TypeError, ValueError):
+                        continue
 
             for key, value in reward_metrics.items():
                 val_metrics[f"val/{key}"].append(value)
@@ -816,14 +810,15 @@ class UnifiedTrainer:
     # =========================================================================
     # Helper functions
     # =========================================================================
-    def _collect_workflow_metrics_from_episodes(self, episodes: list[Episode]) -> tuple[dict, Counter]:
+    @staticmethod
+    def _collect_workflow_metrics_from_episodes(episodes: list[Episode]) -> tuple[dict, Counter]:
         workflow_metrics = defaultdict(list)
         termination_counts = Counter()
         for episode in episodes:
             for k, v in episode.metrics.items():
                 workflow_metrics[k].append(v)
-            if episode.termination_reason is not None:
-                termination_counts[episode.termination_reason.value] += 1
+            reason = episode.termination_reason or TerminationReason.UNKNOWN
+            termination_counts[getattr(reason, "value", reason)] += 1
         # reduce the metrics to a scalar value, with error handling
         reduced_workflow_metrics = {}
         for k, v in workflow_metrics.items():
@@ -873,7 +868,18 @@ class AgentTrainer:
 
     This trainer will simply delegate the task to the corresponding launcher class.
 
-    Provide exactly one of ``workflow_class`` or (``agent_flow`` AND ``evaluator``).
+    Provide exactly one of ``workflow_class`` or ``agent_flow``. For sandbox-style
+    flows (``SandboxedAgentFlow`` agent or tasks with ``task_path`` metadata),
+    ``hooks`` and gateway loopback are auto-wired via
+    :class:`rllm.hooks.SandboxTaskHooks`; pass ``hooks=`` or ``evaluator=``
+    explicitly to override.
+
+    Args:
+        sandbox_backend: Backend for the auto-wired sandbox hooks
+            (``"docker"`` / ``"local"`` / ``"modal"`` / …). Remote backends
+            auto-spawn a cloudflared tunnel.
+        sandbox_concurrency: Override ``max_concurrent`` on a
+            :class:`SandboxedAgentFlow` agent.
     """
 
     def __init__(
@@ -886,19 +892,50 @@ class AgentTrainer:
         backend: Literal["verl", "tinker"] = "verl",
         agent_flow: Any = None,
         evaluator: Any = None,
+        hooks: Any = None,
+        sandbox_backend: str | None = None,
+        sandbox_concurrency: int | None = None,
         store: Store | None = None,
         **kwargs,
     ):
-        has_agent_flow = agent_flow is not None and evaluator is not None
+        # Auto-wire sandbox hooks + gateway loopback unless caller set hooks/evaluator.
+        if agent_flow is not None and hooks is None and evaluator is None:
+            from rllm.hooks import (
+                SandboxTaskHooks,
+                enable_tunnel_for_remote_sandbox,
+                needs_sandbox_isolation,
+                pin_gateway_host_loopback,
+            )
+
+            if needs_sandbox_isolation(agent_flow, train_dataset, val_dataset):
+                hooks = SandboxTaskHooks(sandbox_backend=sandbox_backend)
+                config = pin_gateway_host_loopback(config)
+                config = enable_tunnel_for_remote_sandbox(config, sandbox_backend)
+
+        # Forward concurrency + backend overrides onto a SandboxedAgentFlow.
+        if agent_flow is not None and (sandbox_concurrency is not None or sandbox_backend is not None):
+            try:
+                from rllm.sandbox.sandboxed_flow import SandboxedAgentFlow
+
+                if isinstance(agent_flow, SandboxedAgentFlow):
+                    if sandbox_concurrency is not None:
+                        agent_flow.max_concurrent = sandbox_concurrency
+                    if sandbox_backend is not None:
+                        agent_flow.sandbox_backend = sandbox_backend
+            except ImportError:
+                pass
+
+        has_agent_flow = agent_flow is not None and (evaluator is not None or hooks is not None)
         remote_runtime_enabled = config.rllm.get("remote_runtime", {}).get("enabled", False)
         if not has_agent_flow and not remote_runtime_enabled:
-            assert workflow_class is not None, "Either workflow_class, (agent_flow AND evaluator), or remote_runtime must be provided"
+            assert workflow_class is not None, "Either workflow_class, (agent_flow AND (evaluator OR hooks)), or remote_runtime must be provided"
 
-        # Pass agent_flow and evaluator through kwargs for UnifiedTrainer
         if agent_flow is not None:
             kwargs["agent_flow"] = agent_flow
         if evaluator is not None:
             kwargs["evaluator"] = evaluator
+        if hooks is not None:
+            kwargs["hooks"] = hooks
         kwargs["backend_name"] = backend
 
         if backend == "verl":

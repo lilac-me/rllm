@@ -16,10 +16,6 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 
-from rllm.trainer.env_agent_mappings import AGENT_CLASS_MAPPING, ENV_CLASS_MAPPING
-from rllm.trainer.verl.agent_ppo_trainer import AgentPPOTrainer
-
-# Local application imports
 from rllm.trainer.verl.agent_workflow_trainer import AgentWorkflowPPOTrainer
 from rllm.trainer.verl.ray_runtime_env import get_ppo_ray_runtime_env
 
@@ -187,11 +183,6 @@ class TaskRunner:
         config,
         workflow_class=None,
         workflow_args=None,
-        agent_class=None,
-        env_class=None,
-        agent_args=None,
-        env_args=None,
-        agent_run_func=None,
     ):
         """Execute the main PPO training workflow.
 
@@ -254,20 +245,7 @@ class TaskRunner:
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        # if config.rllm.workflow.use_workflow:
-        if agent_run_func is not None:
-            print("IMPORTANT: Using AgentSdkTrainer")
-            from rllm.trainer.verl.agent_sdk_trainer import AgentSdkTrainer
-
-            trainer = AgentSdkTrainer(
-                config=config,
-                tokenizer=tokenizer,
-                role_worker_mapping=self.role_worker_mapping,
-                resource_pool_manager=resource_pool_manager,
-                ray_worker_group_cls=ray_worker_group_cls,
-                agent_run_func=agent_run_func,
-            )
-        elif workflow_class is not None:
+        if workflow_class is not None:
             workflow_args = workflow_args or {}
             if config.rllm.workflow.get("workflow_args") is not None:
                 for key, value in config.rllm.workflow.get("workflow_args").items():
@@ -291,31 +269,7 @@ class TaskRunner:
             )
 
         else:
-            if env_class is None:
-                env_class = ENV_CLASS_MAPPING[config.rllm.env.name]
-            if agent_class is None:
-                agent_class = AGENT_CLASS_MAPPING[config.rllm.agent.name]
-
-            env_args = env_args or {}
-            agent_args = agent_args or {}
-            if config.rllm.env.get("env_args") is not None:
-                env_args.update(config.rllm.env.get("env_args"))
-            if config.rllm.agent.get("agent_args") is not None:
-                agent_args.update(config.rllm.agent.get("agent_args"))
-
-            trainer = AgentPPOTrainer(
-                config=config,
-                tokenizer=tokenizer,
-                role_worker_mapping=self.role_worker_mapping,
-                resource_pool_manager=resource_pool_manager,
-                ray_worker_group_cls=ray_worker_group_cls,
-                reward_fn=reward_fn,
-                val_reward_fn=val_reward_fn,
-                env_class=env_class,
-                agent_class=agent_class,
-                env_args=env_args,
-                agent_args=agent_args,
-            )
+            raise ValueError("TaskRunner.run requires workflow_class. The legacy agent_class + env_class and agent_run_func paths have been removed; port your agent to a Workflow or AgentFlow.")
 
         # Apply NCCL dynamic batch sync patch (fixes verl#5750)
         from rllm.experimental.verl.patch import patch_verl_dynamic_batch_sync

@@ -69,15 +69,14 @@ Define a rollout (your agent) and an evaluator (your reward function), then hand
 # my_flow.py
 from openai import OpenAI
 import rllm
-from rllm.experimental.eval.types import AgentConfig, Task
-from rllm.types import Episode, Trajectory
+from rllm.types import AgentConfig, Episode, Task, Trajectory
 
 @rllm.rollout
 def solve(task: Task, config: AgentConfig) -> Episode:
     client = OpenAI(base_url=config.base_url, api_key="EMPTY")
     response = client.chat.completions.create(
         model=config.model,
-        messages=[{"role": "user", "content": task.data["question"]}],
+        messages=[{"role": "user", "content": task.instruction}],
     )
     answer = response.choices[0].message.content or ""
     return Episode(
@@ -89,12 +88,12 @@ def solve(task: Task, config: AgentConfig) -> Episode:
 ```python
 # my_evaluator.py
 import rllm
-from rllm.experimental.eval.types import EvalOutput, Signal, _extract_agent_answer
+from rllm.eval.types import EvalOutput, Signal
 from rllm.types import Episode
 
 @rllm.evaluator
 def score(task: dict, episode: Episode) -> EvalOutput:
-    answer = _extract_agent_answer(episode)
+    answer = str(episode.artifacts.get("answer", ""))
     is_correct = answer.strip() == task["ground_truth"].strip()
     reward = 1.0 if is_correct else 0.0
     return EvalOutput(reward=reward, is_correct=is_correct,
@@ -130,11 +129,11 @@ rLLM follows a simple pipeline: **run your agent → collect traces → compute 
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-Your agent runs as-is — rLLM's SDK intercepts LLM calls and structures them into **Episodes** (one task) containing **Trajectories** (one agent run) made of **Steps** (one LLM call). A reward function scores the result, and the RL algorithm updates the model weights. The same agent code works for both eval and training.
+Your agent runs as-is — rLLM's model gateway captures LLM calls (token IDs + logprobs) by URL-routed sessions and structures them into **Episodes** (one task) containing **Trajectories** (one agent run) made of **Steps** (one LLM call). A reward function scores the result, and the RL algorithm updates the model weights. The same agent code works for both eval and training.
 
 Under the hood:
 - **Workflow Engine** runs N parallel agent instances to collect rollouts
-- **LiteLLM Proxy** routes requests and captures token IDs + logprobs
+- **Model Gateway** routes requests and captures token IDs + logprobs
 - **Transform Pipeline** groups trajectories for advantage computation
 - **Training Backend** (verl or tinker) handles the policy update
 
@@ -146,6 +145,7 @@ Under the hood:
 - [SETA](https://github.com/camel-ai/seta) — Scaling environments for terminal agents [![Stars](https://img.shields.io/github/stars/camel-ai/seta)](https://github.com/camel-ai/seta)
 - [LLM-in-Sandbox](https://github.com/llm-in-sandbox/llm-in-sandbox) — Building general agents by running LLMs in a sandbox [![Stars](https://img.shields.io/github/stars/llm-in-sandbox/llm-in-sandbox)](https://github.com/llm-in-sandbox/llm-in-sandbox)
 - [Vision-DeepResearch](https://github.com/Osilly/Vision-DeepResearch) — The first long-horizon multimodal deep-research MLLM [![Stars](https://img.shields.io/github/stars/Osilly/Vision-DeepResearch)](https://github.com/Osilly/Vision-DeepResearch)
+- [OpenSearch-VL](https://github.com/shawn0728/OpenSearch-VL) - An Open Recipe for Frontier Multimodal Search Agents [![Stars](https://img.shields.io/github/stars/shawn0728/OpenSearch-VL)](https://github.com/shawn0728/OpenSearch-VL)
 - [Cogito, Ergo Ludo](https://www.arxiv.org/abs/2509.25052) — An agent that learns to play by reasoning and planning
 - [Cut the Bill, Keep the Turns](https://agate-slipper-ef0.notion.site/Cut-the-Bill-Keep-the-Turns-Affordable-Multi-Turn-Search-RL-003f78214a4d451fb06f453d084e666c) — Affordable multi-turn search RL
 - [Experiential Reinforcement Learning](https://arxiv.org/abs/2602.13949) — Experience-reflection-consolidation loop for RL with sparse rewards

@@ -7,31 +7,29 @@ for eval and training (the gateway handles trace capture).
 
 from __future__ import annotations
 
+import asyncio
 import re
-from concurrent.futures import ThreadPoolExecutor
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 import rllm
-from rllm.experimental.eval.types import AgentConfig, Task
-from rllm.types import Episode, Step, Trajectory
+from rllm.types import AgentConfig, Episode, Step, Task, Trajectory
 
 N_SOLUTIONS = 2
 
 
 @rllm.rollout(name="solver-judge")
-def solver_judge_flow(task: Task, config: AgentConfig) -> Episode:
+async def solver_judge_flow(task: Task, config: AgentConfig) -> Episode:
     """AgentFlow: solver generates N solutions, judge picks the best."""
-    data = task.data
-    client = OpenAI(base_url=config.base_url, api_key="EMPTY")
-    problem = data.get("question", "")
+    client = AsyncOpenAI(base_url=config.base_url, api_key="EMPTY")
+    problem = _format_countdown_problem(task)
 
     # Step 1: Solver generates N solutions in parallel
-    solver_trajectories = _generate_solutions(client, config.model, problem)
+    solver_trajectories = await _generate_solutions(client, config, problem)
 
     # Step 2: Judge selects the best solution
     solutions = [t.steps[0].action for t in solver_trajectories]
-    judge_trajectory = _judge_solutions(client, config.model, problem, solutions)
+    judge_trajectory = await _judge_solutions(client, config, problem, solutions)
 
     selected = judge_trajectory.steps[0].action
     return Episode(
@@ -40,16 +38,16 @@ def solver_judge_flow(task: Task, config: AgentConfig) -> Episode:
     )
 
 
-def _generate_solutions(client: OpenAI, model: str, problem: str) -> list[Trajectory]:
-    """Generate N solutions in parallel using threads."""
+async def _generate_solutions(client: AsyncOpenAI, config: AgentConfig, problem: str) -> list[Trajectory]:
+    # top_k is not a chat.completions parameter; drop it from the rollout sampling params.
+    sampling = {k: v for k, v in config.sampling_params.items() if k != "top_k"}
 
-    def _solve() -> Trajectory:
+    async def _solve() -> Trajectory:
         messages = [{"role": "user", "content": f"{problem}. Output the final answer within <answer>...</answer>"}]
-        response = client.chat.completions.create(
-            model=model,
+        response = await client.chat.completions.create(
+            model=config.model,
             messages=messages,
-            temperature=1,
-            max_tokens=1000,
+            **sampling,
         )
         content = response.choices[0].message.content or ""
         parsed = _parse_answer(content)
@@ -64,19 +62,18 @@ def _generate_solutions(client: OpenAI, model: str, problem: str) -> list[Trajec
             ],
         )
 
-    with ThreadPoolExecutor(max_workers=N_SOLUTIONS) as pool:
-        futures = [pool.submit(_solve) for _ in range(N_SOLUTIONS)]
-        return [f.result() for f in futures]
+    return await asyncio.gather(*(_solve() for _ in range(N_SOLUTIONS)))
 
 
-def _judge_solutions(client: OpenAI, model: str, problem: str, solutions: list[str]) -> Trajectory:
+async def _judge_solutions(client: AsyncOpenAI, config: AgentConfig, problem: str, solutions: list[str]) -> Trajectory:
     prompt = _create_judge_prompt(problem, solutions)
     messages = [{"role": "user", "content": prompt}]
-    response = client.chat.completions.create(
-        model=model,
+    # top_k is not a chat.completions parameter; drop it from the rollout sampling params.
+    sampling = {k: v for k, v in config.sampling_params.items() if k != "top_k"}
+    response = await client.chat.completions.create(
+        model=config.model,
         messages=messages,
-        temperature=1,
-        max_tokens=1000,
+        **sampling,
     )
     content = response.choices[0].message.content or ""
     selected = _parse_judge_response(content, solutions)
@@ -93,6 +90,21 @@ def _judge_solutions(client: OpenAI, model: str, problem: str, solutions: list[s
 
 
 # -- Parsing helpers --------------------------------------------------------
+
+
+def _format_countdown_problem(task: Task) -> str:
+    """Render the countdown task into a natural-language problem statement.
+
+    The countdown DatasetRegistry transform returns only ``{target, nums,
+    data_source}`` (no ``question`` field), so ``task.instruction`` is empty
+    and the flow has to format the prompt itself from metadata.
+    """
+    md = task.metadata or {}
+    target = md.get("target")
+    nums = md.get("nums")
+    if target is None or nums is None:
+        return str(task.instruction or "")
+    return f"Using the numbers {list(nums)}, write an arithmetic expression that evaluates to {target}. Each number must be used exactly once and only +, -, *, / are allowed."
 
 
 def _parse_answer(response: str) -> str:

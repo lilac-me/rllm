@@ -18,7 +18,6 @@ from tinker.types import AdamParams
 from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
-from rllm.agents.agent import TrajectoryGroup
 from rllm.experimental.common import (
     AlgorithmConfig,
     CompactFilteringConfig,
@@ -26,6 +25,7 @@ from rllm.experimental.common import (
     rLLMAdvantageEstimator,
 )
 from rllm.trainer.tinker.transform import transform_trajectory_groups_to_datums
+from rllm.types import TrajectoryGroup
 
 if TYPE_CHECKING:
     import torch
@@ -107,8 +107,14 @@ class TinkerPolicyTrainer:
         self.training_client = None
         # fill in the default versions of the configs if not provided
         self.cf_config = cf_config or CompactFilteringConfig.from_config(self.config.rllm.compact_filtering)
-        self.transform_config = transform_config or TransformConfig()
-        self.algorithm_config = algorithm_config or AlgorithmConfig.from_config(self.config)
+        self.transform_config = transform_config or TransformConfig.from_config(
+            self.config.rllm.get("transform", {}),
+            broadcast=self.config.rllm.stepwise_advantage.mode == "broadcast",
+        )
+        self.algorithm_config = algorithm_config or AlgorithmConfig.from_config(
+            self.config.rllm.algorithm,
+            stepwise_advantage_mode=self.config.rllm.stepwise_advantage.mode,
+        )
 
     async def initialize_async(self, resume_from_checkpoint: bool = True):
         """
@@ -282,6 +288,7 @@ class TinkerPolicyTrainer:
     ) -> tuple[tinker.APIFuture[tinker.types.OptimStepResponse], float]:
         scheduled_learning_rate = learning_rate * compute_schedule_lr_multiplier(
             lr_schedule=self.algorithm_config.lr_schedule,
+            warmup_steps=self.algorithm_config.warmup_steps,
             warmup_steps_ratio=self.algorithm_config.warmup_steps_ratio,
             step=step,
             total_steps=total_steps,
@@ -418,7 +425,13 @@ Adapted from https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/
 LRSchedule = Literal["linear", "cosine", "constant"]
 
 
-def compute_schedule_lr_multiplier(lr_schedule: LRSchedule, warmup_steps_ratio: float, step: int, total_steps: int) -> float:
+def compute_schedule_lr_multiplier(
+    lr_schedule: LRSchedule,
+    warmup_steps_ratio: float,
+    step: int,
+    total_steps: int,
+    warmup_steps: int | None = -1,
+) -> float:
     """
     What factor to multiply the base LR by due to the LR schedule
 
@@ -427,17 +440,20 @@ def compute_schedule_lr_multiplier(lr_schedule: LRSchedule, warmup_steps_ratio: 
         warmup_steps_ratio: Ratio of warmup steps to total steps
         step: Current step
         total_steps: Total steps
+        warmup_steps: Absolute warmup steps. Values <= 0 use warmup_steps_ratio.
 
     Returns:
         Learning rate multiplier
     """
     import math
 
-    warmup_steps = int(total_steps * warmup_steps_ratio)
-    if step < warmup_steps:
+    warmup_steps = -1 if warmup_steps is None else int(warmup_steps)
+    if warmup_steps <= 0:
+        warmup_steps = int(total_steps * warmup_steps_ratio)
+    if warmup_steps > 0 and step < warmup_steps:
         return step / warmup_steps
     # Adjust step and total_steps for warmup steps
-    step, total_steps = step - warmup_steps, total_steps - warmup_steps
+    step, total_steps = step - warmup_steps, max(total_steps - warmup_steps, 1)
     if lr_schedule == "linear":
         return 1 - step / total_steps
     elif lr_schedule == "cosine":

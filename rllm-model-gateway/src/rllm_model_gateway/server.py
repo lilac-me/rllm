@@ -1,6 +1,7 @@
 """FastAPI application factory and CLI entrypoint for rllm-model-gateway."""
 
 import argparse
+import asyncio
 import logging
 import os
 import uuid
@@ -23,6 +24,52 @@ from rllm_model_gateway.session_router import SessionRouter
 from rllm_model_gateway.store.base import TraceStore
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# Access-log noise filter
+# ------------------------------------------------------------------
+
+# Paths whose access lines are filtered from uvicorn.access. These fire on
+# every rollout (often dozens of times per task) and crowd out the lines
+# that actually help — chat completions, session create/delete, trace reads.
+_NOISY_ACCESS_PATHS: tuple[str, ...] = (
+    "/admin/flush",
+    "/admin/workers",
+    "/health",
+    "/health/workers",
+)
+
+
+class _AccessLogPathFilter(logging.Filter):
+    """Drop uvicorn.access records whose request path is in _NOISY_ACCESS_PATHS.
+
+    uvicorn.access formats records with positional args:
+        (client_addr, method, full_path, http_version, status_code)
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not args or len(args) < 3:
+            return True
+        path = args[2]
+        if not isinstance(path, str):
+            return True
+        # Strip query string before matching.
+        bare = path.split("?", 1)[0]
+        return bare not in _NOISY_ACCESS_PATHS
+
+
+_access_filter_installed = False
+
+
+def _install_access_log_filter() -> None:
+    """Idempotently attach the path filter to the uvicorn.access logger."""
+    global _access_filter_installed
+    if _access_filter_installed:
+        return
+    logging.getLogger("uvicorn.access").addFilter(_AccessLogPathFilter())
+    _access_filter_installed = True
 
 
 # ------------------------------------------------------------------
@@ -74,6 +121,8 @@ def create_app(
     if config is None:
         config = GatewayConfig()
 
+    _install_access_log_filter()
+
     if store is None:
         store = create_store(config)
 
@@ -99,12 +148,60 @@ def create_app(
             )
         )
 
+    # Build the renderer for cumulative token mode. The renderer owns
+    # message↔token conversion and the cross-turn bridge (see
+    # token_accumulator.TokenAccumulator). The tokenizer is loaded from the
+    # served model path (``config.model``), which we assume is a complete,
+    # unmodified HuggingFace checkpoint.
+    renderer = None
+    if config.cumulative_token_mode:
+        if not config.model:
+            raise ValueError("cumulative_token_mode=True requires 'model' to be set in GatewayConfig (path to the served HuggingFace checkpoint).")
+        try:
+            from renderers import create_renderer
+            from transformers import AutoTokenizer
+        except ImportError as err:
+            raise ImportError("cumulative_token_mode requires the 'renderers' and 'transformers' packages. Install them with: pip install renderers transformers") from err
+
+        tokenizer = AutoTokenizer.from_pretrained(config.model)
+
+        # renderer_family="auto" lets renderers resolve the family by matching the
+        # tokenizer's name_or_path against its MODEL_RENDERER_MAP. This succeeds
+        # when ``model`` is a canonical HF id (e.g. "Qwen/Qwen3-8B") but misses for
+        # a local/custom checkpoint path, which falls back to DefaultRenderer (whose
+        # bridge_to_next_turn always returns None, disabling drift protection). When
+        # serving from a path, set renderer_family explicitly. Supported families /
+        # MODEL_RENDERER_MAP:
+        #   https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py
+        renderer = create_renderer(tokenizer, renderer=config.renderer_family)
+        logger.info(
+            "Built %s (family=%r) from %s for cumulative token mode",
+            type(renderer).__name__,
+            config.renderer_family,
+            config.model,
+        )
+        if type(renderer).__name__ == "DefaultRenderer":
+            raise ValueError(
+                f"Cumulative token mode resolved to DefaultRenderer for renderer_family="
+                f"{config.renderer_family!r} (model={config.model!r}). DefaultRenderer "
+                "provides no cross-turn bridge, so drift-free token forwarding is disabled. "
+                "renderer_family='auto' only resolves when 'model' is a canonical HuggingFace "
+                "id present in renderers' MODEL_RENDERER_MAP; a local/custom checkpoint path "
+                "will not match. Either pass a recognized HF id as 'model', or set "
+                "renderer_family explicitly to match your model (e.g. 'qwen3', 'qwen3.5', "
+                "'qwen3.6', 'glm-5', 'deepseek-v3', 'gpt-oss'). Check supported families in "
+                "MODEL_RENDERER_MAP of: https://github.com/PrimeIntellect-ai/renderers/blob/"
+                "main/renderers/base.py"
+            )
+
     proxy = ReverseProxy(
         router=router,
         store=store,
         strip_vllm=config.strip_vllm_fields,
         sync_traces=config.sync_traces,
         local_handler=local_handler,
+        cumulative_token_mode=config.cumulative_token_mode,
+        renderer=renderer,
     )
     sessions = SessionManager(store)
 
@@ -132,6 +229,8 @@ def create_app(
         add_logprobs=config.add_logprobs,
         add_return_token_ids=config.add_return_token_ids,
         sessions=sessions,
+        sampling_params_priority=config.sampling_params_priority,
+        model=config.model,
     )
 
     # -- Health endpoints --------------------------------------------------
@@ -190,8 +289,19 @@ def create_app(
 
     @app.delete("/sessions/{session_id}")
     async def delete_session(session_id: str):
+        proxy._accumulators.pop(session_id, None)
         count = await sessions.delete_session(session_id)
         return {"deleted": count}
+
+    @app.post("/sessions/batch_delete")
+    async def batch_delete_sessions(request: Request):
+        body = await _safe_json(request)
+        session_ids = body.get("session_ids", [])
+        total = 0
+        for sid in session_ids:
+            proxy._accumulators.pop(sid, None)
+            total += await sessions.delete_session(sid)
+        return {"deleted": total}
 
     # -- Trace endpoints ---------------------------------------------------
 
@@ -262,6 +372,15 @@ def create_app(
 
     @app.post("/admin/flush")
     async def flush():
+        # Drain in-flight fire-and-forget _safe_store tasks queued by the
+        # non-streaming and streaming paths in Proxy._persist. Without this,
+        # /admin/flush only flushes the store's own buffers and a trace
+        # captured milliseconds before this call may not yet be persisted —
+        # the trainer's aget_traces would then return N-1 traces for an
+        # agent that made N calls, causing positional mismatch downstream.
+        pending = list(proxy._pending_traces)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await store.flush()
         return {"status": "flushed"}
 
@@ -355,6 +474,14 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["log_level"] = args.log_level
     if getattr(args, "store", None) is not None:
         data["store_worker"] = args.store
+    if getattr(args, "sampling_params_priority", None) is not None:
+        data["sampling_params_priority"] = args.sampling_params_priority
+    if getattr(args, "model", None) is not None:
+        data["model"] = args.model
+    if getattr(args, "cumulative_token_mode", False):
+        data["cumulative_token_mode"] = True
+    if getattr(args, "renderer_family", None) is not None:
+        data["renderer_family"] = args.renderer_family
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
@@ -383,6 +510,35 @@ def main() -> None:
     parser.add_argument("--db-path", type=str, default=None)
     parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory"])
     parser.add_argument("--log-level", type=str, default=None)
+    parser.add_argument(
+        "--sampling-params-priority",
+        type=str,
+        default=None,
+        choices=["client", "session"],
+        help="Conflict resolution for sampling params: 'client' (default) or 'session'.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="If set, the gateway rewrites every request body's 'model' field to this value before forwarding.",
+    )
+    parser.add_argument(
+        "--cumulative-token-mode",
+        action="store_true",
+        default=False,
+        help="Enable cumulative token mode for drift-free multi-turn RL training. Loads the tokenizer from --model (the served HuggingFace checkpoint).",
+    )
+    parser.add_argument(
+        "--renderer-family",
+        type=str,
+        default=None,
+        help="renderers family for the cumulative-mode bridge (e.g. 'qwen3', 'qwen3.5', "
+        "'qwen3.6', 'glm-5', 'deepseek-v3', 'gpt-oss'). Renderers can auto infer it if --model "
+        "is a huggingface model id, but if --model is a local path, you must explicitly set it. "
+        "Check the supported model families in MODEL_RENDERER_MAP of "
+        "https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py",
+    )
 
     args = parser.parse_args()
     config = _load_config(args)

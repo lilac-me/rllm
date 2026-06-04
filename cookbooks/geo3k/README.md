@@ -38,6 +38,16 @@ After installation, the agent and evaluator are discoverable by the CLI:
 rllm agent list    # should show "geo3k" as a plugin
 ```
 
+## VLM dependency note
+
+`Qwen/Qwen3-VL-30B-A3B-Instruct` (and the wider Qwen3-VL family) ships a `Qwen3VLVideoProcessor` that imports torchvision at load time. Even though the tinker rollout only uses the image side, `AutoProcessor.from_pretrained` will fail without it:
+
+```bash
+uv pip install torchvision
+```
+
+The tinker backend tries to load the processor lazily and fails fast with an actionable message if torchvision is missing — install it once before kicking off training.
+
 ## Dataset
 
 Pull the Geometry3K dataset (one-time):
@@ -48,19 +58,13 @@ rllm dataset pull geo3k
 
 ## Training
 
-### Option 1: rllm CLI
+### Tinker (single-machine)
 
 ```bash
-rllm train geo3k \
-    --agent geo3k \
-    --evaluator geo3k_math \
-    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
-    --lora-rank 32 \
-    --group-size 8 \
-    --epochs 3
+bash cookbooks/geo3k/train_tinker.sh
 ```
 
-### Option 2: Python API
+Or directly via the Python API:
 
 ```bash
 python cookbooks/geo3k/train.py \
@@ -70,10 +74,19 @@ python cookbooks/geo3k/train.py \
     training.group_size=8
 ```
 
-Or use the provided script (wraps train.py with defaults):
+### Verl (distributed GPU)
+
+Requires verl extras and megatron:
 
 ```bash
-bash cookbooks/geo3k/train.sh
+uv pip install -e ".[verl]"
+bash scripts/install_megatron.sh <cu128|cu129|...>
+```
+
+Then:
+
+```bash
+bash cookbooks/geo3k/train_verl.sh
 ```
 
 ## Eval
@@ -90,8 +103,9 @@ rllm eval geo3k \
 | File | Description |
 |------|-------------|
 | `geo3k_flow.py` | `Geo3KFlow` — AgentFlow implementation (VLM single-turn solver) |
-| `evaluator.py` | `Geo3KEvaluator` — math answer grading with `\boxed{}` extraction |
+| `geo3k_eval.py` | `geo3k_evaluator` — math answer grading with `\boxed{}` extraction |
 | `train.py` | Python API training script (Hydra config) |
-| `train.sh` | Shell wrapper — calls `train.py` with default overrides |
+| `train_tinker.sh` | Tinker backend — single-machine training |
+| `train_verl.sh` | Verl backend — distributed multi-GPU training |
 | `pyproject.toml` | Plugin metadata and entry points |
 | `test.py` | Unit tests for image handling and evaluation |

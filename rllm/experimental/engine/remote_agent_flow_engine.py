@@ -10,7 +10,6 @@ import logging
 import uuid
 from collections import defaultdict
 
-from rllm.agents.agent import Episode, Step, Trajectory
 from rllm.experimental.engine.gateway_manager import GatewayManager
 from rllm.experimental.engine.remote_runtime.protocol import (
     RemoteAgentRuntime,
@@ -18,6 +17,7 @@ from rllm.experimental.engine.remote_runtime.protocol import (
     TaskSubmission,
 )
 from rllm.experimental.engine.trace_converter import compute_step_metrics, trace_record_to_step
+from rllm.types import Episode, Step, Trajectory
 from rllm.utils.episode_logger import EpisodeLogger
 from rllm.workflows.workflow import TerminationReason
 
@@ -60,6 +60,8 @@ class RemoteAgentFlowEngine:
         **kwargs,
     ) -> list[Episode]:
         """Submit tasks to remote runtime, gather results, build Episodes from gateway traces."""
+        from tqdm.asyncio import tqdm
+
         if task_ids is None:
             task_ids = [str(uuid.uuid4()) for _ in tasks]
 
@@ -72,7 +74,7 @@ class RemoteAgentFlowEngine:
             task_id_counter[task_id] += 1
             futures.append(self.process_task_with_retry(task, task_id, rollout_idx, idx, is_validation=is_validation))
 
-        for future in asyncio.as_completed(futures):
+        for future in tqdm(asyncio.as_completed(futures), total=len(futures), desc="rollouts"):
             task_id, rollout_idx, idx, episode = await future
             results[idx] = episode
 
@@ -119,13 +121,29 @@ class RemoteAgentFlowEngine:
             result = results[0]
 
             if not result.finished:
-                logger.warning("[%s] Remote task failed (assigning reward=0): %s", uid, result.error)
+                logger.warning("Remote task failed (session=%s, assigning reward=0): %s", result.session_id, result.error)
                 result.reward = 0.0
 
             traces = await self.gateway.aget_traces(session_id)
             episode = _build_episode(traces, result, uid, task)
+            if result.metadata:
+                episode.metadata.update(result.metadata)
             if not result.finished:
-                episode.metadata["error"] = {"message": result.error or "Unknown error"}
+                error_info: dict = {
+                    "error_message": result.error or "Unknown error",
+                    "elapsed": result.elapsed,
+                }
+                if result.raw_result:
+                    for k in ("stop_reason", "traceback", "status_code"):
+                        if k in result.raw_result:
+                            error_info[k] = result.raw_result[k]
+                episode.metadata["error"] = error_info
+
+            # Delete traces from gateway DB to prevent unbounded growth
+            try:
+                await self.gateway.adelete_session(session_id)
+            except Exception as e:
+                logger.warning("[%s] Failed to delete session (non-fatal): %s", uid, e)
 
             return task_id, rollout_idx, result_idx, episode
 
@@ -177,13 +195,14 @@ def _build_episode(
     metrics["empty"] = int(len(traces) == 0)
     metrics["steps_collected"] = len(traces)
 
-    is_correct = bool(result.reward and result.reward > 0)
+    is_correct = bool(result.reward and result.reward >= 1.0)
 
     return Episode(
         id=uid,
         task=task,
         is_correct=is_correct,
+        session_id=result.session_id,
         trajectories=trajectories,
         metrics=metrics,
-        termination_reason=TerminationReason.ENV_DONE if training_steps else TerminationReason.ERROR,
+        termination_reason=result.termination_reason or TerminationReason.UNKNOWN,
     )

@@ -11,8 +11,11 @@ from unittest.mock import MagicMock
 import torch
 
 from rllm.agents.agent import Episode, Step, Trajectory
+from rllm.experimental.common.config import CompactFilteringConfig, TransformConfig
+from rllm.experimental.common.transform import transform_episodes_to_trajectory_groups
 from rllm.experimental.rollout import ModelOutput
 from rllm.experimental.verl.transform import transform_episodes_to_dataproto
+from rllm.workflows.workflow import TerminationReason
 
 
 def _make_mock_rollout_engine(pad_token_id: int = 0):
@@ -44,6 +47,24 @@ def _make_episode(
     )
     trajectory = Trajectory(steps=[step], reward=reward)
     return Episode(id=episode_id, trajectories=[trajectory], is_correct=reward > 0)
+
+
+def test_transform_metrics_handle_all_filtered_groups():
+    episodes = [Episode(id=f"task:{i}", trajectories=[], termination_reason=TerminationReason.TIMEOUT) for i in range(2)]
+    cf_config = CompactFilteringConfig(enable=True, mask_timeout=True)
+
+    groups, metrics = transform_episodes_to_trajectory_groups(
+        episodes,
+        TransformConfig(),
+        cf_config,
+    )
+
+    assert groups == []
+    assert metrics["groups/num_groups"] == 0
+    assert metrics["groups/num_trajs_after_filter"] == 0
+    assert metrics["groups/avg_group_size"] == 0.0
+    assert metrics["groups/max_group_size"] == 0
+    assert metrics["groups/min_group_size"] == 0
 
 
 class TestRolloutLogProbsPropagation:
@@ -139,7 +160,13 @@ class TestRolloutLogProbsPropagation:
         assert "rollout_log_probs" not in batch.batch
 
     def test_multi_step_trajectory_logprobs(self):
-        """Multi-step trajectories should have logprobs for each step row."""
+        """Cumulative-prefix multi-step trajectories merge into a single row.
+
+        Step 2's prompt [1,2,3,4,5] prefix-extends step 1's full sequence
+        [1,2,3,4], so they merge. The resulting row's response is
+        [3, 4, 5, 6, 7, 8] (action₀, delta_obs, action₁) with mask
+        [1, 1, 0, 1, 1, 1] and logprobs [-0.1, -0.2, 0, -0.3, -0.4, -0.5].
+        """
         model_output_1 = ModelOutput(prompt_ids=[1, 2], completion_ids=[3, 4], logprobs=[-0.1, -0.2])
         model_output_2 = ModelOutput(prompt_ids=[1, 2, 3, 4, 5], completion_ids=[6, 7, 8], logprobs=[-0.3, -0.4, -0.5])
         step1 = Step(prompt_ids=[1, 2], response_ids=[3, 4], model_output=model_output_1, reward=0.0)
@@ -152,17 +179,18 @@ class TestRolloutLogProbsPropagation:
 
         assert "rollout_log_probs" in batch.batch
         rollout_lp = batch.batch["rollout_log_probs"]
-        # 2 steps = 2 rows in the batch
-        assert rollout_lp.shape[0] == 2
+        # Cumulative-prefix merge → 1 row
+        assert rollout_lp.shape[0] == 1
 
-        # Step 1: logprobs [-0.1, -0.2], right-padded
-        assert torch.isclose(rollout_lp[0, 0], torch.tensor(-0.1))
-        assert torch.isclose(rollout_lp[0, 1], torch.tensor(-0.2))
+        # Merged logprobs: action₀ (real), observation delta (0.0 placeholder),
+        # action₁ (real), then right-padded.
+        expected_prefix = [-0.1, -0.2, 0.0, -0.3, -0.4, -0.5]
+        for i, exp in enumerate(expected_prefix):
+            assert torch.isclose(rollout_lp[0, i], torch.tensor(exp)), (i, rollout_lp[0, i].item())
 
-        # Step 2: logprobs [-0.3, -0.4, -0.5], right-padded
-        assert torch.isclose(rollout_lp[1, 0], torch.tensor(-0.3))
-        assert torch.isclose(rollout_lp[1, 1], torch.tensor(-0.4))
-        assert torch.isclose(rollout_lp[1, 2], torch.tensor(-0.5))
+        # Mask follows the same shape: [1, 1, 0, 1, 1, 1]
+        response_mask = batch.batch["response_mask"][0]
+        assert response_mask[:6].tolist() == [1, 1, 0, 1, 1, 1]
 
     def test_other_batch_fields_unchanged(self):
         """Adding logprobs should not affect existing batch fields."""

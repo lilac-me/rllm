@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from rllm.experimental.eval.rollout_decorator import (
+from rllm.eval.rollout_decorator import (
     AgentFlowFn,
     EvaluatorFn,
     _coerce_to_episode,
@@ -15,8 +16,8 @@ from rllm.experimental.eval.rollout_decorator import (
     evaluator,
     rollout,
 )
-from rllm.experimental.eval.types import AgentConfig, AgentFlow, EvalOutput, Evaluator, Task, run_agent_flow
-from rllm.types import Episode, Trajectory
+from rllm.eval.types import EvalOutput
+from rllm.types import AgentConfig, AgentFlow, Episode, Evaluator, Task, Trajectory, run_agent_flow
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -25,7 +26,7 @@ from rllm.types import Episode, Trajectory
 
 @pytest.fixture()
 def task():
-    return Task(data={"question": "What is 2+2?", "ground_truth": "4"})
+    return Task(id="t", instruction="", metadata={"question": "What is 2+2?", "ground_truth": "4"}, dataset_dir=Path("."))
 
 
 @pytest.fixture()
@@ -42,14 +43,14 @@ class TestRolloutBareDecorator:
     def test_creates_agent_flow_fn(self):
         @rollout
         def my_agent(task, config):
-            return "hello"
+            return None
 
         assert isinstance(my_agent, AgentFlowFn)
 
     def test_has_run_method(self):
         @rollout
         def my_agent(task, config):
-            return "hello"
+            return None
 
         assert hasattr(my_agent, "run")
         assert callable(my_agent.run)
@@ -57,31 +58,31 @@ class TestRolloutBareDecorator:
     def test_has_arun_method(self):
         @rollout
         def my_agent(task, config):
-            return "hello"
+            return None
 
         assert hasattr(my_agent, "arun")
 
     def test_satisfies_agent_flow_protocol(self):
         @rollout
         def my_agent(task, config):
-            return "hello"
+            return None
 
         assert isinstance(my_agent, AgentFlow)
 
     def test_run_returns_episode(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "the answer is 4"
+            return Trajectory(name="solver", output="the answer is 4")
 
         episode = my_agent.run(task, config)
         assert isinstance(episode, Episode)
-        assert episode.artifacts["answer"] == "the answer is 4"
-        assert episode.task == task.data
+        assert episode.task == task.metadata
+        assert episode.trajectories[0].output == "the answer is 4"
 
     def test_default_trajectory_name(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "answer"
+            return None
 
         episode = my_agent.run(task, config)
         assert len(episode.trajectories) == 1
@@ -90,7 +91,7 @@ class TestRolloutBareDecorator:
     def test_callable(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "answer"
+            return None
 
         episode = my_agent(task, config)
         assert isinstance(episode, Episode)
@@ -100,44 +101,75 @@ class TestRolloutParameterizedDecorator:
     def test_custom_name(self, task, config):
         @rollout(name="reasoning")
         def my_agent(task, config):
-            return "answer"
+            return None
 
         episode = my_agent.run(task, config)
         assert episode.trajectories[0].name == "reasoning"
 
     def test_register_calls_register_agent(self):
-        with patch("rllm.experimental.eval.agent_loader.register_agent") as mock_reg:
+        with patch("rllm.eval.agent_loader.register_agent") as mock_reg:
 
             @rollout(register="my-agent")
             def my_agent(task, config):
-                return "answer"
+                return None
 
             mock_reg.assert_called_once_with("my-agent", my_agent)
 
     def test_repr(self):
         @rollout(name="solver")
         def my_agent(task, config):
-            return "answer"
+            return None
 
         assert "AgentFlowFn" in repr(my_agent)
         assert "my_agent" in repr(my_agent)
 
 
 class TestRolloutReturnCoercion:
-    def test_str_return(self, task, config):
+    def test_none_return(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "four"
+            return None
 
         ep = my_agent.run(task, config)
-        assert ep.artifacts["answer"] == "four"
+        assert isinstance(ep, Episode)
         assert len(ep.trajectories) == 1
+        assert ep.trajectories[0].name == "solver"
         assert ep.trajectories[0].steps == []
+        assert ep.artifacts == {}
+
+    def test_trajectory_return(self, task, config):
+        @rollout
+        def my_agent(task, config):
+            return Trajectory(name="solver", steps=[], output="four")
+
+        ep = my_agent.run(task, config)
+        assert len(ep.trajectories) == 1
+        assert ep.trajectories[0].name == "solver"
+        assert ep.trajectories[0].output == "four"
+        # Trajectory branch does NOT auto-mirror output to artifacts;
+        # the evaluator parses the Trajectory itself.
+        assert "answer" not in ep.artifacts
+
+    def test_trajectory_return_imputes_default_name(self, task, config):
+        @rollout(name="reasoning")
+        def my_agent(task, config):
+            return Trajectory(steps=[], output="x")  # default name
+
+        ep = my_agent.run(task, config)
+        assert ep.trajectories[0].name == "reasoning"
+
+    def test_trajectory_return_preserves_user_name(self, task, config):
+        @rollout(name="reasoning")
+        def my_agent(task, config):
+            return Trajectory(name="custom", steps=[], output="x")
+
+        ep = my_agent.run(task, config)
+        assert ep.trajectories[0].name == "custom"
 
     def test_episode_return(self, task, config):
         @rollout
         def my_agent(task, config):
-            return Episode(task=task.data, trajectories=[], artifacts={"answer": "direct"})
+            return Episode(task=task.metadata, trajectories=[], artifacts={"answer": "direct"})
 
         ep = my_agent.run(task, config)
         assert ep.artifacts["answer"] == "direct"
@@ -148,72 +180,50 @@ class TestRolloutReturnCoercion:
             return Episode(trajectories=[], artifacts={"answer": "x"})
 
         ep = my_agent.run(task, config)
-        assert ep.task == task.data
+        assert ep.task == task.metadata
 
-    def test_trajectory_list_return(self, task, config):
+    def test_unsupported_type_raises(self, task, config):
         @rollout
         def my_agent(task, config):
-            return [
-                Trajectory(name="solver", steps=[], output="sol1"),
-                Trajectory(name="judge", steps=[], output="sol2"),
-            ]
+            return "no longer supported"
 
-        ep = my_agent.run(task, config)
-        assert len(ep.trajectories) == 2
-        assert ep.trajectories[0].name == "solver"
-        assert ep.artifacts["answer"] == "sol2"
-
-    def test_dict_return(self, task, config):
-        @rollout
-        def my_agent(task, config):
-            return {"answer": "four", "confidence": 0.9}
-
-        ep = my_agent.run(task, config)
-        assert ep.artifacts["answer"] == "four"
-        assert ep.artifacts["confidence"] == 0.9
-
-    def test_fallback_to_str(self, task, config):
-        @rollout
-        def my_agent(task, config):
-            return 42
-
-        ep = my_agent.run(task, config)
-        assert ep.artifacts["answer"] == "42"
+        with pytest.raises(TypeError, match="unsupported type"):
+            my_agent.run(task, config)
 
 
 class TestRolloutAsync:
     def test_async_function_via_run(self, task, config):
         @rollout
         async def my_agent(task, config):
-            return "async answer"
+            return Trajectory(name="solver", output="async answer")
 
         ep = my_agent.run(task, config)
-        assert ep.artifacts["answer"] == "async answer"
+        assert ep.trajectories[0].output == "async answer"
 
     def test_async_function_via_arun(self, task, config):
         @rollout
         async def my_agent(task, config):
-            return "async answer"
+            return Trajectory(name="solver", output="async answer")
 
         ep = asyncio.run(my_agent.arun(task, config))
-        assert ep.artifacts["answer"] == "async answer"
+        assert ep.trajectories[0].output == "async answer"
 
     def test_sync_function_via_arun(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "sync answer"
+            return Trajectory(name="solver", output="sync answer")
 
         ep = asyncio.run(my_agent.arun(task, config))
-        assert ep.artifacts["answer"] == "sync answer"
+        assert ep.trajectories[0].output == "sync answer"
 
     def test_works_with_run_agent_flow(self, task, config):
         @rollout
         def my_agent(task, config):
-            return "hello"
+            return None
 
         ep = asyncio.run(run_agent_flow(my_agent, task, config))
         assert isinstance(ep, Episode)
-        assert ep.artifacts["answer"] == "hello"
+        assert len(ep.trajectories) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +273,7 @@ class TestEvaluatorBareDecorator:
 
 class TestEvaluatorParameterizedDecorator:
     def test_register_calls_register_evaluator(self):
-        with patch("rllm.experimental.eval.evaluator_loader.register_evaluator") as mock_reg:
+        with patch("rllm.eval.evaluator_loader.register_evaluator") as mock_reg:
 
             @evaluator(register="my-eval")
             def my_eval(task, episode):
@@ -351,21 +361,49 @@ class TestEvaluatorReturnCoercion:
 
 class TestCoerceToEpisode:
     def test_episode_passthrough(self):
-        task = Task(data={"q": "test"})
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
         ep = Episode(task={"q": "test"}, trajectories=[], artifacts={"answer": "x"})
         result = _coerce_to_episode(ep, task, "solver")
         assert result is ep
 
-    def test_str(self):
-        task = Task(data={"q": "test"})
-        result = _coerce_to_episode("hello", task, "solver")
-        assert result.artifacts["answer"] == "hello"
+    def test_episode_fills_task(self):
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
+        ep = Episode(trajectories=[])  # task is None
+        result = _coerce_to_episode(ep, task, "solver")
+        assert result.task == {"q": "test"}
 
-    def test_dict(self):
-        task = Task(data={"q": "test"})
-        result = _coerce_to_episode({"answer": "world", "extra": 1}, task, "solver")
-        assert result.artifacts["answer"] == "world"
-        assert result.artifacts["extra"] == 1
+    def test_trajectory_wraps(self):
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
+        traj = Trajectory(name="solver", steps=[], output="hello")
+        result = _coerce_to_episode(traj, task, "solver")
+        assert isinstance(result, Episode)
+        assert result.trajectories == [traj]
+        # No auto-mirror — evaluator parses Trajectory itself.
+        assert "answer" not in result.artifacts
+
+    def test_trajectory_imputes_default_name(self):
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
+        traj = Trajectory(steps=[], output="x")  # default name
+        result = _coerce_to_episode(traj, task, "myagent")
+        assert result.trajectories[0].name == "myagent"
+
+    def test_none_builds_empty_single_trajectory(self):
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
+        result = _coerce_to_episode(None, task, "myagent")
+        assert isinstance(result, Episode)
+        assert len(result.trajectories) == 1
+        assert result.trajectories[0].name == "myagent"
+        assert result.trajectories[0].steps == []
+        assert result.artifacts == {}
+
+    def test_unsupported_type_raises(self):
+        task = Task(id="t", instruction="", metadata={"q": "test"}, dataset_dir=Path("."))
+        with pytest.raises(TypeError, match="unsupported type"):
+            _coerce_to_episode("hello", task, "solver")
+        with pytest.raises(TypeError, match="unsupported type"):
+            _coerce_to_episode({"answer": "x"}, task, "solver")
+        with pytest.raises(TypeError, match="unsupported type"):
+            _coerce_to_episode(42, task, "solver")
 
 
 class TestCoerceToEvalOutput:

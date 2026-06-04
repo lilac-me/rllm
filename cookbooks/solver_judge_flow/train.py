@@ -8,8 +8,8 @@ Or with Hydra overrides:
 """
 
 import hydra
-from evaluator import solver_judge_countdown_evaluator
 from omegaconf import DictConfig
+from solver_judge_eval import solver_judge_countdown_evaluator
 from solver_judge_flow import solver_judge_flow
 
 from rllm.data.dataset import DatasetRegistry
@@ -25,7 +25,7 @@ def main(config: DictConfig):
         raise RuntimeError("countdown train split not found. Run: rllm dataset pull countdown")
 
     trainer = AgentTrainer(
-        backend="tinker",
+        backend=config.rllm.get("backend", "tinker"),
         agent_flow=solver_judge_flow,
         evaluator=solver_judge_countdown_evaluator,
         config=config,

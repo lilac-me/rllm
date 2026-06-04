@@ -13,56 +13,38 @@ from rllm.workflows.workflow import Workflow
 logger = logging.getLogger(__name__)
 
 
-# TODO(listar2000): when later deprecating `train_agent_ppo`, need to migrate all the logic here to `WorkflowTaskRunner`
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
-class WorkflowTaskRunner(TaskRunner):
-    """Ray remote class for executing distributed PPO training with the unified trainer.
+class VerlTaskRunner(TaskRunner):
+    """Ray remote class for executing training with the unified trainer."""
 
-    Inherits worker setup logic from `rllm.trainer.verl.train_agent_ppo.TaskRunner`
-    and overrides `run` to use the `UnifiedTrainer` with `VerlBackend`.
-    """
-
-    def run(self, config, workflow_class: type[Workflow], workflow_args: dict, **kwargs):  # type: ignore
-        """Execute the main PPO training workflow using the unified trainer.
-
-        Args:
-            config: Training configuration
-            workflow_class: Workflow class
-            workflow_args: Workflow arguments
-        """
+    def run(self, config, workflow_class: type[Workflow], workflow_args: dict, hydra_overrides: list[str] | None = None, **kwargs):  # type: ignore
         import os
         import socket
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.trainer.ppo.reward import load_reward_manager
-        from verl.trainer.ppo.utils import need_critic, need_reference_policy
+        from verl.trainer.ppo.utils import need_reference_policy
         from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.config import validate_config
         from verl.utils.fs import copy_to_local
 
-        print(f"WorkflowTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config))
-        OmegaConf.register_new_resolver("mul", lambda x, y: int(x) * int(y))
-        OmegaConf.resolve(config)
+        from rllm.experimental.verl.utils import sync_config
 
-        # Force the new EngineWorker path before worker classes are selected.
-        # VerlBackend (UnifiedTrainer) requires use_legacy_worker_impl='disable';
-        # this must happen before add_actor_rollout_worker() reads the value.
-        legacy_mode = config.trainer.get("use_legacy_worker_impl", "auto")
-        if legacy_mode != "disable":
-            logger.warning(f"VerlBackend requires use_legacy_worker_impl='disable' (new EngineWorker path), got '{legacy_mode}'. Overriding to 'disable'.")
-            config.trainer.use_legacy_worker_impl = "disable"
+        print(f"VerlTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        OmegaConf.register_new_resolver("mul", lambda x, y: int(x) * int(y))
+        sync_config(config, hydra_overrides=hydra_overrides)
+        OmegaConf.resolve(config)
+        sync_config(config, hydra_overrides=hydra_overrides)
+        config.trainer.use_legacy_worker_impl = "disable"
+        pprint(OmegaConf.to_container(config))
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
-        # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(config),
-            use_critic=need_critic(config),
+            use_critic=False,
         )
 
         # Download the checkpoint from HDFS to the local machine.
@@ -75,16 +57,6 @@ class WorkflowTaskRunner(TaskRunner):
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        reward_fn = load_reward_manager(
-            config,
-            tokenizer,
-            **config.reward_model.get("reward_kwargs", {}),
-        )
-        val_reward_fn = load_reward_manager(
-            config,
-            tokenizer,
-            **config.reward_model.get("reward_kwargs", {}),
-        )
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         # Assemble backend-specific arguments for initializing the verl backend.
@@ -94,8 +66,6 @@ class WorkflowTaskRunner(TaskRunner):
             "role_worker_mapping": self.role_worker_mapping,
             "resource_pool_manager": resource_pool_manager,
             "ray_worker_group_cls": ray_worker_group_cls,
-            "reward_fn": reward_fn,
-            "val_reward_fn": val_reward_fn,
         }
 
         trainer = None
@@ -144,20 +114,39 @@ class VerlTrainerLauncher(TrainerLauncher):
             self.config.data.val_files = val_dataset.get_verl_data_path()
 
     def train(self):
+        own_ray = False
         if not ray.is_initialized():
             from rllm.trainer.ray_init_utils import get_ray_init_settings
 
             ray_init_settings = get_ray_init_settings(self.config)
             ray.init(runtime_env=get_ppo_ray_runtime_env(), **ray_init_settings)
+            own_ray = True
 
-        runner = WorkflowTaskRunner.remote()  # type: ignore
+        # Capture Hydra CLI overrides while we're still in the Hydra-decorated
+        # process; the Ray actor below cannot read HydraConfig itself.
+        try:
+            from hydra.core.hydra_config import HydraConfig
 
-        ray.get(
-            runner.run.remote(
-                config=self.config,
-                workflow_class=self.workflow_class,
-                workflow_args=self.workflow_args,
-                store=self.store,
-                **self.kwargs,
+            hydra_overrides = list(HydraConfig.get().overrides.task)
+        except (ValueError, AttributeError, ImportError):
+            hydra_overrides = []
+
+        try:
+            runner = VerlTaskRunner.remote()  # type: ignore
+
+            ray.get(
+                runner.run.remote(
+                    config=self.config,
+                    workflow_class=self.workflow_class,
+                    workflow_args=self.workflow_args,
+                    store=self.store,
+                    hydra_overrides=hydra_overrides,
+                    **self.kwargs,
+                )
             )
-        )
+        finally:
+            if own_ray:
+                try:
+                    ray.shutdown()
+                except Exception:
+                    logger.exception("ray.shutdown during launcher cleanup failed")

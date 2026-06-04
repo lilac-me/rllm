@@ -1,30 +1,31 @@
+import base64
+import json
+import logging
 import uuid
 from typing import cast
 
+import torch
 from omegaconf import DictConfig
 from typing_extensions import override
-from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AsyncLLMServerManager
+from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 
 from rllm.experimental.rollout.rollout_engine import ModelOutput, RolloutEngine
-from rllm.experimental.rollout.types import TokenInput, Tokenizer, TokenOutput, VerlTokenOutput
+from rllm.experimental.rollout.types import Processor, TokenInput, Tokenizer, TokenOutput, VerlTokenOutput
 from rllm.parser import ChatTemplateParser
 from rllm.workflows import TerminationEvent, TerminationReason
 
+logger = logging.getLogger(__name__)
+
 
 class VerlEngine(RolloutEngine):
-    def __init__(self, config: DictConfig, rollout_manager: AgentLoopManager, tokenizer: Tokenizer, processor=None, **kwargs):
+    def __init__(self, config: DictConfig, server_manager: AsyncLLMServerManager, tokenizer: Tokenizer, processor: Processor | None = None, **kwargs):
         super().__init__()
         self.config = config
 
         if config.actor_rollout_ref.rollout.name not in ["vllm", "sglang"]:
             raise ValueError(f"VerlEngine only supports vllm or sglang rollout, but got {config.actor_rollout_ref.rollout.name}")
 
-        assert rollout_manager.global_load_balancer is not None, "global_load_balancer is not available. Issues with RayPPOTrainer's `init_workers()` function."
-
-        self.rollout_manager: AgentLoopManager = rollout_manager
-        # reconstruct the servers list from the server_addresses and server_handles (Verl 0.7.0+)
-        servers = zip(rollout_manager.server_addresses, rollout_manager.server_handles, strict=True)
-        self.server_manager = AsyncLLMServerManager(config, servers=servers, load_balancer_handle=rollout_manager.global_load_balancer)
+        self.server_manager = server_manager
 
         self.tokenizer = tokenizer
         self.processor = processor
@@ -33,6 +34,7 @@ class VerlEngine(RolloutEngine):
         self.max_prompt_length = config.data.max_prompt_length
         self.max_response_length = config.data.max_response_length
         self.accumulate_reasoning = config.get("rllm", {}).get("accumulate_reasoning", False)
+        self.router_replay_mode = config.get("rllm", {}).get("algorithm", {}).get("router_replay", "disabled")
 
         self.train_sampling_params = dict(
             temperature=0.0 if config.actor_rollout_ref.rollout.do_sample is False else config.actor_rollout_ref.rollout.temperature,
@@ -48,8 +50,8 @@ class VerlEngine(RolloutEngine):
             logprobs=1,
         )
 
-        print(f"train_sampling_params: {self.train_sampling_params}")
-        print(f"val_sampling_params: {self.val_sampling_params}")
+        logger.info(f"train_sampling_params: {self.train_sampling_params}")
+        logger.info(f"val_sampling_params: {self.val_sampling_params}")
 
     @property
     def supports_token_in_token_out(self) -> bool:
@@ -62,6 +64,12 @@ class VerlEngine(RolloutEngine):
         input_length = len(token_input)
         application_id = kwargs.pop("application_id", str(uuid.uuid4()))
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
+        # Multimodal: verl's AsyncLLMServerManager.generate accepts image_data /
+        # video_data (list of PIL.Image / video tensors) and the underlying
+        # vLLM server expands the per-image <|image_pad|> placeholder in
+        # ``prompt_ids`` based on each image's actual grid size.
+        image_data = kwargs.pop("image_data", None)
+        video_data = kwargs.pop("video_data", None)
 
         if enforce_max_prompt_length and input_length > self.max_prompt_length:
             raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
@@ -72,7 +80,18 @@ class VerlEngine(RolloutEngine):
         # starting from verl 0.7.0, we can pass in per-turn max_tokens into the sampling_params
         sampling_params["max_tokens"] = max_tokens
 
-        token_output = await self.server_manager.generate(request_id=application_id, prompt_ids=token_input, sampling_params=sampling_params)
+        token_output = await self.server_manager.generate(
+            request_id=application_id,
+            prompt_ids=token_input,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            video_data=video_data,
+        )
+
+        if token_output.stop_reason in ("aborted", "abort"):
+            raise RuntimeError("Rollout aborted")
+        token_output.stop_reason = "length" if len(token_output.token_ids) >= max_tokens else "stop"
+
         return token_output
 
     @override
@@ -86,17 +105,23 @@ class VerlEngine(RolloutEngine):
         request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]
 
         if any(msg.get("images", None) is not None and msg["role"] == "user" for msg in messages) and self.processor is not None:
+            assert hasattr(self.chat_parser, "process_image_data"), f"Chat parser cls {self.chat_parser.__class__.__name__} does not have process_image_data method"
             image_data = self.chat_parser.process_image_data(messages)  # list[PIL.Image.Image]
-            model_inputs = self.processor(text=[prompt], images=image_data)
+            # Below we mirrors verl's ``agent_loop._compute_multi_modal_inputs``
+            model_inputs = self.processor(text=[prompt], images=image_data, return_tensors="pt")
             prompt_ids = model_inputs.pop("input_ids")[0]  # list[int]
             model_inputs.pop("attention_mask")
             multi_modal_inputs = dict(model_inputs)
+
+            grid_thw = multi_modal_inputs.get("image_grid_thw")
+            if grid_thw is not None:
+                multi_modal_inputs["images_seqlens"] = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
         else:
             image_data = None
             multi_modal_inputs = None
             prompt_ids = request_prompt_ids
 
-        token_output: TokenOutput = await self.get_token_output_from_token_input(token_input=request_prompt_ids, **kwargs)
+        token_output: TokenOutput = await self.get_token_output_from_token_input(token_input=request_prompt_ids, image_data=image_data, **kwargs)
         extra_kwargs = dict(prompt_ids=prompt_ids, multi_modal_inputs=multi_modal_inputs)
         return self.assemble_model_output(token_input=request_prompt_ids, token_output=token_output, **extra_kwargs)
 
@@ -109,17 +134,18 @@ class VerlEngine(RolloutEngine):
         token_output = cast(VerlTokenOutput, token_output)
         completion_ids = token_output.token_ids
         logprobs = token_output.log_probs
-
-        # convert the stop reason from verl back to the standard finish reason TODO(listar2000): check backward-compatibility
-        reason_mapping = {"aborted": "abort", "completed": "stop"}
-        if token_output.stop_reason is not None:
-            finish_reason = reason_mapping.get(token_output.stop_reason, token_output.stop_reason)
-        else:
-            finish_reason = "stop"
+        finish_reason = token_output.stop_reason
 
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
         # TODO: implement parse_completion for the standard parser
         parsed_output = self.chat_parser.parse_completion(completion_ids)
+
+        # R3 router replay: encode rollout-side routed_experts as [shape_header_json, base64_blob]
+        routing_matrices = None
+        if self.router_replay_mode == "R3" and token_output.routed_experts is not None:
+            arr = token_output.routed_experts  # (completion_len, num_layers, topk)
+            header = json.dumps({"shape": list(arr.shape[1:]), "dtype": str(arr.dtype)})
+            routing_matrices = [header, base64.b64encode(arr.tobytes()).decode("ascii")]
 
         return ModelOutput(
             text=completion_text,
@@ -133,4 +159,5 @@ class VerlEngine(RolloutEngine):
             prompt_length=prompt_length,
             completion_length=len(completion_ids),
             finish_reason=finish_reason,
+            routing_matrices=routing_matrices,
         )

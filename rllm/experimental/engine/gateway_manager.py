@@ -1,8 +1,26 @@
-"""GatewayManager: manages the rllm-model-gateway lifecycle for training.
+"""GatewayManager + EvalGatewayManager: rllm-model-gateway lifecycle.
 
-Supports two execution modes:
+Two classes share most of the lifecycle (uvicorn-on-thread or subprocess,
+trace store, session API). They differ in how upstream workers are
+registered and what request-body injection the middleware applies.
+
+* :class:`GatewayManager` — training. Workers come from a verl/tinker
+  rollout engine via :meth:`start(rollout_engine)`. Injects ``logprobs``
+  and ``return_token_ids`` into request bodies (vLLM needs both for the
+  loss math downstream).
+
+* :class:`EvalGatewayManager(GatewayManager)` — eval. Wraps a static
+  upstream URL (vLLM endpoint, LiteLLM proxy, OpenAI-compatible server).
+  Disables vLLM-specific param injection because external providers 400
+  on ``return_token_ids``. Constructed with
+  ``EvalGatewayManager(upstream_url, model)`` and started with
+  ``.start()`` (no rollout engine).
+
+Modes:
+
 - 'process': subprocess via ``rllm-model-gateway`` CLI (for verl / distributed)
-- 'thread': background thread via ``create_app`` + uvicorn (for tinker / single-machine)
+- 'thread': background thread via ``create_app`` + uvicorn (for tinker /
+  single-machine / eval)
 
 For Tinker backends, an in-process handler is injected into the gateway
 (via ``local_handler``), avoiding the need for a separate HTTP backend server.
@@ -24,12 +42,35 @@ from rllm_model_gateway.models import TraceRecord
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from rllm.experimental.rollout import RolloutEngine
+    from rllm.experimental.rollout import RolloutEngine, VerlEngine
 
 logger = logging.getLogger(__name__)
 
 _HEALTH_POLL_INTERVAL = 0.5
 _HEALTH_POLL_TIMEOUT = 30.0
+_TRACE_API_TIMEOUT = 600.0
+
+
+def _find_free_port() -> int:
+    """Ask the OS for a free TCP port on the loopback interface."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _normalize_worker_url(raw_url: str) -> str:
+    """Strip trailing ``/v1`` and trailing slashes from an upstream URL.
+
+    The gateway client always sends ``api_path="/v1"`` when registering a
+    worker, and the upstream's ``api_url`` is computed as
+    ``url + api_path``. Without this normalization, callers passing an
+    OpenAI-compatible URL like ``http://localhost:4000/v1`` would end up
+    forwarding to ``http://localhost:4000/v1/v1/chat/completions``.
+    """
+    url = raw_url.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    return url
 
 
 def _get_routable_ip() -> str:
@@ -76,12 +117,36 @@ class GatewayManager:
     - 'thread': background thread via create_app + uvicorn (for tinker / single-machine)
     """
 
+    # Subclasses override these to flip vLLM-specific request-body injection
+    # off when the upstream isn't vLLM (e.g. OpenAI/Anthropic via LiteLLM).
+    add_logprobs: bool = True
+    add_return_token_ids: bool = True
+
     def __init__(self, config: DictConfig, mode: str = "thread") -> None:
         gw_cfg = config.rllm.get("gateway", {})
         configured_host = gw_cfg.get("host", None)
         self.host: str = configured_host if configured_host else _get_routable_ip()
         self.port: int = gw_cfg.get("port", 9090)
+        self.store: str = gw_cfg.get("store", "memory")
         self.db_path: str | None = gw_cfg.get("db_path", None)
+        if self.store not in ("memory", "sqlite"):
+            raise ValueError(f"rllm.gateway.store must be 'memory' or 'sqlite', got {self.store!r}")
+        if self.store == "memory" and self.db_path:
+            raise ValueError("rllm.gateway.db_path is set but store='memory'; set store='sqlite' or clear db_path")
+        from rllm.experimental.engine.tunnel import parse_tunnel
+
+        self.public_url, self.tunnel_backend = parse_tunnel(gw_cfg.get("tunnel", None))
+        self.sampling_params_priority: str = gw_cfg.get("sampling_params_priority", "client")
+        # The gateway always pins ``body.model`` to whatever the trainer is serving
+        self.model: str | None = config.get("model", {}).get("name", None)
+
+        # Cumulative token mode: drift-free multi-turn token forwarding. The
+        # gateway loads the tokenizer from the served model path. renderers
+        # cannot infer the family from a local checkpoint path, so
+        # renderer_family must be set explicitly (e.g. "qwen3", "glm-5").
+        self.cumulative_token_mode: bool = gw_cfg.get("cumulative_token_mode", False)
+        self.renderer_family: str = gw_cfg.get("renderer_family", "auto")
+
         self.mode = mode
 
         self._process: subprocess.Popen | None = None
@@ -90,6 +155,7 @@ class GatewayManager:
         self._local_handler: Any = None  # in-process handler for tinker
         self._client: GatewayClient | None = None
         self._async_client: AsyncGatewayClient | None = None
+        self._tunnel: Any = None  # CloudflaredTunnel when tunnel_backend is set
 
         # Per-mode sampling params (extracted from rollout engine in start())
         self._train_sampling_params: dict[str, Any] = {}
@@ -110,7 +176,7 @@ class GatewayManager:
     def async_client(self) -> AsyncGatewayClient:
         """Async client for runtime operations (sessions, traces)."""
         if self._async_client is None:
-            self._async_client = AsyncGatewayClient(self.gateway_url)
+            self._async_client = AsyncGatewayClient(self.gateway_url, timeout=_TRACE_API_TIMEOUT)
         return self._async_client
 
     # -- Lifecycle -----------------------------------------------------------
@@ -129,23 +195,46 @@ class GatewayManager:
 
             self._local_handler = create_tinker_handler(rollout_engine)
             self._start_thread(local_handler=self._local_handler)
-        else:
+        elif engine_cls == "VerlEngine":
             if self.mode == "process":
                 self._start_process()
             else:
                 self._start_thread()
 
-            worker_urls = self._ensure_workers(rollout_engine)
+            worker_urls = self._ensure_verl_engine_workers(rollout_engine)
             for url in worker_urls:
                 worker_id = self.client.add_worker(url=url)
                 logger.info("Registered worker %s -> %s", worker_id, url)
+        else:
+            logger.warning("Unknown engine type %s — no workers registered", engine_cls)
 
         # Extract per-mode sampling params from the rollout engine
         self._train_sampling_params = getattr(rollout_engine, "train_sampling_params", {})
         self._val_sampling_params = getattr(rollout_engine, "val_sampling_params", {})
 
+        if self.tunnel_backend and not self.public_url:
+            self._start_tunnel()
+
+    def _start_tunnel(self) -> None:
+        """Spawn the named tunnel backend and pin its public URL onto ``self.public_url``."""
+        if self.tunnel_backend != "cloudflared":
+            raise ValueError(f"Unsupported gateway tunnel backend: {self.tunnel_backend!r}. Supported: 'cloudflared', or pass an http(s):// URL.")
+
+        from rllm.experimental.engine.tunnel import CloudflaredTunnel
+
+        tunnel = CloudflaredTunnel(self.gateway_url)
+        self.public_url = tunnel.start()
+        self._tunnel = tunnel
+
     def stop(self) -> None:
         """Terminate the gateway (process or thread)."""
+        if self._tunnel is not None:
+            try:
+                self._tunnel.stop()
+            except Exception:
+                logger.exception("Error stopping cloudflared tunnel")
+            self._tunnel = None
+
         if self._client is not None:
             self._client.close()
             self._client = None
@@ -174,6 +263,9 @@ class GatewayManager:
         return self.client.create_session(session_id=session_id, sampling_params=sp or None)
 
     def get_session_url(self, session_id: str) -> str:
+        if self.public_url:
+            base = self.public_url.rstrip("/")
+            return f"{base}/sessions/{session_id}/v1"
         return self.client.get_session_url(session_id)
 
     def get_traces(self, session_id: str) -> list[TraceRecord]:
@@ -187,21 +279,27 @@ class GatewayManager:
         return await self.async_client.create_session(session_id=session_id, sampling_params=sp or None)
 
     async def aget_traces(self, session_id: str) -> list[TraceRecord]:
-        await self.async_client.flush()
+        await self.async_client.flush(timeout=_TRACE_API_TIMEOUT)
         return await self.async_client.get_session_traces(session_id)
+
+    async def adelete_session(self, session_id: str) -> int:
+        """Delete a session and all its accumulated traces. Returns count removed."""
+        await self.async_client.flush(timeout=_TRACE_API_TIMEOUT)
+        return await self.async_client.delete_session(session_id)
+
+    async def adelete_sessions(self, session_ids: list[str]) -> int:
+        """Batch-delete many sessions in a single flush + request."""
+        if not session_ids:
+            return 0
+        await self.async_client.flush()
+        return await self.async_client.delete_sessions(session_ids)
 
     # -- Worker setup --------------------------------------------------------
 
-    def _ensure_workers(self, rollout_engine: RolloutEngine) -> list[str]:
-        """Get or create worker URLs for the given engine type."""
-        engine_cls = type(rollout_engine).__name__
-
-        if engine_cls == "VerlEngine":
-            addresses = rollout_engine.rollout_manager.server_addresses
-            return [f"http://{addr}" if not addr.startswith("http") else addr for addr in addresses]
-
-        logger.warning("Unknown engine type %s — no workers registered", engine_cls)
-        return []
+    def _ensure_verl_engine_workers(self, rollout_engine: VerlEngine) -> list[str]:
+        """Get or create worker URLs for the VerlEngine."""
+        addresses = rollout_engine.server_manager._server_id_to_handle.keys()
+        return [f"http://{addr}" if not addr.startswith("http") else addr for addr in addresses]
 
     # -- Internal ------------------------------------------------------------
 
@@ -216,8 +314,17 @@ class GatewayManager:
             "--port",
             str(self.port),
         ]
+        cmd.extend(["--store", self.store])
         if self.db_path:
             cmd.extend(["--db-path", self.db_path])
+        if self.sampling_params_priority != "client":
+            cmd.extend(["--sampling-params-priority", self.sampling_params_priority])
+        if self.model:
+            cmd.extend(["--model", self.model])
+        if self.cumulative_token_mode:
+            cmd.append("--cumulative-token-mode")
+            if self.renderer_family != "auto":
+                cmd.extend(["--renderer-family", self.renderer_family])
 
         logger.info("Starting gateway subprocess: %s", " ".join(cmd))
         # Inherit parent's stdout/stderr so gateway logs are visible for debugging.
@@ -251,7 +358,13 @@ class GatewayManager:
             host="0.0.0.0",
             port=self.port,
             db_path=self.db_path,
-            store_worker="sqlite" if self.db_path else "memory",
+            store_worker=self.store,
+            sampling_params_priority=self.sampling_params_priority,
+            model=self.model,
+            add_logprobs=self.add_logprobs,
+            add_return_token_ids=self.add_return_token_ids,
+            cumulative_token_mode=self.cumulative_token_mode,
+            renderer_family=self.renderer_family,
         )
         app = create_app(config=gw_config, local_handler=local_handler)
 
@@ -276,3 +389,82 @@ class GatewayManager:
             time.sleep(_HEALTH_POLL_INTERVAL)
 
         raise TimeoutError(f"Gateway thread did not start within {_HEALTH_POLL_TIMEOUT}s")
+
+
+# ---------------------------------------------------------------------------
+# EvalGatewayManager — eval-side gateway with a static upstream URL
+# ---------------------------------------------------------------------------
+
+
+class EvalGatewayManager(GatewayManager):
+    """Gateway pointing at a single static upstream URL (no rollout engine).
+
+    Used by ``rllm eval``: the upstream is either the user's ``--base-url``
+    (vLLM endpoint, OpenAI-compatible server) or the URL of a LiteLLM
+    proxy started by ``EvalProxyManager``.
+
+    Key differences vs the training-side :class:`GatewayManager`:
+
+    * vLLM-specific request-body injection (``logprobs``,
+      ``return_token_ids``) is OFF — external providers reject
+      ``return_token_ids`` as an unknown parameter.
+    * ``start()`` ignores any ``rollout_engine`` and registers the
+      upstream URL passed at construction. URLs are normalized via
+      :func:`_normalize_worker_url` (strips trailing ``/v1``).
+
+    Example::
+
+        gw = EvalGatewayManager(upstream_url=base_url, model="gpt-4o")
+        gw.start()
+        try:
+            ...
+        finally:
+            gw.stop()
+    """
+
+    add_logprobs = False
+    add_return_token_ids = False
+
+    def __init__(
+        self,
+        upstream_url: str,
+        model: str,
+        *,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        db_path: str | None = None,
+        tunnel: str | None = None,
+    ) -> None:
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.create(
+            {
+                "rllm": {
+                    "gateway": {
+                        "host": host,
+                        "port": port if port is not None else _find_free_port(),
+                        "db_path": db_path,
+                        "tunnel": tunnel,
+                    }
+                },
+                "model": {"name": model},
+            }
+        )
+        super().__init__(cfg, mode="thread")
+        self._upstream_urls: list[str] = [upstream_url]
+
+    def start(self, rollout_engine: RolloutEngine | None = None) -> None:  # type: ignore[override]
+        """Start gateway, register the static upstream URL(s), and bring up the tunnel if configured.
+
+        ``rollout_engine`` is accepted for shape-compatibility with the base class but ignored.
+        """
+        if rollout_engine is not None:
+            logger.warning("EvalGatewayManager.start ignores `rollout_engine` argument")
+        self._start_thread()
+        for raw_url in self._upstream_urls:
+            url = _normalize_worker_url(raw_url)
+            worker_id = self.client.add_worker(url=url)
+            logger.info("Registered worker %s -> %s (raw=%s)", worker_id, url, raw_url)
+
+        if self.tunnel_backend and not self.public_url:
+            self._start_tunnel()
