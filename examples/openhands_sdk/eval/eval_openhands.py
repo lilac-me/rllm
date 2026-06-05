@@ -199,7 +199,12 @@ def load_tasks(cfg: argparse.Namespace, staging: Path) -> list[Task]:
         if not ldir.is_dir():
             print(f"[eval] WARN level dir missing: {ldir}", file=sys.stderr)
             continue
-        for py in sorted(ldir.glob("*.py")):
+        # numeric sort by the leading op id, so --max-ops N == ops 1..N (string sort puts
+        # "10_LayerNorm" before "1_GELU" → --max-ops 8 grabbed the hardest ops 10-17).
+        def _numkey(p):
+            m = re.match(r"\d+", p.stem)
+            return (int(m.group()) if m else 1 << 30, p.stem)
+        for py in sorted(ldir.glob("*.py"), key=_numkey):
             if py.stem.endswith("_impl") or py.name.startswith("_"):
                 continue
             jp = py.with_suffix(".json")
