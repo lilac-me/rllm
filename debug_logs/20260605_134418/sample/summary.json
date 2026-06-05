@@ -1,0 +1,36 @@
+{
+  "n_ops": 8,
+  "n_trajectories": 4,
+  "k_values": [
+    1,
+    4
+  ],
+  "temperature": 0.7,
+  "rollout_backend": "remote_worker",
+  "model": null,
+  "dataset": "/home/c00937190/AscendOpGenAgent/benchmarks/NPUKernelBench",
+  "levels": "1",
+  "pass_at_k": {
+    "pass@1": 0.0,
+    "pass@4": 0.0
+  },
+  "solve_rate_any": 0.0,
+  "mean_correct_per_op": 0.0,
+  "best_of_N_speedup": {
+    "geomean_over_correct_ops": 0.0,
+    "fast@1.0": 0.0,
+    "fast@1.2": 0.0
+  },
+  "step_calibration": {
+    "max_iterations_set": 40,
+    "iterations_observed": {
+      "max": 40,
+      "p90": 40.0,
+      "median": 40.0,
+      "min": 7
+    },
+    "pct_hit_cap": 0.0938,
+    "n_with_meta": 5,
+    "hint": "set --max-iterations ~1.3x of iterations.max; pct_hit_cap>0 ⇒ some rollouts were truncated (raise --max-iterations and re-probe)"
+  }
+}

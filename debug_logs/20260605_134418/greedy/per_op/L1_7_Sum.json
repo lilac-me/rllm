@@ -1,0 +1,24 @@
+{
+  "task_id": "L1_7_Sum",
+  "op_name": "sum",
+  "arch": "ascend910b1",
+  "n_trajectories": 1,
+  "num_correct": 0,
+  "pass_at_k": {
+    "pass@1": 0.0
+  },
+  "best_of_N_speedup": 0.0,
+  "trajectories": [
+    {
+      "traj_idx": 0,
+      "correctness_ok": false,
+      "speedup_vs_torch": 0.0,
+      "success": false,
+      "error_type": "submission_missing",
+      "iterations": 8,
+      "hit_cap": false,
+      "exit_code": 0,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "task_id": "L1_2_SwiGLU",
+  "op_name": "swiglu",
+  "arch": "ascend910b1",
+  "n_trajectories": 1,
+  "num_correct": 0,
+  "pass_at_k": {
+    "pass@1": 0.0
+  },
+  "best_of_N_speedup": 0.0,
+  "trajectories": [
+    {
+      "traj_idx": 0,
+      "correctness_ok": false,
+      "speedup_vs_torch": 0.0,
+      "success": false,
+      "error_type": "correctness_failed",
+      "iterations": 9,
+      "hit_cap": false,
+      "exit_code": 0,
+      "error": null
+    }
+  ]
+}

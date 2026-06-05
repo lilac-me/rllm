@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "op_name": "sort",
+  "success": false,
+  "ast_check_ok": false,
+  "correctness_ok": false,
+  "perf_data": null,
+  "error": "AST退化检查失败: {\n  \"valid\": false,\n  \"filepath\": \"output/submission/sort_impl.py\",\n  \"checks\": {\n    \"triton_kernel_exists\": {\n      \"passed\": true,\n      \"kernels\": [\n        {\n          \"name\": \"sort_kernel\",\n          \"line\": 8,\n          \"has_tl_usage\": true\n        }\n      ],\n      \"error\": null\n    },\n    \"kernel_called_from_forward\": {\n      \"passed\": true,\n      \"called\": [\n        \"sort_kernel\"\n      ],\n      \"error\": null\n    },\n    \"no_forbidden_torch_ops\": {\n      \"passed\": false,\n      \"violations\": [\n        {\n          \"line\": 84,\n          \"call\": \"for 循环\",\n          \"reason\": \"forward() 中禁止 Python for 循环，核心计算必须在单个 Triton kernel 内完成\"\n        },\n        {\n          \"line\": 63,\n          \"call\": \"dims.append(...)\",\n          \"reason\": \"forward() 中禁止 list.append，动态状态维护必须在 Triton kernel 内完成\"\n        }\n      ],\n      \"error\": \"forward() 中发现 2 处禁止的 PyTorch 计算操作\"\n    }\n  },\n  \"regression_type\": 3,\n  \"suggestion\": \"forward() 调用了 Triton kernel 但仍使用 PyTorch 进行部分计算: 第84行 for 循环; 第63行 dims.append(...)。所有核心计算必须在 @triton.jit kernel 中完成，forward() 中只允许 buffer 分配（torch.empty 等）和形状操作（.view/.reshape 等）。\"\n}",
+  "error_type": "ast_check_failed",
+  "error_file": "metrics_error.log",
+  "error_truncated": false
+}

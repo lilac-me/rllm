@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "op_name": "sort",
+  "success": false,
+  "ast_check_ok": true,
+  "correctness_ok": false,
+  "perf_data": null,
+  "error": "数值验证失败: 验证超时（900秒），已终止子进程",
+  "error_type": "correctness_failed",
+  "error_file": "metrics_error.log",
+  "error_truncated": false
+}
