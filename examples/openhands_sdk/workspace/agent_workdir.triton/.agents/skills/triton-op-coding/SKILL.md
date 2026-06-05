@@ -76,22 +76,45 @@ def forward(self, x, w):
     return y + 1  # ← 违规：+ 是 PyTorch 运算符
 ```
 
-### ✅ 正确示例（纯 Triton 实现）
+### ✅ 必背 kernel 骨架（每次照抄起步，三个红线不能漏）
+
+> ⚠️ 三条红线，漏一条结果必错：① 每个 kernel 必须 `pid = tl.program_id(0)` 并用
+> `pid * BLOCK_SIZE` 算偏移（否则每个 block 都只算前 BLOCK_SIZE 个元素，其余是未初始化垃圾）；
+> ② 每个 load/store 必须带 `mask`；③ grid 必须 `triton.cdiv(n, BLOCK_SIZE)` 覆盖全部元素。
+> 低精度（float16/bfloat16）的归约/激活，**必须先 `.to(tl.float32)` 累加、算完再降回原 dtype**，否则精度不达标 correctness 不过。
 
 ```python
+# 骨架 A —— 逐元素 / 广播（elementwise）
 @triton.jit
-def add_kernel(x_ptr, y_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr):
-    idx = tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + idx)
-    y = tl.load(y_ptr + idx)
-    output = x + y  # ← 计算在 kernel 中
-    tl.store(output_ptr + idx, output)
+def ew_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)                                  # ① 当前 block 号
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)   # ① block 偏移，别漏！
+    mask = offsets < n                                      # ② 越界保护
+    x = tl.load(x_ptr + offsets, mask=mask)
+    out = x                                                 # ← 替换成你的计算（abs/gelu/...）
+    tl.store(out_ptr + offsets, out, mask=mask)
 
 class ModelNew(nn.Module):
-    def forward(self, x, y):
-        output = torch.empty_like(x)  # ✅ 允许：buffer 分配
-        add_kernel[(1,)](x, y, output, x.numel(), BLOCK_SIZE=128)  # ✅ 允许：kernel 启动
-        return output  # ✅ 允许：直接返回 kernel 输出
+    def forward(self, x):
+        out = torch.empty_like(x)
+        n = x.numel()
+        grid = (triton.cdiv(n, 1024),)                      # ③ 覆盖全部元素
+        ew_kernel[grid](x.contiguous(), out, n, BLOCK_SIZE=1024)
+        return out
+
+# 骨架 B —— 行归约（softmax / sum / mean / layernorm…）；低精度必须 fp32 累加
+@triton.jit
+def row_softmax_kernel(x_ptr, out_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)                                  # 一行一个 program
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(x_ptr + row * N + cols, mask=mask, other=-float('inf'))
+    x = x.to(tl.float32)                                    # f16/bf16 先升 fp32
+    m = tl.max(x, axis=0)
+    e = tl.exp(x - m)
+    s = tl.sum(e, axis=0)
+    y = (e / s).to(out_ptr.dtype.element_ty)               # 算完降回原 dtype
+    tl.store(out_ptr + row * N + cols, y, mask=mask)
 ```
 
 ---
