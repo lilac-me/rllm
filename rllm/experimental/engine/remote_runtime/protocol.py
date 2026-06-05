@@ -18,6 +18,7 @@ class RemoteRuntimeConfig:
     backend: str = "agentcore"
     agentcore: dict[str, Any] = field(default_factory=dict)
     harbor: dict[str, Any] = field(default_factory=dict)
+    polar: dict[str, Any] = field(default_factory=dict)
     session_timeout: float = 900.0
 
 

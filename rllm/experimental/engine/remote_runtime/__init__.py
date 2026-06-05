@@ -48,6 +48,11 @@ def create_remote_runtime(
             session_timeout=config.session_timeout,
         )
 
+    if config.backend == "polar":
+        from rllm.integrations.polar.runtime import PolarRuntime
+
+        return PolarRuntime(config, exp_id=exp_id, model_id=model_id)
+
     raise ValueError(f"Unknown remote runtime backend: {config.backend!r}")
 
 
