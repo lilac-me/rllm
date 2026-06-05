@@ -88,6 +88,17 @@ def _failed_result(task_id: str, error: str):
     return RemoteTaskResult(finished=False, session_id="", task_id=task_id, reward=0.0, error=error)
 
 
+def polar_episode_builder(result, uid: str, task):
+    """``RemoteAgentFlowEngine.episode_builder`` hook for the Polar path.
+
+    PolarRuntime stamps the Polar SessionResult into ``result.raw_result``; turn it into an
+    rllm Episode via the adapter (which mirrors rllm's own ``_build_episode``).
+    """
+    from rllm.integrations.polar.adapter import session_result_to_episode
+
+    return session_result_to_episode(getattr(result, "raw_result", None) or {}, uid, task)
+
+
 class PolarRuntime:
     """``RemoteAgentRuntime`` (Protocol, structural) backed by a Polar rollout server."""
 

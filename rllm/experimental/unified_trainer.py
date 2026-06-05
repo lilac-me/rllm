@@ -203,7 +203,6 @@ class UnifiedTrainer:
                 hooks=hooks,
             )
         elif remote_runtime_cfg.get("enabled", False):
-            from rllm.experimental.engine.gateway_manager import GatewayManager
             from rllm.experimental.engine.remote_agent_flow_engine import (
                 RemoteAgentFlowEngine,
             )
@@ -212,14 +211,13 @@ class UnifiedTrainer:
                 create_remote_runtime,
             )
 
-            gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
-            self._gateway = GatewayManager(self.config, mode=gateway_mode)
-
+            backend = remote_runtime_cfg.get("backend", "agentcore")
             remote_runtime_config = RemoteRuntimeConfig(
                 enabled=True,
-                backend=remote_runtime_cfg.get("backend", "agentcore"),
+                backend=backend,
                 agentcore=dict(remote_runtime_cfg.get("agentcore", {})),
                 harbor=dict(remote_runtime_cfg.get("harbor", {})),
+                polar=dict(remote_runtime_cfg.get("polar", {})),
                 session_timeout=remote_runtime_cfg.get("session_timeout", 900.0),
             )
             self._remote_runtime = create_remote_runtime(
@@ -228,12 +226,27 @@ class UnifiedTrainer:
                 model_id=self.config.get("model", {}).get("name", "default"),
             )
 
+            # Polar captures + reconstructs the trajectory itself, so it needs no rllm
+            # gateway; an episode_builder turns its SessionResult into an Episode.
+            episode_builder = None
+            if backend == "polar":
+                from rllm.integrations.polar.runtime import polar_episode_builder
+
+                self._gateway = None
+                episode_builder = polar_episode_builder
+            else:
+                from rllm.experimental.engine.gateway_manager import GatewayManager
+
+                gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
+                self._gateway = GatewayManager(self.config, mode=gateway_mode)
+
             self.agent_workflow_engine = RemoteAgentFlowEngine(
                 runtime=self._remote_runtime,
                 gateway=self._gateway,
                 session_timeout=remote_runtime_config.session_timeout,
                 n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
                 episode_logger=self.episode_logger,
+                episode_builder=episode_builder,
             )
         else:
             self.agent_workflow_engine = UnifiedWorkflowEngine(

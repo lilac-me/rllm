@@ -30,13 +30,20 @@ class RemoteAgentFlowEngine:
     def __init__(
         self,
         runtime: RemoteAgentRuntime,
-        gateway: GatewayManager,
+        gateway: GatewayManager | None = None,
         session_timeout: float = 900.0,
         n_parallel_tasks: int = 128,
         episode_logger: EpisodeLogger | None = None,
+        episode_builder=None,
     ) -> None:
+        # gateway is None for runtimes that capture + reconstruct the trajectory
+        # themselves (e.g. Polar); then episode_builder(result, uid, task) turns the
+        # RemoteTaskResult into an Episode instead of the rllm gateway trace path.
+        if gateway is None and episode_builder is None:
+            raise ValueError("RemoteAgentFlowEngine needs a gateway OR an episode_builder")
         self.runtime = runtime
         self.gateway = gateway
+        self.episode_builder = episode_builder
         self.session_timeout = session_timeout
         self.n_parallel_tasks = n_parallel_tasks
         self.episode_logger = episode_logger
@@ -108,14 +115,19 @@ class RemoteAgentFlowEngine:
             session_id = str(uuid.uuid4())
             is_validation = kwargs.get("is_validation", False)
 
-            await self.gateway.acreate_session(session_id, is_validation=is_validation)
-            session_url = self.gateway.get_session_url(session_id)
+            if self.gateway is not None:
+                await self.gateway.acreate_session(session_id, is_validation=is_validation)
+                inference_url = self.gateway.get_session_url(session_id)
+            else:
+                # Polar-style runtime owns its own gateway; inference is routed by its
+                # topology, so the rllm per-session URL is unused.
+                inference_url = ""
 
             submission = TaskSubmission(
                 task=task,
                 session_id=session_id,
                 task_id=task_id,
-                inference_url=session_url,
+                inference_url=inference_url,
             )
             results = await self.runtime.execute_tasks([submission], timeout=self.session_timeout)
             result = results[0]
@@ -124,8 +136,12 @@ class RemoteAgentFlowEngine:
                 logger.warning("Remote task failed (session=%s, assigning reward=0): %s", result.session_id, result.error)
                 result.reward = 0.0
 
-            traces = await self.gateway.aget_traces(session_id)
-            episode = _build_episode(traces, result, uid, task)
+            if self.gateway is not None:
+                traces = await self.gateway.aget_traces(session_id)
+                episode = _build_episode(traces, result, uid, task)
+            else:
+                # Runtime already captured + reconstructed the trajectory.
+                episode = self.episode_builder(result, uid, task)
             if result.metadata:
                 episode.metadata.update(result.metadata)
             if not result.finished:
@@ -140,10 +156,11 @@ class RemoteAgentFlowEngine:
                 episode.metadata["error"] = error_info
 
             # Delete traces from gateway DB to prevent unbounded growth
-            try:
-                await self.gateway.adelete_session(session_id)
-            except Exception as e:
-                logger.warning("[%s] Failed to delete session (non-fatal): %s", uid, e)
+            if self.gateway is not None:
+                try:
+                    await self.gateway.adelete_session(session_id)
+                except Exception as e:
+                    logger.warning("[%s] Failed to delete session (non-fatal): %s", uid, e)
 
             return task_id, rollout_idx, result_idx, episode
 
