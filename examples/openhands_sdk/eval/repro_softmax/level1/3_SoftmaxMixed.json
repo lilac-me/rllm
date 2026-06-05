@@ -1,0 +1,5 @@
+{"inputs": [{"name": "x", "type": "tensor", "dtype": "float32", "shape": [1024, 1024]}]}
+{"inputs": [{"name": "x", "type": "tensor", "dtype": "float16", "shape": [1024, 1024]}]}
+{"inputs": [{"name": "x", "type": "tensor", "dtype": "bfloat16", "shape": [1024, 1024]}]}
+{"inputs": [{"name": "x", "type": "tensor", "dtype": "float16", "shape": [512, 768]}]}
+{"inputs": [{"name": "x", "type": "tensor", "dtype": "bfloat16", "shape": [128, 2048]}]}
