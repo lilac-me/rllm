@@ -318,6 +318,7 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
         "judge_timeout": cfg.judge_timeout,
         "eval_device_ids": cfg.eval_device_ids or os.environ.get("OPENHANDS_EVAL_DEVICE_IDS", ""),
         "llm_temperature": str(cfg.temperature),
+        "llm_max_output_tokens": str(cfg.max_output_tokens),
     }
     import urllib.request
     data = json.dumps(payload).encode("utf-8")
@@ -431,6 +432,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--n-trajectories", type=int, default=4)
     ap.add_argument("--k-values", default="1,4")
     ap.add_argument("--temperature", type=float, default=0.7, help=">0 so N rollouts diverge for pass@k")
+    ap.add_argument("--max-output-tokens", type=int, default=8192,
+                    help="LLM max output tokens (8192 default; raise for reasoning models with long CoT)")
     # rollout / worker
     ap.add_argument("--rollout", choices=["mock", "remote_worker"], default="mock")
     ap.add_argument("--remote-eval-url", default=None)

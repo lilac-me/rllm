@@ -525,7 +525,9 @@ def run() -> int:
         # Sampling temperature: 0.0 default (greedy, as before). Eval sets LLM_TEMPERATURE>0
         # so N independent rollouts diverge → pass@k is meaningful. The worker passes it via -e.
         temperature=float(os.environ.get("LLM_TEMPERATURE", "0.0")),
-        max_output_tokens=2048,
+        # Raised 2048→8192: reasoning models (qwen3.6 CoT) spend output budget on
+        # thinking before the tool call; 2048 truncated the kernel write. Env-tunable.
+        max_output_tokens=int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", "8192")),
     )
 
     def debug_llm_identity(llm, agent):

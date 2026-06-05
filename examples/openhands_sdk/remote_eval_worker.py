@@ -141,6 +141,8 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
     # Sampling temperature for the in-container LLM (runner.py reads LLM_TEMPERATURE).
     # Eval sets it >0 so N rollouts diverge → pass@k is meaningful; training keeps 0.0.
     llm_temperature = str(request.get("llm_temperature") or os.environ.get("LLM_TEMPERATURE", "0.0"))
+    # Max output tokens (8192 default; raised from 2048 for reasoning models whose CoT eats the budget).
+    llm_max_output_tokens = str(request.get("llm_max_output_tokens") or os.environ.get("LLM_MAX_OUTPUT_TOKENS", "8192"))
     observer_api_url = (
         request.get("observer_api_url")
         or os.environ.get("OPENHANDS_OBSERVER_API_URL")
@@ -167,6 +169,7 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
         "-e", "LLM_API_KEY=EMPTY",
         "-e", f"LLM_MODEL=openai/{model_name}",
         "-e", f"LLM_TEMPERATURE={llm_temperature}",
+        "-e", f"LLM_MAX_OUTPUT_TOKENS={llm_max_output_tokens}",
         "-e", f"OPERATOR_BACKEND={operator_backend}",
         "-e", f"OPERATOR_ARCH={arch}",
         "-e", f"OPERATOR_NAME={op_name}",
