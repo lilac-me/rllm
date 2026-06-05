@@ -1,0 +1,2452 @@
+System Prompt ──────────────────────────────────────────────────────────────────
+
+System Prompt:
+You are a helpful assistant. Use the provided tools to complete the task. Be 
+concise.
+
+Dynamic Context:
+<CURRENT_DATETIME>
+The current date and time is: 2026-06-04T19:16:17.943895
+</CURRENT_DATETIME>
+
+
+<REPO_CONTEXT>
+The following information has been included based on several files defined in 
+user's repository.
+Please follow them while working.
+
+
+[BEGIN context from [agents]]
+---
+name: triton-op-generator
+description: Triton-Ascend 算子生成与优化工作流（RL 版）。从给定的 PyTorch 
+参考算子出发，生成 @triton.jit kernel + 
+ModelNew，自测迭代后提交。触发：需要把一个算子描述实现成 Triton-Ascend 算子时。
+---
+
+# System Prompt
+
+你是 **triton-op-generator**。在**固定工作目录 `agent_workdir`** 内，把已给定的 
+PyTorch 参考算子实现成 Triton-Ascend 算子。
+
+> 本工作流运行在 OpenHands 非交互式 RL 环境：**没有 `question` 
+工具、没有人工参与**，任何阶段都不要等待确认，按各 SKILL.md 的判定标准自动推进。
+
+## 重要：Skill 使用方法
+
+工作流引用的 skill（triton-op-designer / triton-op-coding / triton-op-verifier /
+triton-latency-optimizer）**不是可直接调用的工具，而是指导文档**。每阶段开始前先
+用 `file_editor` 读取对应 `.agents/skills/<skill>/SKILL.md`，再按其指导用 
+`file_editor`（读写文件）和 `terminal`（执行脚本）手动完成。**不存在名为 
+`triton-*` 的可调用工具。**
+
+## 固定输入/输出契约（RL pipeline，务必严格遵守）
+
+- **输入（已由框架放好，不要自建、不要改写）**：参考算子在 
+`src/{op_name}.py`（含 PyTorch `Model` + `get_inputs()` 或 
+`get_input_groups()`）；多 case 时同目录附 `src/{op_name}.json`。
+- **唯一提交物**：最终实现写到 
+**`output/submission/{op_name}_impl.py`**，类名必须为 
+**`ModelNew`**。**评测与奖励只认这个文件**，其余产物一律不计。
+- **不要新建带时间戳的工作目录**，所有文件操作限定在 `agent_workdir` 内。
+- `op_name` 取自环境变量 `OPERATOR_NAME`（或 `src/` 下算子文件名）；`arch` 取自 
+`OPERATOR_ARCH`。
+
+## 评测：统一走固定入口（禁止自写测试）
+
+所有功能验证 + 性能采集**统一**通过固定入口执行：
+
+```bash
+bash tools/triton_eval_pipeline.sh --op_name {op_name} \
+    --impl output/submission/{op_name}_impl.py \
+    --task src/{op_name}.py [--json src/{op_name}.json]
+```
+
+它内部按固定顺序跑：AST 退化检查 → `verify.py`（NPU 数值正确性）→ 
+`benchmark.py`（性能），结果写入 `metrics.json`。
+
+⚠️ **禁止**自创测试方法、**禁止**直接调用或修改 
+`tools/`、`.agents/skills/triton-op-verifier/scripts/` 
+下的脚本、**禁止**改评测参数（warmup/repeats/精度阈值由入口写死）。`metrics.json
+` 字段见《错误分析》。
+
+## 固定配置
+
+- framework: `torch`　dsl: `triton_ascend`　backend: `ascend`
+
+---
+
+## 工作流
+
+```
+Phase 1: 算法设计       (triton-op-designer) —— 仅一次
+Phase 2: 生成 + 自测迭代 (triton-op-coding + triton-op-verifier)
+Phase 3: 性能优化        (triton-latency-optimizer) —— 可选
+```
+
+> 完整 rollout 轨迹由 OpenHands/rllm runner 在框架层捕获，**无需** agent 
+自行导出会话或写 report/summary。
+
+### Phase 1: 算法设计
+
+读 `src/{op_name}.py`，调用 `triton-op-designer` 设计算法草图，写到 
+`src/sketch.txt`。仅执行一次，后续迭代不重做。
+
+### Phase 2: 代码生成与自测迭代
+
+```
+iteration = 0; max_iterations = 5; verifier_error = ""; suggestion = ""
+while iteration < max_iterations:
+    1) 调 triton-op-coding 生成/修复实现：
+       首次传 op_name/task/arch/sketch；重试再加 上一版代码 + verifier_error + 
+suggestion。
+       产物直接写入 output/submission/{op_name}_impl.py（就地迭代，不建 iter_N 
+目录）。
+    2) 运行固定入口：
+       bash tools/triton_eval_pipeline.sh --op_name {op_name} \
+           --impl output/submission/{op_name}_impl.py --task src/{op_name}.py 
+[--json src/{op_name}.json]
+    3) 读 metrics.json：
+       - success == true            → 进入 Phase 3
+       - 否则按 error_type 分析（见《错误分析》）：
+           A 类（代码/算法可修）→ 生成 suggestion，iteration++，continue
+           B 类（环境/基础设施）→ 终止
+           C 类（同一 A 子类连续 ≥3 次）→ 终止
+到达 max_iterations 仍未 success → 任务失败结束。
+```
+
+### Phase 3: 性能优化（可选；最多 2 轮，不劣化即可）
+
+> 一如既往**只改** `output/submission/{op_name}_impl.py`（目录已预置，无需 
+mkdir）。固定入口会在
+> 每次 `success==true` 
+时自动留存"迄今最优正确版"（`{op_name}_impl.best.py`），**评测/奖励以最优正确版
+> 为准**——所以优化失败**不会降低成绩**，**也无需手动 `cp` 
+备份/还原**；放心尝试，但**别无限试**，按下面硬上限收敛。
+
+```
+opt_iter = 0; max_opt_iterations = 2
+while opt_iter < max_opt_iterations:
+    opt_iter += 1
+    1) 调 triton-latency-optimizer 就地重写 output/submission/{op_name}_impl.py
+    2) 重新运行固定入口评测，读 metrics.json：
+       - success 且 speedup_vs_torch 较前更高 → 入口已自动刷新最优；continue 
+再试
+       - 否则（correctness 未过 / 无提升 / 失败）  → 立即结束 Phase 3
+    3) optimizer 报告无更多优化点 → 结束
+```
+
+---
+
+## PyTorch 退化政策
+
+`ModelNew.forward()` 的核心计算必须在 `@triton.jit` kernel 内实现；AST 
+检查会拒绝常见的 PyTorch 退化。
+
+forward 中**禁止**用于核心计算：
+
+- `torch.matmul` / `torch.sum` / `torch.relu` / `torch.softmax` 等计算算子；
+- `torch.nn.functional` 的计算调用（如 `F.linear` / `F.softmax`）；
+- `.sum()` / `.mean()` / `@` / `+` / `*` 
+等张量计算方法/运算符（当其替代目标运算时）；
+- 调用参考子模块（如 `self.conv(x)` / `self.linear(x)`）走优化路径。
+
+**允许**的支持性操作：分配、形状检查、reshape、contiguous 转换、launch 
+kernel。launch 时直接传张量对象（`kernel[grid](A, B, C, ...)`），不要传 
+`.data_ptr()` 或整数指针。标量输出（reduction/loss）的最终标量也必须由 kernel 
+产出，禁止 forward 里 `.sum()`/`.mean()`/索引加算/标量除法做后处理。
+
+## Short Kernel Rules
+
+静默使用，不要先打印计划：
+
+- Elementwise/broadcast：一个向量化 tile kernel 覆盖输出元素；`diag(A) @ B` 即 
+`C[i,j]=A[i]*B[i,j]`，不要 materialize `diag(A)`。
+- Matmul/linear：tiled `tl.dot`，传张量，必要时 fp32 累加，参考不做 dtype cast 
+就不要 cast。
+- Reduction：tile 内规约；大轴用"小首段部分规约 + 末段规约 kernel"。
+- Transpose/slice/layout：分配输出，在 kernel 内写精确索引布局，保持 
+stride/shape/dtype 与参考一致。
+- Softmax/cumsum/conv/loss：先写最简正确版，编译/显存失败再缩 tile。
+
+---
+
+## 错误分析（读 `metrics.json` 的 `error_type` / `error`）
+
+> `metrics.json` 由固定入口产出；失败时 `error_type`/`error` 
+是主要调试信号（终端日志可能被截断）。关键字段：`success` / `ast_check_ok` / 
+`correctness_ok` / `perf_data.speedup_vs_torch` / `error` / `error_type`。
+
+错误分类与决策：
+
+- **A 类（代码逻辑/算法错误，可修）**：含 PyTorch 退化（Type 
+1/2/3）、语法/类型错误、形状不匹配、kernel 参数错误（BLOCK_SIZE/grid）、DSL API 
+误用、数值精度不符。→ 生成修复建议，iteration++ 继续。
+- **B 类（环境/基础设施，不可修）**：文件缺失、NPU 
+OOM/设备不可用、依赖缺失、超时。→ 立即终止。
+- **C 类（重复失败）**：同一 A 类子类连续 ≥ 3 次。→ 终止。
+
+PyTorch 退化子类型（`error_type` 含 ast/退化信息时）：
+
+| 子类型 | 含义 | 修复方向 |
+|--------|------|---------|
+| Type1 | 完全无 `@triton.jit` kernel | 创建 kernel，用 tl.load/tl.store 
+实现核心计算 |
+| Type2 | 有 kernel 但 forward 未调用 | forward 内 `kernel[grid](...)` 启动 |
+| Type3 | forward 部分计算仍用 PyTorch | 把禁止的 torch 计算移进 kernel |
+
+常见 `error_type` → 修复：`triton_ub_overflow` 缩小 
+BLOCK_SIZE_{M,N,K}；`triton_compile_failed`/`triton_lowering_failed` 检查 
+tl.constexpr/内存对齐/指针表达式；`correctness_failed` 检查 
+dtype、累加顺序、broadcasting、规约轴、容差；`benchmark_failed` 简化 
+kernel、减少访存。
+
+---
+
+## 约束
+
+| 约束 | 说明 |
+|------|------|
+| 提交物 | 仅 `output/submission/{op_name}_impl.py`（类 `ModelNew`）；不写 
+report.md/summary.json |
+| 工作目录 | 固定 `agent_workdir`，不新建带时间戳目录；文件操作限其内 |
+| 输入 | `src/{op_name}.py`(+`.json`) 已给定，禁止改写参考 |
+| 评测 | 必须经 `tools/triton_eval_pipeline.sh`；禁止自创测试、禁止改/读 
+`tools/`、`scripts/` 内容 |
+| 禁止 PyTorch 退化 | forward 禁用 torch.*/F.* 计算 |
+| Phase 2 最大迭代 | 5 次 |
+| Phase 3 最大迭代 | 2 次；首次 correctness 
+未过/无提升即结束（入口自动保最优正确版，失败不降分） |
+| A 类连续上限 | 同一子类连续 ≥ 3 次自动终止 |
+| 语言 | 思考/分析用中文；代码/路径用英文 |
+
+## 沟通风格
+
+专业、技术、简洁；每完成一个 Phase 给一行状态更新；错误时清晰描述 + 建议操作。
+
+[END Context]
+
+</REPO_CONTEXT>
+
+
+<SKILLS>
+The following skills are available and may be triggered by keywords or task 
+types in your messages.
+When a skill is triggered, you will receive additional context and instructions.
+You can also directly look up a skill's full content by reading its location 
+path, and use the skill's guidance proactively when relevant to your task.
+
+<available_skills>
+  <skill>
+    <name>npu-arch</name>
+    <description>Ascend NPU 架构知识查询技能。通过芯片型号映射、架构代际划分和 
+archXX 
+特性说明，帮助判断目标平台能力、特性支持与条件编译策略。当需要确认芯片型号、NpuA
+rch/SocVersion、架构差异、特性支持或编译分支条件时使用。</description>
+    <location>/opt/workspace/agent_workdir/.agents/skills/npu-arch/SKILL.md</loc
+ation>
+  </skill>
+  <skill>
+    <name>triton-op-coding</name>
+    <description>Triton Ascend 算子代码生成 Skill — 
+根据算子任务格式任务描述生成高性能 Triton Ascend 
+内核代码。支持首次生成和基于错误反馈的迭代优化。 
+触发：当用户需要根据任务描述生成或迭代修复 Triton Ascend 
+内核代码时使用。</description>
+    <location>/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/SKILL
+.md</location>
+  </skill>
+  <skill>
+    <name>triton-op-designer</name>
+    <description>Triton Ascend 算子算法草图设计 Skill — 
+根据任务描述设计高质量的算法草图（sketch）， 
+用于指导后续代码生成。支持首次设计和基于历史上下文的迭代优化。 
+触发：当用户需要为 Triton Ascend 算子设计算法草图或在已有 sketch 
+基础上迭代时使用。</description>
+    <location>/opt/workspace/agent_workdir/.agents/skills/triton-op-designer/SKI
+LL.md</location>
+  </skill>
+  <skill>
+    <name>triton-latency-optimizer</name>
+    <description>擅长在 Ascend NPU 平台上编写高效 Triton 算子的性能优化专家。 
+按照严格的顺序逐步优化 Triton 代码，每次只尝试一个优化点， 
+确保优化前后功能一致、精度一致。 ⚠️ 只能使用本 skill 
+规定的优化方式，禁止使用任何超出本 skill 之外的优化方式。 触发：当用户需要对 
+Ascend NPU 上的 Triton 
+算子代码进行性能优化、降低时延、提升吞吐时使用。</description>
+    <location>/opt/workspace/agent_workdir/.agents/skills/triton-latency-optimiz
+er/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>triton-op-verifier</name>
+    <description>算子代码验证——通过固定入口 tools/triton_eval_pipeline.sh 跑 AST
+退化检查 + NPU 数值正确性 + 性能采集，读 metrics.json 
+判定。禁止自写测试。触发：需要验证 Triton 算子正确性/性能时。</description>
+    <location>/opt/workspace/agent_workdir/.agents/skills/triton-op-verifier/SKI
+LL.md</location>
+  </skill>
+</available_skills>
+</SKILLS>
+
+
+
+Workspace directory: /opt/workspace/agent_workdir. Maximum iterations budget: 
+40. Session ID: cb902d99-6bf1-4d73-94f5-0b2532d30729.
+
+Tools Available: 4
+  - terminal: Execute a bash command in the terminal within a persistent shell 
+session....
+  Parameters: {"type": "object", "description": "Schema for bash command 
+execution.", "properties": {"command": {"type": "string", "description": "The 
+bash command to execute. Can be empty string to view additio...
+  - file_editor: Custom editing tool for viewing, creating and editing files in 
+plain-text format...
+  Parameters: {"type": "object", "description": "Schema for file editor 
+operations.", "properties": {"command": {"type": "string", "description": "The 
+commands to run. Allowed options are: `view`, `create`, `str...
+  - finish: Signals the completion of the current task or conversation....
+  Parameters: {"type": "object", "properties": {"message": {"type": "string", 
+"description": "Final message to send to the user."}}, "required": ["message"]}
+  - think: Use the tool to think about something. It will not obtain new 
+information or make any changes to the...
+  Parameters: {"type": "object", "description": "Action for logging a thought 
+without making any changes.", "properties": {"thought": {"type": "string", 
+"description": "The thought to log."}}, "required": ["thou...
+
+Message from User ──────────────────────────────────────────────────────────────
+
+为算子 pad 生成 Triton-Ascend 实现，参考算子在 src/pad.py。
+严格按 AGENTS.md 的工作流执行（设计 → 生成 → 
+用固定入口自测迭代），把唯一提交物写到 output/submission/pad_impl.py（类名 
+ModelNew），
+再用固定入口 bash tools/triton_eval_pipeline.sh --op_name pad --impl 
+output/submission/pad_impl.py --task src/pad.py 验证，
+读 metrics.json 按 error_type 迭代直到 
+success。未写出提交物、且未通过固定入口验证之前，不要结束任务。
+
+Tokens: ↑ input 0 • cache hit N/A • ↓ output 0 • $ 0.00
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/src"}
+
+Thought:
+Let me start by understanding the task:
+1. I need to implement a Triton-Ascend version of the `pad` operator
+2. The reference implementation is in `src/pad.py`
+3. I need to write the implementation to `output/submission/pad_impl.py` with 
+class name `ModelNew`
+4. I need to follow the workflow: Design → Generate → Self-test iteration using 
+the fixed entry point
+
+Let me start by reading the reference implementation and the relevant skill 
+files.
+</think>
+
+
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: "/opt/workspace/agent_workdir/src"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 6.42K • cache hit 0.00% • ↓ output 193 • $ 0.00
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir"}
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: "/opt/workspace/agent_workdir"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 6.42K • cache hit 0.00% • ↓ output 193 • $ 0.00
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the files and directories up to 2 levels deep in 
+/opt/workspace/agent_workdir/src, excluding hidden items:
+/opt/workspace/agent_workdir/src/
+/opt/workspace/agent_workdir/src/pad.json
+/opt/workspace/agent_workdir/src/pad.py
+
+1 hidden files/directories in this directory are excluded. You can use 'ls -la 
+/opt/workspace/agent_workdir/src' to see them.
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the files and directories up to 2 levels deep in 
+/opt/workspace/agent_workdir, excluding hidden items:
+/opt/workspace/agent_workdir/
+/opt/workspace/agent_workdir/AGENTS.md
+/opt/workspace/agent_workdir/INSTRUCTIONS.md
+/opt/workspace/agent_workdir/output/
+/opt/workspace/agent_workdir/output/submission/
+/opt/workspace/agent_workdir/src/
+/opt/workspace/agent_workdir/src/pad.json
+/opt/workspace/agent_workdir/src/pad.py
+/opt/workspace/agent_workdir/tools/
+/opt/workspace/agent_workdir/tools/env.sh
+/opt/workspace/agent_workdir/tools/fixtures/
+/opt/workspace/agent_workdir/tools/triton_eval_pipeline.sh
+
+1 hidden files/directories in this directory are excluded. You can use 'ls -la 
+/opt/workspace/agent_workdir' to see them.
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/src/pad.py"}
+
+Thought:
+Let me read the reference implementation and the JSON file to understand the 
+operator.
+</think>
+
+
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: "/opt/workspace/agent_workdir/src/pad.py"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 13.32K • cache hit 0.00% • ↓ output 303 • $ 0.00
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/src/pad.json"}
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: "/opt/workspace/agent_workdir/src/pad.json"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 13.32K • cache hit 0.00% • ↓ output 303 • $ 0.00
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/src/pad.py:
+     1  import torch
+     2  import torch.nn as nn
+     3  import json
+     4  import os
+     5  
+     6  class Model(nn.Module):
+     7      """
+     8      Simple model that performs padding on a tensor.
+     9      """
+    10      def __init__(self):
+    11          super(Model, self).__init__()
+    12  
+    13      def forward(self, x: torch.Tensor, pad: tuple, mode: str = 
+'constant', value: float = None) -> torch.Tensor:
+    14          """
+    15          Pads tensor with specified padding mode.
+    16  
+    17          Args:
+    18              x (torch.Tensor): Input tensor.
+    19              pad (tuple): Padding sizes in the form (pad_left, pad_right,
+pad_top, pad_bottom, ...).
+    20              mode (str, optional): Padding mode: 'constant', 'reflect', 
+'replicate', 'circular'.
+    21              value (float, optional): Fill value for 'constant' padding.
+    22  
+    23          Returns:
+    24              torch.Tensor: Padded tensor.
+    25          """
+    26          return torch.nn.functional.pad(x, pad, mode=mode, value=value)
+    27  
+    28  
+    29  def get_init_inputs():
+    30      return []
+    31  
+    32  
+    33  def get_input_groups():
+    34      return [
+    35          [torch.randn([128], dtype=torch.float32), [4, 4], 'constant', 
+0.0],
+    36          [torch.randn([256], dtype=torch.float32), [8, 8], 'constant', 
+0.0],
+    37          [torch.randn([512], dtype=torch.float16), [16, 16], 'constant', 
+0.0],
+    38          [torch.randn([1024], dtype=torch.bfloat16), [32, 32], 
+'constant', 0.0],
+    39          [torch.randn([128, 256], dtype=torch.float32), [4, 4, 2, 2], 
+'constant', 0.0],
+    40          [torch.randn([256, 512], dtype=torch.float32), [8, 8, 4, 4], 
+'constant', 0.0],
+    41          [torch.randn([512, 1024], dtype=torch.float16), [16, 16, 8, 8], 
+'constant', 0.0],
+    42          [torch.randn([1024, 2048], dtype=torch.bfloat16), [32, 32, 16, 
+16], 'constant', 0.0],
+    43          [torch.randn([64, 128, 256], dtype=torch.float32), [4, 4, 2, 2, 
+1, 1], 'constant', 0.0],
+    44          [torch.randn([32, 64, 128], dtype=torch.float32), [2, 2, 1, 1, 
+1, 1], 'constant', 0.0],
+    45          [torch.randn([16, 128, 256], dtype=torch.float16), [8, 8, 4, 4, 
+2, 2], 'constant', 0.0],
+    46          [torch.randn([8, 256, 512], dtype=torch.bfloat16), [16, 16, 8, 
+8, 4, 4], 'constant', 0.0],
+    47          [torch.randn([1, 64, 128, 128], dtype=torch.float32), [4, 4, 2, 
+2, 1, 1, 0, 0], 'constant', 0.0],
+    48          [torch.randn([1, 128, 64, 64], dtype=torch.float32), [2, 2, 1, 
+1], 'reflect'],
+    49          [torch.randn([1, 256, 32, 32], dtype=torch.float16), [2, 2, 2, 
+2], 'replicate'],
+    50          [torch.randn([1, 512, 16, 16], dtype=torch.bfloat16), [2, 2, 1, 
+1], 'circular'],
+    51          [torch.randn([1536], dtype=torch.float32), [64, 64], 'constant',
+0.0],
+    52          [torch.randn([4096], dtype=torch.float16), [128, 128], 
+'constant', 1.0],
+    53          [torch.randn([8192], dtype=torch.bfloat16), [256, 256], 
+'constant', -1.0],
+    54          [torch.randn([4096, 4096], dtype=torch.float32), [64, 64, 32, 
+32], 'constant', 0.0],
+    55          [torch.randn([4096, 11008], dtype=torch.float16), [128, 128, 64,
+64], 'constant', 0.0],
+    56          [torch.randn([5120, 13824], dtype=torch.bfloat16), [256, 256, 
+128, 128], 'constant', 0.0],
+    57          [torch.randn([3584, 18944], dtype=torch.float32), [64, 64, 32, 
+32], 'constant', 0.5],
+    58          [torch.randn([5120, 27648], dtype=torch.float16), [128, 128, 64,
+64], 'constant', 0.0],
+    59          [torch.randn([1, 3, 224, 224], dtype=torch.float32), [3, 3, 3, 
+3], 'constant', 0.0],
+    60          [torch.randn([1, 3, 224, 224], dtype=torch.float16), [1, 1, 1, 
+1], 'reflect'],
+    61          [torch.randn([1, 64, 56, 56], dtype=torch.bfloat16), [1, 1, 1, 
+1], 'replicate'],
+    62          [torch.randn([1, 128, 28, 28], dtype=torch.float32), [2, 2, 2, 
+2], 'circular'],
+    63          [torch.randn([1, 256, 14, 14], dtype=torch.float32), [1, 1, 1, 
+1], 'constant', 0.0],
+    64          [torch.randn([1, 512, 7, 7], dtype=torch.float16), [1, 1, 1, 1],
+'constant', 0.0],
+    65          [torch.randn([100], dtype=torch.float32), [5, 5], 'constant', 
+0.0],
+    66          [torch.randn([200], dtype=torch.float16), [3, 3], 'constant', 
+0.0],
+    67          [torch.randn([34, 66], dtype=torch.float32), [2, 2, 1, 1], 
+'constant', 0.0],
+    68          [torch.randn([17, 33], dtype=torch.float16), [1, 1, 1, 1], 
+'constant', 0.0],
+    69          [torch.randn([65, 129], dtype=torch.bfloat16), [2, 2, 2, 2], 
+'constant', 0.0],
+    70          [torch.randn([1, 16, 100, 100], dtype=torch.float32), [5, 5, 5, 
+5], 'constant', 0.0],
+    71          [torch.randn([1, 32, 50, 50], dtype=torch.float16), [2, 2, 2, 
+2], 'reflect'],
+    72          [torch.randn([1, 64, 25, 25], dtype=torch.bfloat16), [1, 1, 1, 
+1], 'circular'],
+    73          [torch.randn([1, 3, 112, 112], dtype=torch.float32), [1, 0, 1, 
+0], 'constant', 0.0],
+    74          [torch.randn([1, 64, 56, 56], dtype=torch.float16), [2, 0, 2, 
+0], 'replicate'],
+    75          [torch.randn([128, 256], dtype=torch.float32), [0, 0, 4, 4], 
+'constant', 0.0],
+    76          [torch.randn([256, 512], dtype=torch.float16), [8, 8, 0, 0], 
+'constant', 0.0],
+    77          [torch.randn([32, 128, 128], dtype=torch.float32), [0, 4, 0, 4, 
+0, 2], 'constant', 0.0],
+    78          [torch.randn([16, 64, 64], dtype=torch.float16), [2, 2, 0, 0, 1,
+1], 'constant', 0.0],
+    79          [torch.randn([1, 64, 64, 64], dtype=torch.float32), [1, 1, 1, 1,
+1, 1, 0, 0], 'constant', 0.0],
+    80          [torch.randn([1, 128, 32, 32], dtype=torch.float16), [2, 2, 2, 
+2], 'reflect'],
+    81          [torch.randn([1, 256, 16, 16], dtype=torch.bfloat16), [1, 1, 1, 
+1], 'circular'],
+    82          [torch.randn([2048, 2048], dtype=torch.float32), [32, 32, 16, 
+16], 'constant', 0.0],
+    83          [torch.randn([3072, 3072], dtype=torch.float16), [64, 64, 32, 
+32], 'constant', 0.0],
+    84          [torch.randn([6144, 6144], dtype=torch.float32), [128, 128, 64, 
+64], 'constant', 0.0],
+    85          [torch.randn([8192, 8192], dtype=torch.float16), [256, 256, 128,
+128], 'constant', 0.0],
+    86      ]
+    87  
+
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/src/pad.json:
+     1  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [128]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [4, 4]}, {"name": "mode", "type": "attr", "required":
+false, "dtype": "str", "value": "constant"}, {"name": "value", "type": "attr", 
+"required": false, "dtype": "float", "value": 0.0}]}
+     2  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [256]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [8, 8]}, {"name": "mode", "type": "attr", "required":
+false, "dtype": "str", "value": "constant"}, {"name": "value", "type": "attr", 
+"required": false, "dtype": "float", "value": 0.0}]}
+     3  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [512]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [16, 16]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     4  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [1024]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [32, 32]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     5  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [128, 256]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [4, 4, 2, 2]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     6  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [256, 512]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [8, 8, 4, 4]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     7  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [512, 1024]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [16, 16, 8, 8]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     8  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [1024, 2048]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [32, 32, 16, 16]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+     9  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [64, 128, 256]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [4, 4, 2, 2, 1, 1]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    10  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [32, 64, 128]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [2, 2, 1, 1, 1, 1]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    11  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [16, 128, 256]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [8, 8, 4, 4, 2, 2]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    12  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [8, 256, 512]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [16, 16, 8, 8, 4, 4]}, {"name": "mode", "type":
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    13  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1, 64, 128, 128]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [4, 4, 2, 2, 1, 1, 0, 0]}, {"name":
+"mode", "type": "attr", "required": false, "dtype": "str", "value": "constant"},
+{"name": "value", "type": "attr", "required": false, "dtype": "float", "value": 
+0.0}]}
+    14  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1, 128, 64, 64]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 2, 1, 1]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "reflect"}]}
+    15  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [1, 256, 32, 32]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 2, 2, 2]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "replicate"}]}
+    16  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [1, 512, 16, 16]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 2, 1, 1]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "circular"}]}
+    17  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1536]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [64, 64]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    18  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [4096]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [128, 128]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 1.0}]}
+    19  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [8192]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [256, 256]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": -1.0}]}
+    20  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [4096, 4096]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [64, 64, 32, 32]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    21  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [4096, 11008]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [128, 128, 64, 64]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    22  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [5120, 13824]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [256, 256, 128, 128]}, {"name": "mode", "type":
+"attr", "required":<response clipped><NOTE>Due to the max output limit, only 
+part of this file has been shown to you. You should retry this tool after you 
+have searched inside the file with `grep -n` in order to find the line numbers 
+of what you are looking for.</NOTE>"value": 0.0}]}
+    23  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [1, 512, 7, 7]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [1, 1, 1, 1]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    24  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [100]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [5, 5]}, {"name": "mode", "type": "attr", "required":
+false, "dtype": "str", "value": "constant"}, {"name": "value", "type": "attr", 
+"required": false, "dtype": "float", "value": 0.0}]}
+    25  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [200]}, {"name": "pad", "type": "attr", "required": true, 
+"dtype": "tuple", "value": [3, 3]}, {"name": "mode", "type": "attr", "required":
+false, "dtype": "str", "value": "constant"}, {"name": "value", "type": "attr", 
+"required": false, "dtype": "float", "value": 0.0}]}
+    26  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [34, 66]}, {"name": "pad", "type": "attr", "required": true,
+"dtype": "tuple", "value": [2, 2, 1, 1]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    27  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [17, 33]}, {"name": "pad", "type": "attr", "required": true,
+"dtype": "tuple", "value": [1, 1, 1, 1]}, {"name": "mode", "type": "attr", 
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    28  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [65, 129]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [2, 2, 2, 2]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    29  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1, 16, 100, 100]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [5, 5, 5, 5]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "constant"}, 
+{"name": "value", "type": "attr", "required": false, "dtype": "float", "value": 
+0.0}]}
+    30  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [1, 32, 50, 50]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 2, 2, 2]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "reflect"}]}
+    31  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [1, 64, 25, 25]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [1, 1, 1, 1]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "circular"}]}
+    32  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1, 3, 112, 112]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [1, 0, 1, 0]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "constant"}, 
+{"name": "value", "type": "attr", "required": false, "dtype": "float", "value": 
+0.0}]}
+    33  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [1, 64, 56, 56]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 0, 2, 0]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "replicate"}]}
+    34  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [128, 256]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [0, 0, 4, 4]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    35  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [256, 512]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [8, 8, 0, 0]}, {"name": "mode", "type": "attr",
+"required": false, "dtype": "str", "value": "constant"}, {"name": "value", 
+"type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    36  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [32, 128, 128]}, {"name": "pad", "type": "attr", "required":
+true, "dtype": "tuple", "value": [0, 4, 0, 4, 0, 2]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    37  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [16, 64, 64]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [2, 2, 0, 0, 1, 1]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    38  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [1, 64, 64, 64]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [1, 1, 1, 1, 1, 1, 0, 0]}, {"name":
+"mode", "type": "attr", "required": false, "dtype": "str", "value": "constant"},
+{"name": "value", "type": "attr", "required": false, "dtype": "float", "value": 
+0.0}]}
+    39  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [1, 128, 32, 32]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [2, 2, 2, 2]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "reflect"}]}
+    40  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"bfloat16", "shape": [1, 256, 16, 16]}, {"name": "pad", "type": "attr", 
+"required": true, "dtype": "tuple", "value": [1, 1, 1, 1]}, {"name": "mode", 
+"type": "attr", "required": false, "dtype": "str", "value": "circular"}]}
+    41  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [2048, 2048]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [32, 32, 16, 16]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    42  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [3072, 3072]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [64, 64, 32, 32]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    43  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float32", "shape": [6144, 6144]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [128, 128, 64, 64]}, {"name": "mode", "type": 
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+    44  {"inputs": [{"name": "x", "type": "tensor", "required": true, "dtype": 
+"float16", "shape": [8192, 8192]}, {"name": "pad", "type": "attr", "required": 
+true, "dtype": "tuple", "value": [256, 256, 128, 128]}, {"name": "mode", "type":
+"attr", "required": false, "dtype": "str", "value": "constant"}, {"name": 
+"value", "type": "attr", "required": false, "dtype": "float", "value": 0.0}]}
+
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-designer/SKILL.md"}
+
+Thought:
+Now let me read the relevant skill files to understand the design and coding 
+guidelines.
+</think>
+
+Now let me read the skill files for design and coding guidance.
+
+
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-designer/SKILL.md"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 29.56K • cache hit 0.00% • ↓ output 446 • $ 0.00
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/SKILL.md"}
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: "/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/SKILL.md"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 29.56K • cache hit 0.00% • ↓ output 446 • $ 0.00
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/.agents/skills/triton-op-designer/SKILL.md:
+     1  ---
+     2  name: triton-op-designer
+     3  description: >
+     4    Triton Ascend 算子算法草图设计 Skill — 
+根据任务描述设计高质量的算法草图（sketch），
+     5    用于指导后续代码生成。支持首次设计和基于历史上下文的迭代优化。
+     6    触发：当用户需要为 Triton Ascend 算子设计算法草图或在已有 sketch 
+基础上迭代时使用。
+     7  ---
+     8  
+     9  # Triton Ascend 算法草图设计 Skill
+    10  
+    11  <role>
+    12  你是一个高性能计算的算法设计专家。
+    13  
+    14  你的任务是基于以下固定配置设计高质量的算法草图（sketch）：
+    15  
+    16  - **目标 DSL**: triton_ascend
+    17  - **目标框架**: torch
+    18  - **目标后端**: ascend
+    19  - **目标架构**: Ascend NPU（默认 `ascend910b1`；若任务说明 / 环境变量 
+`OPERATOR_ARCH` 指定了具体型号，以其为准）
+    20  
+    21  ⚠️ 
+你**仅生成算法草图**，不生成可执行代码。草图用于指导后续的代码生成（triton-op-co
+ding）。
+    22  </role>
+    23  
+    24  ## 执行方式
+    25  
+    26  **重要**：你没有名为 `triton-op-designer` 的专用工具。本 skill 
+是指导文档，请使用以下现有工具完成本 Skill 描述的工作流：
+    27  - `file_editor` — 读取任务文件、参考文档（view 命令）
+    28  - `terminal` — 如需执行 shell 命令
+    29  
+    30  
+按需加载的知识文档（`@references/...`、`@../npu-arch/references/...`）均通过 
+`file_editor` 的 view 命令读取；其路径相对本 skill 的 `<location>` 目录（见 
+`<available_skills>`）解析。
+    31  
+    32  ## 输入信息
+    33  
+    34  你将获得以下信息：
+    35  
+    36  1. **任务描述和规格说明** — 算子任务格式的算子需求（包含 `Model` 类）
+    37  2. **相关的知识和示例** — UnifiedSketch DSL 
+规范和设计模式（见下方知识加载规则）
+    38  3. **执行历史** — 之前的设计反馈和优化建议（迭代设计时）
+    39  
+    40  ## 知识加载规则
+    41  
+    42  ### 必选知识（每次设计都加载）
+    43  
+    44  - `@references/sketch-design.md` — UnifiedSketch DSL 
+语法规范、核心操作、设计模式、最佳实践
+    45  
+    46  - **硬件规格**
+    47    详细硬件规格参考： `@../npu-arch/references/npu-arch-guide-triton.md` 
+和 `@../npu-arch/references/npu-hardware-params.md` 
+    48  
+    49    使用 `file_editor` 工具（view 命令）读取对应架构的硬件规格文件。
+    50  
+    51  
+    52  ### 手写优化案例（根据任务选择最相关的 2 个）
+    53  
+    54  根据任务描述中的算子类型，从以下案例中选择**最相关的 2 
+个**加载。选择依据：算子类型匹配 > 数据规模接近 > 优化模式相似。
+    55  
+    56  | 类别 | 案例文件 | 核心优化 |
+    57  |------|---------|---------|
+    58  | **Elementwise** | `@references/cases/elemwise-broadcast-2d.md` | 2D 
+广播：小维不切分、循环外加载 |
+    59  | | `@references/cases/elemwise-broadcast-3d.md` | 跨轴 3D 广播：两阶段 
+kernel |
+    60  | | `@references/cases/elemwise-cast.md` | int8→fp16：二次切分 + 用满 UB
+|
+    61  | | `@references/cases/elemwise-concat.md` | Slice+Concat 融合：精确切片
+load |
+    62  | | `@references/cases/elemwise-zeros.md` | 小 shape：少核、减调度开销 |
+    63  | **Index** | `@references/cases/index-histogram.md` | 直方图：预排序 + 
+二分查找 |
+    64  | | `@references/cases/index-put.md` | 批量 load 索引到 UB、get_element 
+复用 |
+    65  | **MatMul** | `@references/cases/matmul-swizzle2d.md` | 固定核心数 
+grid、Swizzle2D 块重排 |
+    66  | **Reduction** | `@references/cases/reduction-amax-large.md` | 
+M≪N：reduce 轴多核 + 原子 + 二次切分 |
+    67  | | `@references/cases/reduction-amax-medium.md` | 
+中等规模：矩阵累加再归约 |
+    68  | | `@references/cases/reduction-amax-small.md` | 极小 shape：grid=1 
+最优 |
+    69  | | `@references/cases/reduction-amin-atomic.md` | 原子 
+amin：两种原子方案对比 |
+    70  | | `@references/cases/reduction-amin-large.md` | 超大 1D：二次切分 + 
+重组 |
+    71  | | `@references/cases/reduction-amin-medium.md` | 大 N 维 amin：矩阵 
+min 再轴归约 |
+    72  | | `@references/cases/reduction-amin-small.md` | 1D amin：并行度平衡 |
+    73  | | `@references/cases/reduction-mean-large.md` | mean 行二次切分 |
+    74  | | `@references/cases/reduction-mean-medium.md` | mean reduce 
+第一轴：重组 |
+    75  | | `@references/cases/reduction-prod-small.md` | prod：tl.reduce + 
+自定义 mul |
+    76  | | `@references/cases/reduction-sum-fused.md` | elemwise + sum 融合 |
+    77  | | `@references/cases/reduction-sum-large.md` | 大规模 sum：重组 |
+    78  | | `@references/cases/reduction-weighted-swiglu.md` | 3D SwiGLU 
+backward：reshape + 行二次切分 |
+    79  
+    80  ### 按需加载的知识
+    81  
+    82  | 条件 | 加载文档 |
+    83  |------|---------|
+    84  | 任务描述中包含 hint 标记（`@hint:`, `@range_hint` 等） | 
+`@references/hint-mode.md` |
+    85  
+    86  ---
+    87  
+    88  ## 设计模式
+    89  
+    90  1. 仔细阅读 `task_desc` 中 `Model.forward()` 的参考实现
+    91  2. 理解算子的数学逻辑和计算模式
+    92  3. 判断算子类型（elementwise / reduce / matmul / attention / 复合）
+    93  4. 根据目标硬件架构，选择合适的并行化策略和内存访问模式
+    94  5. 使用 UnifiedSketch DSL 设计算法草图
+    95  
+    96  ---
+    97  
+    98  ## 输出要求
+    99  
+   100  **直接输出** `sketch op_name { ... }` 格式的算法草图，如果任务描述中包含
+hint 标记，在草图末尾附上"设计适用范围"注释（格式见 `hint-mode.md`）。
+   101  
+   102  ---
+   103  
+   104  ## 设计原则
+   105  
+   106  - 设计**清晰的、可理解的**算法流程
+   107  - 遵循 **Ascend NPU** 硬件特性的最佳实践（core 级别并行、内存层次）
+   108  - 考虑**目标硬件架构**的优化机会（并行度、内存访问模式、数据对齐）
+   109  - 标注**优化点和权衡决策**（使用 `@llm_hint` 注解）
+   110  - 数值正确性优先，性能次之
+   111  
+   112  ## 草图特点
+   113  
+   114  算法草图应该：
+   115  
+   116  - **高层抽象**: 关注算法逻辑和优化策略，而非实现细节
+   117  - **易于理解**: 便于 triton-op-coding 转换为可执行的 Triton Ascend 代码
+   118  - **包含优化提示**: 标注并行化、内存优化、循环展开等机会
+   119  
+   120  ## 思考要求
+   121  
+   122  **重要**：思考过程中请只做框架级别的分析和决策，例如：
+   123  
+   124  - 算子类型判断（elementwise / reduce / matmul 等）
+   125  - 选择什么并行策略（core 级并行、数据切分方式）
+   126  - Tile 大小选择（考虑 NPU UB 容量和对齐要求）
+   127  - 数据类型如何处理
+   128  
+   129  **不要在思考过程中写出完整的草图**，完整草图只在最终输出中给出。
+   130  
+
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/SKILL.md:
+     1  ---
+     2  name: triton-op-coding
+     3  description: >
+     4    Triton Ascend 算子代码生成 Skill — 根据算子任务格式任务描述生成高性能
+     5    Triton Ascend 内核代码。支持首次生成和基于错误反馈的迭代优化。
+     6    触发：当用户需要根据任务描述生成或迭代修复 Triton Ascend 
+内核代码时使用。
+     7  ---
+     8  
+     9  # Triton Ascend 代码生成 Skill
+    10  
+    11  <role>
+    12  你是一个高性能计算的内核代码生成专家。
+    13  
+    14  你的任务是基于以下固定配置生成优化的内核代码：
+    15  
+    16  - **目标 DSL**: triton_ascend
+    17  - **目标框架**: torch
+    18  - **目标后端**: ascend
+    19  - **目标架构**: Ascend NPU（默认 `ascend910b1`；若任务说明 / 环境变量 
+`OPERATOR_ARCH` 指定了具体型号，以其为准）
+    20  </role>
+    21  
+    22  ## 执行方式
+    23  
+    24  **重要**：你没有名为 `triton-op-coding` 的专用工具。本 skill 
+是指导文档，请使用以下现有工具完成本 Skill 描述的工作流：
+    25  - `file_editor` — 读取任务/草图/参考文档，写出生成的内核代码
+    26  - `terminal` — 如需执行 shell 命令
+    27  
+    28  知识文档（`@references/...`、`@../npu-arch/references/...`）通过 
+`file_editor` 的 view 命令读取；其路径相对本 skill 的 `<location>` 目录（见 
+`<available_skills>`）解析。
+    29  
+    30  ## 核心约束：禁止 PyTorch 退化
+    31  
+    32  ⚠️ **生成的代码必须是纯 Triton Ascend 实现，禁止退化成 PyTorch。**
+    33  
+    34  ### forward() 中禁止的操作
+    35  
+    36  | 禁止操作 | 示例 | 原因 |
+    37  |---------|------|------|
+    38  | torch 计算函数 | `torch.matmul(x, w)`, `torch.relu(x)`, `torch.sum(x)`
+| 必须在 @triton.jit kernel 中实现 |
+    39  | torch.nn.functional | `F.softmax(x, dim=-1)`, `F.linear(x, w)`, 
+`F.relu(x)` | 必须在 @triton.jit kernel 中实现 |
+    40  | tensor 方法计算 | `x.sum()`, `x.mean()`, `x.softmax(dim=-1)`, 
+`x.relu()` | 必须在 @triton.jit kernel 中实现 |
+    41  | tensor 运算符 | `x @ w`, `x + y`, `x * y`, `x / y` | 必须在 
+@triton.jit kernel 中实现 |
+    42  | nn.Module 调用 | `self.conv(x)`, `self.linear(x)`, `self.layer(x)` | 
+必须在 @triton.jit kernel 中实现 |
+    43  
+    44  ### forward() 中允许的操作
+    45  
+    46  | 允许操作 | 示例 | 说明 |
+    47  |---------|------|------|
+    48  | buffer 分配 | `torch.empty(shape)`, `torch.zeros(shape)`, 
+`torch.ones(shape)` | 用于存储 kernel 输出 |
+    49  | 形状操作 | `x.view(...)`, `x.reshape(...)`, `x.permute(...)`, 
+`x.transpose(...)` | 不涉及计算 |
+    50  | 元信息查询 | `x.shape`, `x.dtype`, `x.device`, `x.numel()` | 用于 grid
+计算 |
+    51  | kernel 启动 | `kernel[grid](...args)` | 调用自定义 @triton.jit kernel 
+|
+    52  
+    53  ### ❌ 错误示例（退化成 PyTorch）
+    54  
+    55  ```python
+    56  # ❌ 错误 1：完全无 kernel，纯 PyTorch
+    57  def forward(self, x, w):
+    58      return torch.matmul(x, w)
+    59  
+    60  # ❌ 错误 2：有 kernel 但 forward 未调用
+    61  @triton.jit
+    62  def matmul_kernel(...):
+    63      pass
+    64  
+    65  def forward(self, x, w):
+    66      return torch.matmul(x, w)  # kernel 定义了但没用
+    67  
+    68  # ❌ 错误 3：混合实现（部分 kernel + 部分 torch）
+    69  def forward(self, x, w):
+    70      y = self.kernel[grid](x, w)
+    71      return y.sum(dim=-1)  # ← 违规：tensor 方法计算
+    72  
+    73  # ❌ 错误 4：tensor 运算符
+    74  def forward(self, x, w):
+    75      y = self.kernel[grid](x, w)
+    76      return y + 1  # ← 违规：+ 是 PyTorch 运算符
+    77  ```
+    78  
+    79  ### ✅ 正确示例（纯 Triton 实现）
+    80  
+    81  ```python
+    82  @triton.jit
+    83  def add_kernel(x_ptr, y_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr):
+    84      idx = tl.arange(0, BLOCK_SIZE)
+    85      x = tl.load(x_ptr + idx)
+    86      y = tl.load(y_ptr + idx)
+    87      output = x + y  # ← 计算在 kernel 中
+    88      tl.store(output_ptr + idx, output)
+    89  
+    90  class ModelNew(nn.Module):
+    91      def forward(self, x, y):
+    92          output = torch.empty_like(x)  # ✅ 允许：buffer 分配
+    93          add_kernel[(1,)](x, y, output, x.numel(), BLOCK_SIZE=128)  # ✅ 
+允许：kernel 启动
+    94          return output  # ✅ 允许：直接返回 kernel 输出
+    95  ```
+    96  
+    97  ---
+    98  
+    99  ## 输入信息
+   100  
+   101  你将获得以下信息：
+   102  
+   103  1. **任务描述和规格说明** — 算子任务格式的算子需求（包含 `Model` 类）
+   104  2. **算法设计草图**（`sketch`） — kernel-designer 
+生成的算法草图（首次生成时由 workflow 传入）
+   105  3. **相关的知识和示例** — Triton Ascend 编程知识（见下方知识加载规则）
+   106  4. **执行历史** — 之前的错误信息和修复建议（迭代生成时）
+   107  
+   108  ## 知识加载规则
+   109  
+   110  ### 必选知识（每次生成都加载）
+   111  
+   112  - **硬件规格**（每次生成都必须加载）：
+   113   `@../npu-arch/references/npu-arch-guide-triton.md` 和 
+`@../npu-arch/references/npu-hardware-params.md` 
+   114  
+   115  
+   116  - `@references/triton-ascend-fundamentals.md` — API 参考、编程基础、Grid
+配置、内存优化、性能优化、调试清单
+   117  - `@references/triton-ascend-examples.md` — PyTorch + Triton Ascend 
+完整示例代码
+   118  
+   119  ### 按算子类型选择的知识
+   120  
+   121  根据算子类型，**额外**加载对应的参考文档：
+   122  
+   123  | 算子类型 | 识别特征 | 加载文档 |
+   124  |---------|---------|---------|
+   125  | Element-wise | add/mul/relu/sigmoid/tanh/gelu/exp/log/silu 
+等逐元素操作 | `@references/triton-ascend-elementwise.md` |
+   126  | MatMul | matmul/bmm/linear/gemm 等矩阵乘法 | 
+`@references/triton-ascend-matmul.md` |
+   127  | Reduce | sum/mean/max/min/softmax/layernorm/logsoftmax 等归约操作 | 
+`@references/triton-ascend-reduce.md` |
+   128  | Attention | 
+self-attention/cross-attention/flash-attention/scaled-dot-product | 
+`@references/triton-ascend-attention.md` |
+   129  | Sort/Select | nms 等排序选择操作 | 
+`@references/triton-ascend-sort-select.md` |
+   130  | Interpolate | Interpolate等插值操作 | 
+`@references/triton-ascend-interpolate.md` |
+   131  
+   132  如果算子涉及多种类型（如融合算子），加载所有相关文档。
+   133  
+   134  ---
+   135  
+   136  ## 算法草图使用规则
+   137  
+   138  当传入了 `sketch`（kernel-designer 
+生成的算法设计草图）时，**必须以草图为基础进行代码实现** 
+，充分利用其中的算法思路和优化策略。
+   139  
+   140  如果没有传入 `sketch`，则根据 `task_desc` 自行设计实现方案。
+   141  
+   142  ---
+   143  
+   144  ## 代码生成模式
+   145  
+   146  ### 模式 1: 首次生成（无历史信息）
+   147  
+   148  当只有 `op_name`、`task_desc` 等基本参数时：
+   149  
+   150  1. 仔细阅读 `task_desc` 中 `Model.forward()` 的参考实现
+   151  2. 理解算子的数学逻辑和计算模式
+   152  3. 判断算子类型，加载对应的知识文档
+   153  4. 选择合适的并行化策略和内存访问模式
+   154  5. 生成 kernel 函数和 `ModelNew` 类
+   155  
+   156  ### 模式 2: 代码修改（有 previous_code + user_requirements）
+   157  
+   158  当用户要求修改已有代码时：
+   159  
+   160  1. **仅修改用户要求的部分**，不要重构无关代码
+   161  2. **保持代码结构和接口不变**（除非用户要求修改）
+   162  3. **确保修改后的代码仍然完整可运行**
+   163  4. 输出完整的修改后代码
+   164  
+   165  ### 模式 3: 迭代修复（有 verifier_error / conductor_suggestion）
+   166  
+   167  当上一轮验证失败时：
+   168  
+   169  1. **分析错误**：仔细阅读 `verifier_error`，理解失败的具体原因
+   170  2. **参考建议**：严格按照 `conductor_suggestion` 中的修复方向进行修改
+   171  3. **保留优点**：保留上一轮代码中正确的部分，只修改有问题的部分
+   172  4. **针对性修复**：不做不必要的大规模重构
+   173  5. **避免重复**：如果建议中提到了历史教训，确保不犯同样的错误
+   174  
+   175  ---
+   176  
+   177  ## 输出要求
+   178  
+   179  生成的代码**必须**是一个完整的 Python 文件，包含以下结构：
+   180  
+   181  ```python
+   182  import torch
+   183  import torch.nn as nn
+   184  import triton
+   185  import triton.language as tl
+   186  # 其他必要的 import（如 torch_npu）
+   187  
+   188  # Kernel 函数（一个或多个）
+   189  @triton.jit
+   190  def {op_name}_kernel(...):
+   191      # 高性能内核实现
+   192      ...
+   193  
+   194  # 新 Model 类
+   195  class ModelNew(nn.Module):
+   196      def __init__(self, <与原 Model 完全相同的参数>):
+   197          super().__init__()
+   198          # 与原 Model 相同的初始化逻辑
+   199          # 在此获取核心数（如需要）
+   200  
+   201      def forward(self, <与原 Model 完全相同的输入>):
+   202          # 调用自定义 kernel
+   203          ...
+   204          return output
+   205  ```
+   206  
+   207  ### 关键约束
+   208  
+   209  | 约束 | 说明 |
+   210  |------|------|
+   211  | 类名 `ModelNew` | 必须使用 `ModelNew`，**不能**是 `Model` |
+   212  | 接口一致 | `__init__` 和 `forward` 的签名必须与原 `Model` **完全一致**
+|
+   213  | 输出一致 | 输出的形状、数据类型必须与原 `Model` 一致 |
+   214  | 自包含 | 所有 kernel 函数和辅助函数必须定义在同一文件内 |
+   215  | 可执行 | 代码必须可以直接导入运行 |
+   216  | 无测试代码 | 不需要生成测试代码 |
+   217  | 权重一致 | 含随机权重的算子（Conv2d/Linear 
+等）必须通过固定种子确保权重一致 |
+   218  | **禁止 PyTorch 退化** | **forward() 中所有核心计算必须在 @triton.jit 
+kernel 中实现，禁止使用 torch.*/F.*/tensor 方法/tensor 运算符** |
+   219  
+   220  ### 含随机权重算子的权重一致性（关键！）
+   221  
+   222  当任务描述中的 `Model` 类包含 
+`nn.Conv2d`、`nn.Linear`、`nn.ConvTranspose2d` 等带可学习参数的模块，或者使用 
+`torch.randn` / `nn.Parameter(torch.randn(...))` 创建随机参数时，**必须**在 
+`ModelNew.__init__` 中通过固定随机种子来确保与原 `Model` 的权重完全一致。
+   223  
+   224  **原理**：验证框架会在创建 `Model` 前调用 
+`torch.manual_seed(0)`，再在创建 `ModelNew` 前再次调用 
+`torch.manual_seed(0)`。只要两者在 `__init__` 
+内部以相同的顺序创建参数，就能获得完全一致的权重。
+   225  
+   226  **标准模式**：
+   227  
+   228  ```python
+   229  class ModelNew(nn.Module):
+   230      def __init__(self, in_channels, out_channels, kernel_size, ...):
+   231          super().__init__()
+   232          # 1. 固定种子 — 必须与验证框架中的种子一致 (0)
+   233          torch.manual_seed(0)
+   234  
+   235          # 2. 按照原 Model 的**完全相同的顺序**创建模块并提取权重
+   236          #    确保随机数消耗顺序一致
+   237          conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+   238          self.weight = nn.Parameter(conv.weight.clone())
+   239          self.bias = nn.Parameter(conv.bias.clone()) if conv.bias is not 
+None else None
+   240  
+   241          # 如果原 Model 还有其他随机参数（如 
+nn.Parameter(torch.randn(...))），
+   242          # 也必须在此按相同顺序创建
+   243          self.extra_bias = nn.Parameter(torch.randn(bias_shape))
+   244  
+   245      def forward(self, x):
+   246          # 使用提取的权重调用自定义 kernel
+   247          return custom_conv_kernel(x, self.weight, self.bias, ...)
+   248  ```
+   249  
+   250  **核心要点**：
+   251  1. `ModelNew.__init__` 的**第一行**必须调用 `torch.manual_seed(0)`
+   252  2. 参数创建的**顺序**必须与原 `Model.__init__` 完全一致（因为每次 
+`torch.randn` 调用会推进随机状态）
+   253  3. 通过创建相同的 `nn.Module`（如 `nn.Conv2d`）来获取权重，而非手动 
+`torch.randn` —— 这保证内部参数的 shape 和初始化方式一致
+   254  4. 如果原 `Model` 有多个含权重的模块，必须按**原顺序**逐一创建并提取
+   255  
+   256  ---
+   257  
+   258  ## 思考要求
+   259  
+   260  **重要**：思考过程中请只做框架级别的分析和决策，例如：
+   261  - 算子类型判断（elementwise / reduce / matmul 等）
+   262  - 选择什么优化策略（循环展开、向量化等）
+   263  - 数据类型如何处理
+   264  - 代码结构的大致骨架
+   265  
+   266  **不要在思考过程中写出完整的代码**，完整代码只在最终输出中给出。
+   267  
+   268  ## 生成原则
+   269  
+   270  - 生成**完整的、可编译的**代码
+   271  - 遵循 Triton Ascend 的最佳实践
+   272  - 针对 Ascend NPU 架构进行优化
+   273  - 正确处理边界情况和异常条件
+   274  - 包含必要的导入和包装函数
+   275  - 数值正确性优先，性能次之
+   276  - **严格遵守禁止 PyTorch 退化的约束** — 所有核心计算必须在 @triton.jit 
+kernel 中实现
+   277  
+
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references"}
+
+Thought:
+Now let me read the Triton Ascend fundamentals and examples to understand the 
+API.
+</think>
+
+
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 53.04K • cache hit 0.00% • ↓ output 519 • $ 0.00
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the files and directories up to 2 levels deep in 
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references, 
+excluding hidden items:
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-attention.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-elementwise.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-examples.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-fundamentals.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-interpolate.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-matmul.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-reduce.md
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-sort-select.md
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-
+ascend-fundamentals.md"}
+
+Thought:
+Let me read the fundamentals and examples to understand the Triton Ascend API.
+</think>
+
+
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-
+ascend-fundamentals.md"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 76.87K • cache hit 0.00% • ↓ output 661 • $ 0.00
+
+Agent Action ───────────────────────────────────────────────────────────────────
+
+Summary: file_editor: {"command": "view", "path": 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-
+ascend-examples.md"}
+
+Action: FileEditorAction
+
+Arguments:
+  command: "view"
+  path: 
+"/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-
+ascend-examples.md"
+  kind: "FileEditorAction"
+
+Tokens: ↑ input 76.87K • cache hit 0.00% • ↓ output 661 • $ 0.00
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-fundamentals.md:
+     1  # Triton Ascend 基础知识参考手册
+     2  
+     3  本文档汇集 Triton Ascend 编程的基础知识，包括 API 
+参考、编程模式、优化策略和调试技巧。
+     4  
+     5  ---
+     6  
+     7  ## 1. 编程基础
+     8  
+     9  ### 1.1 核心概念
+    10  
+    11  Triton Ascend 采用与 Triton GPU 类似的执行模型：
+    12  
+    13  - **Kernel（内核）**：用 `@triton.jit` 装饰的函数，在 NPU 上并行执行
+    14  - **Grid（网格）**：启动的并行程序总数，由 `kernel[grid](args)` 指定
+    15  - **Block（块）**：每个程序处理的数据块，由 `tl.program_id(0)` 区分
+    16  
+    17  #### 内存层次
+    18  - **全局内存**: 主内存，所有程序可访问，延迟高
+    19  - **共享内存**: 块内共享，延迟低，容量有限
+    20  - **寄存器**: 每个线程私有，最快访问
+    21  
+    22  ### 1.2 标准 Kernel 结构（五步模式）
+    23  
+    24  ```python
+    25  @triton.jit
+    26  def triton_better_kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: 
+tl.constexpr, XBLOCK_SUB: tl.constexpr):
+    27      # Step 1: 计算当前核的起始偏移（核间切分）
+    28      xoffset = tl.program_id(0) * XBLOCK
+    29  
+    30      # Step 2: 核内循环（核内切分）
+    31      for xoffset_sub in range(0, XBLOCK, XBLOCK_SUB):
+    32          # Step 3: 构造数据索引
+    33          x_index = xoffset + xoffset_sub + tl.arange(0, XBLOCK_SUB)[:]
+    34  
+    35          # Step 4: 边界处理（mask）
+    36          xmask = x_index < xnumel
+    37  
+    38          # Step 5: 加载 → 计算 → 存储
+    39          x = tl.load(in_ptr0 + x_index, xmask)
+    40          ret = x * 0.5 * (1.0 + tl.erf(x / tl.sqrt(2.0)))
+    41          tl.store(out_ptr0 + x_index, ret, xmask)
+    42  ```
+    43  
+    44  ### 1.3 内核启动方式
+    45  ```python
+    46  def launch_kernel(input_tensor, output_tensor):
+    47      BLOCK_SIZE = 1024  
+    48      grid = (triton.cdiv(input_tensor.numel(), BLOCK_SIZE),)
+    49      
+    50      kernel[grid](
+    51          output_tensor, input_tensor, input_tensor.numel(),
+    52          BLOCK_SIZE=BLOCK_SIZE,
+    53      )
+    54  ```
+    55  
+    56  ### 1.4 边界处理（Mask）
+    57  
+    58  使用 mask 防止越界访问，确保只处理合法范围内的数据：
+    59  
+    60  ```python
+    61  xmask = x_index < xnumel
+    62  x = tl.load(in_ptr0 + x_index, mask=xmask, other=0.0)
+    63  tl.store(out_ptr0 + x_index, ret, mask=xmask)
+    64  ```
+    65  
+    66  ### 1.5 编程模式
+    67  
+    68  #### 1.5.1 向量操作模式
+    69  适用于元素级运算：加法、乘法、激活函数等。
+    70  
+    71  ```python
+    72  @triton.jit
+    73  def vector_add_kernel(a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: 
+tl.constexpr):
+    74      pid = tl.program_id(0)
+    75      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    76      mask = offsets < n_elements
+    77      
+    78      a = tl.load(a_ptr + offsets, mask=mask)
+    79      b = tl.load(b_ptr + offsets, mask=mask)
+    80      c = a + b
+    81      
+    82      tl.store(c_ptr + offsets, c, mask=mask)
+    83  ```
+    84  
+    85  #### 1.5.2 归约模式
+    86  适用于求和、最大值、最小值等聚合操作。
+    87  
+    88  ```python
+    89  @triton.jit
+    90  def reduction_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: 
+tl.constexpr):
+    91      pid = tl.program_id(0)
+    92      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    93      mask = offsets < n_elements
+    94      
+    95      # 加载数据
+    96      data = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    97      
+    98      # 块内归约
+    99      block_sum = tl.sum(data, axis=0)
+   100      
+   101      # 原子操作写回全局内存
+   102      if pid == 0:  # 只有第一个块写入结果
+   103          tl.atomic_add(output_ptr, block_sum)
+   104  ```
+   105  
+   106  #### 1.5.3 矩阵乘法模式
+   107  使用块指针高效处理 2D 数据。
+   108  
+   109  ```python
+   110  @triton.jit
+   111  def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, 
+stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, 
+BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+   112      # 获取程序 ID
+   113      pid_m = tl.program_id(0)
+   114      pid_n = tl.program_id(1)
+   115      
+   116      # 初始化累加器
+   117      accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), 
+dtype=tl.float32)
+   118      
+   119      # 主循环：沿 K 轴迭代
+   120      for k in range(0, K, BLOCK_SIZE_K):
+   121          # 创建块指针
+   122          a_block_ptr = tl.make_block_ptr(
+   123              base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
+   124              offsets=(pid_m * BLOCK_SIZE_M, k), 
+   125              block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0)
+   126          )
+   127          b_block_ptr = tl.make_block_ptr(
+   128              base=b_ptr, shape=(K, N), strides=(stride_bk, stride_bn),
+   129              offsets=(k, pid_n * BLOCK_SIZE_N), 
+   130              block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), order=(1, 0)
+   131          )
+   132          
+   133          # 加载数据块
+   134          a = tl.load(a_block_ptr, boundary_check=(0, 1))
+   135          b = tl.load(b_block_ptr, boundary_check=(0, 1))
+   136          
+   137          # 矩阵乘加
+   138          accumulator += tl.dot(a, b)
+   139      
+   140      # 存储结果
+   141      c_block_ptr = tl.make_block_ptr(
+   142          base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+   143          offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
+   144          block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0)
+   145      )
+   146      tl.store(c_block_ptr, accumulator, boundary_check=(0, 1))
+   147  ```
+   148  
+   149  ### 1.6 Autotune 使用
+   150  
+   151  Triton 支持 `autotune` 自动调优，但 **Ascend NPU 不支持 
+`num_warps`、`num_ctas`、`num_stages` 等 CUDA 专用调优参数**。在 Ascend 
+上主要调优：
+   152  
+   153  - `BLOCK_SIZE` / `XBLOCK` / `XBLOCK_SUB` 等分块参数
+   154  - `grid` 维度（核数）
+   155  
+   156  ```python
+   157  @triton.autotune(
+   158       configs=[
+   159          triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 
+'BLOCK_SIZE_K': 128}),
+   160          triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 
+'BLOCK_SIZE_K': 64}),
+   161      ],
+   162      key=['M', 'N', 'K'],  # 当这些参数变化时触发重新autotune
+   163  )
+   164  @triton.jit
+   165  ddef matmul_kernel(
+   166      a_ptr, b_ptr, c_ptr,
+   167      M, N, K,
+   168      stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+   169      BLOCK_SIZE_M: tl.constexpr, # configs中的参数必须声明为constexpr
+   170      BLOCK_SIZE_N: tl.constexpr, # configs中的参数必须声明为constexpr
+   171      BLOCK_SIZE_K: tl.constexpr, # configs中的参数必须声明为constexpr
+   172  ):
+   173      # kernel实现
+   174      pass
+   175  
+   176  class ModelNew(torch.nn.Module):
+   177      def __init__(self):
+   178          super().__init__()
+   179  
+   180      def forward(self, a, b):
+   181      M, K = a.shape
+   182      K, N = b.shape
+   183      c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+   184      
+   185      grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * 
+triton.cdiv(N, meta['BLOCK_SIZE_N']),) # grid设置是tuple
+   186      
+   187      # 关键：调用时不要传递configs中的参数（BLOCK_SIZE_M等）
+   188      matmul_kernel[grid](
+   189          a, b, c,
+   190          M, N, K,
+   191          a.stride(0), a.stride(1),
+   192          b.stride(0), b.stride(1),
+   193          c.stride(0), c.stride(1),
+   194          # 不要写：BLOCK_SIZE_M=128  # 错误！autotune会自动传入
+   195      )
+   196      return c
+   197  ```
+   198  ---
+   199  
+   200  ## 2. API 参考
+   201  
+   202  ### 2.1 装饰器与启动
+   203  
+   204  | API | 说明 |
+   205  |-----|------|
+   206  | `@triton.jit` | 将 Python 函数编译为 Triton 内核 |
+   207  | `tl.program_id(axis)` | 当前程序在 grid 指定维度上的 ID |
+   208  | `tl.num_programs(axis)` | grid 在指定维度上的程序总数 |
+   209  | `triton.cdiv(x, y)` | 向上取整除法：`(x + y - 1) // y` |
+   210  
+   211  **@triton.jit 示例**：
+   212  ```python
+   213  @triton.jit
+   214  def kernel_function(...):
+   215      pass
+   216  ```
+   217  - **作用**: 将 Python 函数编译为硬件内核
+   218  - **约束**: 函数内部不能使用 `return`、`break`、`continue` 语句
+   219  
+   220  **tl.program_id(axis) 示例**：
+   221  ```python
+   222  pid = tl.program_id(axis)  # axis: 0, 1, or 2
+   223  ```
+   224  - **参数**: `axis` - 维度轴 (0, 1, 2)
+   225  - **返回**: 当前程序在该轴上的 ID
+   226  - **用途**: 确定当前程序块处理的数据范围
+   227  
+   228  **tl.num_programs(axis) 示例**：
+   229  ```python
+   230  num_pids = tl.num_programs(axis)  # axis: 0, 1, or 2
+   231  ```
+   232  - **参数**: `axis` - 维度轴 (0, 1, 2)
+   233  - **返回**: 该轴上的总程序数
+   234  - **用途**: 计算网格大小和边界条件
+   235  
+   236  **triton.cdiv(a, b) 示例**：
+   237  ```python
+   238  grid_size = triton.cdiv(total_elements, block_size)
+   239  ```
+   240  - **参数**: `a`, `b` - 被除数和除数
+   241  - **返回**: 向上取整的除法结果
+   242  - **用途**: host侧使用，计算启动网格大小
+   243  
+   244  ### 2.2 内存访问
+   245  
+   246  | API | 说明 |
+   247  |-----|------|
+   248  | `tl.load(ptr, mask=None, other=0.0, boundary_check=None)` | 
+从全局内存加载数据 |
+   249  | `tl.store(ptr, value, mask=None, boundary_check=None)` | 
+将数据写入全局内存 |
+   250  | `tl.make_block_ptr(base, shape, strides, offsets, block_shape, order)`
+| 创建块指针，用于 2D/高维块访问 |
+   251  | `tl.advance(block_ptr, dim, delta)` | 沿指定维度推进块指针 |
+   252  
+   253  **tl.load 示例:**
+   254  ```python
+   255  data = tl.load(ptr + offsets, mask=mask, other=0.0)
+   256  ```
+   257  - **参数**:
+   258    - `pointer`: 内存指针
+   259    - `mask`: 布尔掩码，True 表示有效位置
+   260    - `other`: 掩码为 False 时的默认值
+   261    - `boundary_check`: 边界检查维度 (0, 1) 或 None
+   262  - **返回**: 加载的张量数据
+   263  - **用途**: 从全局内存加载数据
+   264  
+   265  **tl.store 示例:**
+   266  ```python
+   267  tl.store(ptr + offsets, result, mask=mask)
+   268  ```
+   269  - **参数**:
+   270    - `pointer`: 内存指针
+   271    - `value`: 要存储的值
+   272    - `mask`: 布尔掩码，True 表示有效位置
+   273    - `boundary_check`: 边界检查维度 (0, 1) 或 None
+   274  - **用途**: 将数据存储到全局内存
+   275  
+   276  **tl.make_block_ptr 示例:**
+   277  ```python
+   278  p_q = tl.make_block_ptr(
+   279      base=q + (bos * HQ + i_hq) * K,
+   280      shape=(T, K),
+   281      strides=(HQ*K, 1),
+   282      offsets=(i_t * BT, 0),
+   283      block_shape=(BT, BK),
+   284      order=(1, 0)
+   285  )
+   286  val = tl.load(p_q, boundary_check=(0, 1), padding="zero")
+   287  ```
+   288  - **参数**:
+   289    - `base`: 基础内存指针
+   290    - `shape`: 完整张量的形状
+   291    - `strides`: 每个维度的步长
+   292    - `offsets`: 当前块的起始偏移
+   293    - `block_shape`: 当前块的大小
+   294    - `order`: 内存布局顺序 (1, 0) 表示行主序
+   295  - **返回**: 块指针对象
+   296  - **用途**: 高效访问 2D 数据块
+   297  
+   298  **tl.advance 示例:**
+   299  ```python
+   300  block_ptr = tl.advance(block_ptr, (BLOCK_M, 0))
+   301  ```
+   302  - **参数**:
+   303    - `ptr`: 块指针
+   304    - `offsets`: 各维度的偏移量
+   305  - **返回**: 移动后的块指针
+   306  - **用途**: 移动块指针到下一个位置
+   307  
+   308  ### 2.3 张量构造与索引
+   309  
+   310  | API | 说明 |
+   311  |-----|------|
+   312  | `tl.arange(start, end)` | 创建一维索引张量 |
+   313  | `tl.zeros(shape, dtype)` | 创建全零张量 |
+   314  | `tl.full(shap<response clipped><NOTE>Due to the max output limit, only
+part of this file has been shown to you. You should retry this tool after you 
+have searched inside the file with `grep -n` in order to find the line numbers 
+of what you are looking for.</NOTE>lice` / `tl.insert_slice` |
+   315  | constexpr 仅用于 kernel 参数 | 编译时常量通过参数传入 |
+   316  | 避免 tl.where 做内存偏移 | 易导致低效，改用 boundary_check 或 mask |
+   317  | 标量类型转换 | 用 `.to(tl.float32)` 等，不用 `tl.float16()` |
+   318  
+   319  ```python
+   320  # 不推荐：tl.where 用于偏移
+   321  # ptr = base + tl.where(mask, idx, 0)
+   322  
+   323  # 推荐：mask 用于 load/store
+   324  data = tl.load(ptr + idx, mask=mask, other=0.0)
+   325  ```
+   326  
+   327  ---
+   328  
+   329  ## 6. 调试清单
+   330  
+   331  ### 6.1 内存访问清单
+   332  
+   333  - [ ] 所有 load/store 是否有正确的 mask 或 boundary_check
+   334  - [ ] 指针偏移是否可能越界
+   335  - [ ] 是否使用 `.contiguous()` 保证连续访问
+   336  - [ ] Block 大小是否满足 256B/512B 对齐
+   337  
+   338  ### 6.2 控制流清单
+   339  
+   340  - [ ] 是否使用了 `return` / `break` / `continue`（Ascend 不支持）
+   341  - [ ] 是否使用了 `while`（需改为 `for` + `if`）
+   342  - [ ] 是否使用了 lambda
+   343  - [ ] 是否使用了 Python 切片（需改为 tl 切片 API）
+   344  
+   345  ### 6.3 Grid/Block 清单
+   346  
+   347  - [ ] Grid 各维度是否 ≤ 65535
+   348  - [ ] BLOCK_SIZE 是否 < 65536
+   349  - [ ] 大 shape 是否采用交错循环或连续块法
+   350  - [ ] 核心数是否在 `__init__` 中获取
+   351  
+   352  ### 6.4 并发清单
+   353  
+   354  - [ ] 多 kernel 调用时中间张量是否正确传递
+   355  - [ ] 原子操作是否正确使用（如有）
+   356  
+   357  ### 6.5 切片清单
+   358  
+   359  - [ ] 多维索引是否正确计算
+   360  - [ ] 是否使用 `tl.extract_slice` / `tl.insert_slice` 替代 Python 切片
+   361  
+   362  ### 6.6 性能清单
+   363  
+   364  - [ ] 是否优先 1D grid
+   365  - [ ] Element-wise 是否使用 VEC 核心
+   366  - [ ] MatMul 是否使用 CUBE 核心
+   367  - [ ] 是否利用核内循环实现存算并行
+   368  
+   369  ### 6.7 常见错误速查表
+   370  
+   371  | 错误现象 | 可能原因 | 排查方向 |
+   372  |----------|----------|----------|
+   373  | 编译失败：unsupported op | 使用了 Ascend 不支持的 API | 检查 
+return/break/while/lambda/切片 |
+   374  | 数值不一致 | 精度、reduce 维度、边界处理 | 检查 mask、axis、float32 
+累加 |
+   375  | 越界 / 崩溃 | 指针或索引计算错误 | 检查 offset 公式、mask 覆盖 |
+   376  | Grid 超限 | grid 维度 > 65535 | 使用交错循环或拆分 grid |
+   377  | 性能差 | 访存不连续、block 过小 | 使用 contiguous、调整 BLOCK_SIZE |
+   378  | tl.where 相关错误 | Ascend 上 tl.where 用于偏移易出问题 | 改用 mask + 
+other 或 boundary_check |
+   379  
+   380  ### 6.8 常见错误解决表
+   381  
+   382  | 错误类型 | 典型症状 | 常见原因 | 解决方案 |
+   383  |---------|---------|---------|---------|
+   384  | 内存越界访问 | 运行时错误、结果异常、随机崩溃 | 
+load/store缺少mask或boundary_check | 添加正确的mask或boundary_check保护 |
+   385  | Grid超限 | 编译失败或运行时错误 | grid总大小超过65535 | 
+使用交错循环`for i in range(pid, total, core_num)`或连续分块处理 |
+   386  | 控制流错误 | 编译失败、语法错误 | 使用了return/break/continue | 
+移除禁用语句，使用mask控制流程 |
+   387  | while循环错误 | 编译失败（Ascend后端） | 使用了while循环 | 改用for + 
+if替代：`for i in range(MAX): if i < n:` |
+   388  | 切片语法错误 | 编译失败 | 使用了`b[0]`或`b[i:j]`直接切片 | 
+使用`tl.get_element`或`tl.extract_slice` |
+   389  | tl.arange索引错误 | 编译失败 | 对`tl.arange`结果使用`get_element` | 
+直接计算索引值而非提取 |
+   390  | 类型转换错误 | 编译警告或错误 | 使用`tl.float16(scalar)`转换 | 
+改用`scalar.to(tl.float16)` |
+   391  | constexpr误用 | 编译失败 | 在host侧使用tl.constexpr | 
+仅在kernel参数中使用tl.constexpr |
+   392  | Stride设置错误 | 计算结果错误、数据错位 | stride参数计算或传递错误 | 
+验证stride设置，检查tensor.stride() |
+   393  | 数值不稳定 | 结果为NaN或Inf | softmax/sqrt等操作溢出 | 
+减去最大值、检查非负、使用float32 |
+   394  | 数据竞争 | 结果不确定、每次运行不同 | 多program并发写入同一位置 | 
+使用tl.atomic_add等原子操作 |
+   395  | BLOCK_SIZE过大 | 编译失败或运行时错误 | BLOCK_SIZE超过65536或硬件限制 
+| 减小BLOCK_SIZE，使用循环处理 |
+   396  | tl.where偏移计算 | 编译失败（Ascend后端） | 在内存偏移中使用tl.where |
+改用if-else静态分支处理 |
+   397  | 性能低下 | 运行缓慢 | 内存访问不连续、切分不合理 | 
+优化内存布局、调整BLOCK_SIZE、使用block_ptr |
+   398  
+   399  ---
+   400  
+   401  ## 注意conv类卷积算子编写：
+   402  torch 
+module中的卷积算子生成会包含一个随机权重weight，为保证我们生成的triton实现也具有
+相同的结果，我们可以在triton的host侧代码中生成对应的weight，例如：
+   403  ```python
+   404  import torch
+   405  import torch.nn as nn
+   406  import triton
+   407  import triton.language as tl
+   408  
+   409  @triton.jit
+   410  def triton_kernel():
+   411      pass
+   412  def triton_host():
+   413      args = ...
+   414      weight = nn.conv(**args).weight.to(device)
+   415  ```
+   416  
+具体的参数和''nn''中调用的module要与torch保持一致，device与传入的backend保持一致
+（如"npu"），我会在调用triton之前固定相同的随机种子，所以在这里只需要正确地创建
+类的实例，并导出权重
+   417  
+   418  ---
+   419  
+   420  ## 附录：完整代码示例
+   421  
+   422  ### A.1 Vector Add（向量加法）
+   423  
+   424  ```python
+   425  @triton.jit
+   426  def vector_add_kernel(a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: 
+tl.constexpr):
+   427      pid = tl.program_id(0)
+   428      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+   429      mask = offsets < n_elements
+   430  
+   431      a = tl.load(a_ptr + offsets, mask=mask)
+   432      b = tl.load(b_ptr + offsets, mask=mask)
+   433      c = a + b
+   434  
+   435      tl.store(c_ptr + offsets, c, mask=mask)
+   436  
+   437  class ModelNew(torch.nn.Module):
+   438      def forward(self, a, b):
+   439          c = torch.empty_like(a)
+   440          n_elements = a.numel()
+   441          grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+   442          vector_add_kernel[grid](a, b, c, n_elements, BLOCK_SIZE=1024)
+   443          return c
+   444  ```
+   445  
+   446  ### A.2 Reduce 算子（块内归约 + 原子操作）
+   447  
+   448  ```python
+   449  @triton.jit
+   450  def reduction_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: 
+tl.constexpr):
+   451      pid = tl.program_id(0)
+   452      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+   453      mask = offsets < n_elements
+   454  
+   455      data = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+   456      block_sum = tl.sum(data, axis=0)
+   457      tl.atomic_add(output_ptr, block_sum)
+   458  ```
+   459  
+   460  ### A.3 MatMul（固定核心数启动）
+   461  
+   462  ```python
+   463  @triton.jit
+   464  def matmul_kernel(
+   465      a_ptr, b_ptr, c_ptr,
+   466      M, N, K,
+   467      num_cores: tl.constexpr,
+   468      BLOCK_M: tl.constexpr,
+   469      BLOCK_N: tl.constexpr,
+   470      BLOCK_K: tl.constexpr,
+   471  ):
+   472      pid = tl.program_id(0)
+   473      NUM_BLOCKS_M = triton.cdiv(M, BLOCK_M)
+   474      NUM_BLOCKS_N = triton.cdiv(N, BLOCK_N)
+   475      NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
+   476  
+   477      for block_idx in range(pid, NUM_BLOCKS, num_cores):
+   478          block_m = block_idx // NUM_BLOCKS_N
+   479          block_n = block_idx % NUM_BLOCKS_N
+   480  
+   481          accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+   482  
+   483          for k in range(0, K, BLOCK_K):
+   484              a_offset = (block_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, 
+None] * K + \
+   485                         (k + tl.arange(0, BLOCK_K))[None, :]
+   486              a_mask = (block_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, 
+None] < M
+   487              a = tl.load(a_ptr + a_offset, mask=a_mask, other=0.0)
+   488  
+   489              b_offset = (k + tl.arange(0, BLOCK_K))[:, None] * N + \
+   490                         (block_n * BLOCK_N + tl.arange(0, BLOCK_N))[None,
+:]
+   491              b_mask = (block_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, 
+:] < N
+   492              b = tl.load(b_ptr + b_offset, mask=b_mask, other=0.0)
+   493  
+   494              accumulator += tl.dot(a, b)
+   495  
+   496          c_offset = (block_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] 
+* N + \
+   497                     (block_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :]
+   498          c_mask = ((block_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] <
+M) & \
+   499                   ((block_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :] <
+N)
+   500          tl.store(c_ptr + c_offset, accumulator, mask=c_mask)
+   501  
+   502  class ModelNew(torch.nn.Module):
+   503      def __init__(self):
+   504          super().__init__()
+   505  
+   506      def forward(self, a, b):
+   507          M, K = a.shape
+   508          K2, N = b.shape
+   509          assert K == K2
+   510          c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+   511  
+   512          num_cores = 20
+   513          BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 256
+   514  
+   515          matmul_kernel[(num_cores,)](a, b, c, M, N, K, num_cores,
+   516                                      BLOCK_M, BLOCK_N, BLOCK_K)
+   517          return c
+   518  ```
+   519  
+   520  ### A.4 LayerNorm 核心逻辑（归一化）
+   521  
+   522  ```python
+   523  # 1. 计算均值
+   524  mean = tl.sum(x, axis=0) / n_cols
+   525  
+   526  # 2. 计算方差
+   527  x_centered = x - mean
+   528  variance = tl.sum(x_centered * x_centered, axis=0) / n_cols
+   529  
+   530  # 3. 归一化
+   531  variance = tl.maximum(variance, 0.0)
+   532  rstd = 1.0 / tl.sqrt(variance + eps)
+   533  normalized = x_centered * rstd
+   534  
+   535  # 4. 应用 weight 和 bias
+   536  output = normalized * weight + bias
+   537  ```
+   538  
+   539  ### A.5 Double Kernel（多内核调用）
+   540  
+   541  ```python
+   542  class ModelNew(torch.nn.Module):
+   543      def forward(self, x):
+   544          intermediate = torch.empty_like(x)
+   545          kernel1[grid](x, intermediate, ...)
+   546  
+   547          output = torch.empty_like(x)
+   548          kernel2[grid](intermediate, output, ...)
+   549  
+   550          return output
+   551  ```
+   552  
+   553  ### A.6 完整 GELU 示例
+   554  
+   555  ```python
+   556  import triton
+   557  import triton.language as tl
+   558  import torch
+   559  
+   560  @triton.jit
+   561  def triton_easy_kernel(in_ptr0, out_ptr0, NUMEL: tl.constexpr):
+   562      idx_block = tl.arange(0, NUMEL)
+   563      x = tl.load(in_ptr0 + idx_block)
+   564      ret = x * 0.5 * (1.0 + tl.erf(x / tl.sqrt(2.0)))
+   565      tl.store(out_ptr0 + idx_block, ret)
+   566  
+   567  @triton.jit
+   568  def triton_better_kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: 
+tl.constexpr, XBLOCK_SUB: tl.constexpr):
+   569      xoffset = tl.program_id(0) * XBLOCK
+   570      for xoffset_sub in range(0, XBLOCK, XBLOCK_SUB):
+   571          x_index = xoffset + xoffset_sub + tl.arange(0, XBLOCK_SUB)[:]
+   572          xmask = x_index < xnumel
+   573          x = tl.load(in_ptr0 + x_index, xmask)
+   574          ret = x * 0.5 * (1.0 + tl.erf(x / tl.sqrt(2.0)))
+   575          tl.store(out_ptr0 + x_index, ret, xmask)
+   576  
+   577  # 调用示例
+   578  ncore = 32
+   579  xblock = 32768
+   580  xblock_sub = 8192
+   581  triton_better_kernel[ncore, 1, 1](x0, out1, x0.numel(), xblock, 
+xblock_sub)
+   582  ```
+   583  
+
+
+Observation ────────────────────────────────────────────────────────────────────
+
+Tool: file_editor
+Result:
+Here's the result of running `cat -n` on 
+/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/references/triton-a
+scend-examples.md:
+     1  # Triton Ascend PyTorch 示例代码
+     2  
+     3  本 Skill 包含完整的可运行示例代码，展示如何在 PyTorch 中使用 Triton 
+Ascend 编写高性能 kernel。
+     4  
+     5  ## 示例列表
+     6  
+     7  ### 1. Vector Add（向量加法）
+     8  **文件**: `torch_vector_add.py` (需补充)
+     9  **算子类型**: Element-wise
+    10  **关键点**:
+    11  - 最简单的 Triton kernel 示例
+    12  - 一维索引和 mask
+    13  - 标准五步模式
+    14  
+    15  **示例代码结构**:
+    16  ```python
+    17  @triton.jit
+    18  def vector_add_kernel(a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: 
+tl.constexpr):
+    19      pid = tl.program_id(0)
+    20      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    21      mask = offsets < n_elements
+    22      
+    23      a = tl.load(a_ptr + offsets, mask=mask)
+    24      b = tl.load(b_ptr + offsets, mask=mask)
+    25      c = a + b
+    26      
+    27      tl.store(c_ptr + offsets, c, mask=mask)
+    28  
+    29  class ModelNew(torch.nn.Module):
+    30      def forward(self, a, b):
+    31          c = torch.empty_like(a)
+    32          n_elements = a.numel()
+    33          grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    34          vector_add_kernel[grid](a, b, c, n_elements, BLOCK_SIZE=1024)
+    35          return c
+    36  ```
+    37  
+    38  ### 2. MatMul（矩阵乘法）
+    39  **文件**: `torch_matmul.py`
+    40  **算子类型**: MatMul
+    41  **关键点**:
+    42  - 使用 `tl.dot` 进行矩阵乘法
+    43  - 2D 索引计算
+    44  - 简单的分块策略
+    45  
+    46  **核心代码**:
+    47  ```python
+    48  @triton.jit
+    49  def matmul_kernel(output_ptr, x_ptr, y_ptr,
+    50                    A: tl.constexpr, B: tl.constexpr, C: tl.constexpr, D: 
+tl.constexpr):
+    51      aidx = tl.arange(0, A)
+    52      bidx = tl.arange(0, B)
+    53      cidx = tl.arange(0, C)
+    54      didx = tl.arange(0, D)
+    55      
+    56      Xidx = bidx[:, None] * C + cidx[None, :]
+    57      Yidx = cidx[:, None] * D + didx[None, :]
+    58      
+    59      X = tl.load(x_ptr + Xidx)
+    60      Y = tl.load(y_ptr + Yidx)
+    61      
+    62      result = tl.dot(X, Y)
+    63      
+    64      oidx = bidx[:, None] * D + didx[None, :]
+    65      tl.store(output_ptr + oidx, result)
+    66  ```
+    67  
+    68  ### 3. Layer Norm（层归一化）
+    69  **文件**: `torch_layer_norm.py`
+    70  **算子类型**: Reduce + Element-wise
+    71  **关键点**:
+    72  - 逐行处理
+    73  - 均值和方差计算
+    74  - 数值稳定性处理
+    75  
+    76  **核心逻辑**:
+    77  ```python
+    78  # 1. 计算均值
+    79  mean = tl.sum(x, axis=0) / n_cols
+    80  
+    81  # 2. 计算方差
+    82  x_centered = x - mean
+    83  variance = tl.sum(x_centered * x_centered, axis=0) / n_cols
+    84  
+    85  # 3. 归一化
+    86  variance = tl.maximum(variance, 0.0)  # 防止负数
+    87  rstd = 1.0 / tl.sqrt(variance + eps)
+    88  normalized = x_centered * rstd
+    89  
+    90  # 4. 应用 weight 和 bias
+    91  output = normalized * weight + bias
+    92  ```
+    93  
+    94  ### 4. Double Kernel（双内核调用）
+    95  **文件**: `torch_double_kernel.py`
+    96  **算子类型**: 多 Kernel 组合
+    97  **关键点**:
+    98  - 展示如何在一个 forward 中调用多个 kernel
+    99  - 中间结果处理
+   100  - Kernel 之间的数据传递
+   101  
+   102  **示例结构**:
+   103  ```python
+   104  class ModelNew(torch.nn.Module):
+   105      def forward(self, x):
+   106          # 第一个 kernel
+   107          intermediate = torch.empty_like(x)
+   108          kernel1[grid](x, intermediate, ...)
+   109          
+   110          # 第二个 kernel
+   111          output = torch.empty_like(x)
+   112          kernel2[grid](intermediate, output, ...)
+   113          
+   114          return output
+   115  ```
+   116  
+
+
+Message from Agent ─────────────────────────────────────────────────────────────
+
+Now I have a good understanding of the task. Let me analyze the `pad` operator:
+
+1. It's a padding operation on tensors with arbitrary dimensions
+2. Supports modes: 'constant', 'reflect', 'replicate', 'circular'
+3. The `pad` tuple specifies padding for each dimension: (pad_left, pad_right, 
+pad_top, pad_bottom, ...)
+4. For 'constant' mode, a `value` parameter is used
+5. Input shapes range from 1D to 4D tensors
+6. dtypes: float32, float16, bfloat16
+
+For the Triton implementation, I need to:
+1. Create a kernel that handles padding for any number of dimensions
+2. The key insight is that for each output element, we need to compute the 
+corresponding input index based on the padding mode
+
+Let me think about the approach:
+- For 'constant' mode: if the output index is in the padding region, return 
+`value`; otherwise, return the input value at the mapped index
+- For 'reflect' mode: reflect the index at the boundary
+- For 'replicate' mode: clamp the index to the valid range
+- For 'circular' mode: use modulo to wrap the index
+
+The simplest approach is to flatten the tensor and compute the output index → 
+input index mapping. This works for any number of dimensions.
+
+Let me design the kernel:
+1. Flatten both input and output tensors
+2. For each output element, compute its multi-dimensional index
+3. Map to input index based on padding mode
+4. Load from input (or return value for constant padding)
+5. Store to output
+
+Actually, a simpler approach: since we're doing element-wise mapping, we can 
+just iterate over all output elements and compute the corresponding input index.
+
+Let me think about the mapping:
+- Output shape = input shape + sum of all pad values
+- For each output element with multi-dim index (i0, i1, ..., in), the input 
+index is:
+  - For constant mode: if any dimension is in the padding region, return value; 
+otherwise, input[i0-pad_left, i1-pad_top, ...]
+  - For reflect/replicate/circular: similar but with different boundary handling
+
+The most straightforward approach is to flatten everything and compute the 
+output index → input index mapping. For each output element, I need to convert 
+its flat index to multi-dimensional coordinates, then apply the padding logic to
+find the corresponding input index, and finally load or return the appropriate 
+value.
+
+I'll implement this with a Triton kernel that handles the padding modes. The 
+kernel takes the input and output pointers along with the input and output 
+shapes, padding configuration, mode, and value. It computes the 
+multi-dimensional output index, maps it to the input index based on the padding 
+mode, and stores the result.
+
+For the constant padding mode, I check if any dimension falls within the padding
+region—if so, I store the fill value; otherwise, I compute the corresponding 
+input index and load from there. The reflect mode handles boundary reflection by
+checking if the index is in the left or right padding region and reflecting it 
+accordingly.
+
+For replicate mode, I clamp the index to the valid range using max and min 
+operations. The circular mode wraps indices using modulo arithmetic to handle 
+out-of-bounds access.
+
+Now I'm realizing the padding tuple format needs clarification—it specifies 
+padding for each dimension in reverse order, so for a 2D tensor with pad=[4, 4, 
+2, 2], the last dimension gets padded by 4 on each side and the second-to-last 
+by 2 on each side.
+
+I should flatten the tensor to simplify the indexing logic, then map each output
+element back to its corresponding input position based on the padding 
+configuration.
+
+For each output element, I need to convert its flat index into multi-dimensional
+coordinates, then apply the padding rules to find the corresponding input index.
+The key insight is that I can compute the input index directly from the output 
+index using the padding offsets, rather than trying to handle all dimensions at 
+once.
+
+Let me implement this with a Triton kernel that handles the padding logic. The 
+kernel will take the input and output pointers, along with the input and output 
+shapes, padding configuration, mode, and fill value. I'll iterate through each 
+output element, compute its multi-dimensional index, apply the appropriate 
+padding transformation, and store the result.
+
+For the constant padding mode, I check if any dimension falls within the padding
+region—if so, I use the fill value; otherwise, I compute the corresponding input
+index and load from there. The reflect mode handles boundary reflection by 
+checking if the index is in the left or right padding region and reflecting it 
+accordingly.
+
+For replicate mode, I clamp the index to the valid range using max and min 
+operations. The circular mode wraps indices using modulo arithmetic to handle 
+out-of-bounds access.
+
+Now I'm realizing the padding tuple format needs clarification—it specifies 
+padding for each dimension in reverse order, so for a 2D tensor with pad=[4, 4, 
+2, 2], the last dimension gets padded by 4 on each side and the second-to-last 
+by 2 on each side.
+
+I need to map this to per-dimension padding values and then handle the index 
+mapping for each mode. For constant padding, I check if any dimension falls 
+within the padding region and return the fill value; otherwise I compute the 
+corresponding input index. For reflect padding, I need to handle the boundary 
+reflection logic carefully.
+
+The reflect mode is particularly tricky because it reflects at the edge of the 
+original data, not the padded region. For an index in the left padding, I 
+reflect it as `pad_left - 1 - (pad_left - 1 - idx)`, which simplifies to `1 - 
+idx`. For indices in the right padding, the reflection is `2 * (input_size - 1) 
+- idx`. I need to verify this logic against PyTorch's actual reflect padding 
+behavior to make sure I'm handling the edge cases correctly.
+
+For replicate padding, it's straightforward—just clamp the index to the valid 
+range. Circular padding uses modulo arithmetic to wrap around. The key insight 
+is that I can flatten the tensor and compute the multi-dimensional index from 
+the flat index, then apply the appropriate padding logic for each dimension.
+
+Now I'm implementing the Triton kernel to handle all these padding modes. The 
+kernel takes the input and output pointers along with shape information, padding
+configuration, and mode parameters. It computes the multi-dimensional output 
+index, then for each dimension, applies the corresponding padding logic to get 
+the input index.
+
+For constant padding, I check if any dimension falls within the padding 
+region—if so, I use the fill value; otherwise, I compute the corresponding input
+index and load from there. For reflect padding, I handle the left and right 
+padding regions by reflecting the index around the boundary, and for indices 
+within the original data range, I use them directly.
+
+For replicate mode, I clamp the index to the valid range using max and min 
+operations. For circular mode, I apply modulo arithmetic to wrap indices around.
+Finally, I compute the flat input index by combining the per-dimension indices 
+with their respective strides, then load the value from the input tensor.
+
+Now I'm realizing there's a potential issue with how I'm handling the padding 
+tuple. The format specifies padding for each dimension in reverse order—so for a
+2D tensor, `pad = [pad_left, pad_right, pad_top, pad_bottom]` means the last 
+dimension gets padded by `pad_left` and `pad_right`, while the second-to-last 
+gets `pad_top` and `pad_bottom`. I need to make sure I'm correctly mapping these
+values to the right dimensions when computing the output shape and strides.
+
+For the index mapping, I need to account for the cumulative padding from all 
+dimensions that come after the current one. The offset for each dimension 
+depends on the product of output sizes of all subsequent dimensions, which I can
+compute from the output shape.
+
+Now I'm realizing the padding tuple format needs clarification—it specifies 
+padding for each dimension in reverse order, so for a 2D tensor with `pad = [4, 
+4, 2, 2]`, the last dimension gets padded by 4 on each side and the 
+second-to-last by 2 on each side. I need to verify this interpretation against 
+the test cases to make sure my indexing logic is correct.
+
+Looking at the test cases, I can see the pattern: for a 1D tensor with `pad = 
+[4, 4]`, the output shape becomes `[136]` (128 + 4 + 4), and for a 2D tensor 
+with `pad = [4, 4, 2, 2]`, the output shape is `[134, 260]` (128 + 2 + 2, 256 + 
+4 + 4). This confirms the padding tuple applies in reverse order to the 
+dimensions.
+
+Now I need to implement the Triton kernel for this padding operation. The kernel
+will need to handle the padding logic by checking if each output index falls 
+within the padded regions and either filling with the specified value or copying
+from the corresponding input position.
+
+For the constant padding mode, I'll check if any dimension is in the padding 
+region—if so, use the fill value; otherwise, compute the corresponding input 
+index and load from there. For reflect padding, I need to handle the boundary 
+reflection logic where indices in the padding region get reflected back into the
+valid range.
+
+For replicate mode, I clamp the index to the valid range using max and min 
+operations. For circular mode, I apply modulo arithmetic to wrap indices around.
+
+Now I'm computing the flat input index by combining the per-dimension indices 
+with their respective strides,
+
+Tokens: ↑ input 111.76K • cache hit 0.00% • ↓ output 2.71K • $ 0.00
+
++----------------------------------------------------------------------+
+|  OpenHands SDK v1.16.0                                               |
+|                                                                      |
+|  Report a bug: github.com/OpenHands/software-agent-sdk/issues        |
+|  Get help: openhands.dev/joinslack                                   |
+|  Scale up: openhands.dev/product/sdk                                 |
+|                                                                      |
+|  Set OPENHANDS_SUPPRESS_BANNER=1 to hide this message                |
++----------------------------------------------------------------------+
+
+2026-06-04 19:16:17,930 [INFO] rllm_entrypoint.runner: LLM_BASE_URL : http://127.0.0.1:8003/v1...
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: LLM_MODEL    : openai/qwen35
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: WORKSPACE    : /opt/workspace/agent_workdir
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: MAX_ITER     : 40
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: SESSION_ID   : cb902d99-6bf1-4d73-94f5-0b2532d30729
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: TASK         : 为算子 pad 生成 Triton-Ascend 实现，参考算子在 src/pad.py。
+严格按 AGENTS.md 的工作流执行（设计 → 生成 → 用固定入口自测迭代），把唯一提交物写到 output/submission/pad_i
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: ASCEND_RT_VISIBLE_DEVICES : NA...
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.runner: OBSERVER_URL : (disabled — running standalone)
+2026-06-04 19:16:17,931 [INFO] rllm_entrypoint.events: [events] Pushing StartupEvent
+2026-06-04 19:16:17,932 [INFO] rllm_entrypoint.pause_ctrl: [pause_ctrl] Started (poll=2.0s)
+2026-06-04 19:16:17,945 [INFO] rllm_entrypoint.runner: [2026-06-04 19:16:17] [pid=1] [rank=NA] [local_rank=NA] [input llm type=<class 'openhands.sdk.llm.llm.LLM'>] [input llm id=140621557187120] [agent.llm type=<class 'openhands.sdk.llm.llm.LLM'>] [agent.llm id=140621557187120] [same_obj=True]
+2026-06-04 19:16:17,945 [INFO] rllm_entrypoint.runner: [LLM_PROBE_INSTALLED] pid=1 rank=NA local_rank=NA llm_type=<class 'openhands.sdk.llm.llm.LLM'> llm_id=140621557187120 patched_methods=['completion'] log_path=/tmp/llm_latency_cb902d99-6bf1-4d73-94f5-0b2532d30729_1.log
+2026-06-04 19:16:17,946 [INFO] openhands.sdk.conversation.state: Created new conversation 9a87ed74-9688-4388-a273-2799f778ff81
+State: {'id': UUID('9a87ed74-9688-4388-a273-2799f778ff81'), 'workspace': {'working_dir': '/opt/workspace/agent_workdir', 'kind': 'LocalWorkspace'}, 'persistence_dir': None, 'max_iterations': 40, 'stuck_detection': True, 'execution_status': <ConversationExecutionStatus.IDLE: 'idle'>, 'confirmation_policy': {'kind': 'NeverConfirm'}, 'security_analyzer': None, 'activated_knowledge_skills': [], 'blocked_actions': {}, 'blocked_messages': {}, 'last_user_message_id': None, 'stats': {'usage_to_metrics': {}}, 'secret_registry': {'secret_sources': {}}, 'tags': {}, 'agent_state': {}, 'hook_config': None}
+Agent: {'llm': {'model': 'openai/qwen35', 'api_key': SecretStr('**********'), 'base_url': 'http://127.0.0.1:8003/v1', 'openrouter_site_url': 'https://docs.all-hands.dev/', 'openrouter_app_name': 'OpenHands', 'num_retries': 5, 'retry_multiplier': 8.0, 'retry_min_wait': 8, 'retry_max_wait': 64, 'timeout': 300, 'max_message_chars': 30000, 'temperature': 0.0, 'max_output_tokens': 2048, 'stream': False, 'drop_params': True, 'modify_params': True, 'disable_stop_word': False, 'caching_prompt': True, 'log_completions': False, 'log_completions_folder': 'logs/completions', 'native_tool_calling': True, 'reasoning_effort': 'high', 'enable_encrypted_reasoning': True, 'prompt_cache_retention': '24h', 'extended_thinking_budget': 200000, 'usage_id': 'rllm-openhands', 'litellm_extra_body': {}}, 'tools': [{'name': 'terminal', 'params': {}}, {'name': 'file_editor', 'params': {}}], 'mcp_config': {}, 'include_default_tools': ['FinishTool', 'ThinkTool'], 'agent_context': {'skills': [{'name': 'agents', 'content': '---\nname: triton-op-generator\ndescription: Triton-Ascend 算子生成与优化工作流（RL 版）。从给定的 PyTorch 参考算子出发，生成 @triton.jit kernel + ModelNew，自测迭代后提交。触发：需要把一个算子描述实现成 Triton-Ascend 算子时。\n---\n\n# System Prompt\n\n你是 **triton-op-generator**。在**固定工作目录 `agent_workdir`** 内，把已给定的 PyTorch 参考算子实现成 Triton-Ascend 算子。\n\n> 本工作流运行在 OpenHands 非交互式 RL 环境：**没有 `question` 工具、没有人工参与**，任何阶段都不要等待确认，按各 SKILL.md 的判定标准自动推进。\n\n## 重要：Skill 使用方法\n\n工作流引用的 skill（triton-op-designer / triton-op-coding / triton-op-verifier / triton-latency-optimizer）**不是可直接调用的工具，而是指导文档**。每阶段开始前先用 `file_editor` 读取对应 `.agents/skills/<skill>/SKILL.md`，再按其指导用 `file_editor`（读写文件）和 `terminal`（执行脚本）手动完成。**不存在名为 `triton-*` 的可调用工具。**\n\n## 固定输入/输出契约（RL pipeline，务必严格遵守）\n\n- **输入（已由框架放好，不要自建、不要改写）**：参考算子在 `src/{op_name}.py`（含 PyTorch `Model` + `get_inputs()` 或 `get_input_groups()`）；多 case 时同目录附 `src/{op_name}.json`。\n- **唯一提交物**：最终实现写到 **`output/submission/{op_name}_impl.py`**，类名必须为 **`ModelNew`**。**评测与奖励只认这个文件**，其余产物一律不计。\n- **不要新建带时间戳的工作目录**，所有文件操作限定在 `agent_workdir` 内。\n- `op_name` 取自环境变量 `OPERATOR_NAME`（或 `src/` 下算子文件名）；`arch` 取自 `OPERATOR_ARCH`。\n\n## 评测：统一走固定入口（禁止自写测试）\n\n所有功能验证 + 性能采集**统一**通过固定入口执行：\n\n```bash\nbash tools/triton_eval_pipeline.sh --op_name {op_name} \\\n    --impl output/submission/{op_name}_impl.py \\\n    --task src/{op_name}.py [--json src/{op_name}.json]\n```\n\n它内部按固定顺序跑：AST 退化检查 → `verify.py`（NPU 数值正确性）→ `benchmark.py`（性能），结果写入 `metrics.json`。\n\n⚠️ **禁止**自创测试方法、**禁止**直接调用或修改 `tools/`、`.agents/skills/triton-op-verifier/scripts/` 下的脚本、**禁止**改评测参数（warmup/repeats/精度阈值由入口写死）。`metrics.json` 字段见《错误分析》。\n\n## 固定配置\n\n- framework: `torch`\u3000dsl: `triton_ascend`\u3000backend: `ascend`\n\n---\n\n## 工作流\n\n```\nPhase 1: 算法设计       (triton-op-designer) —— 仅一次\nPhase 2: 生成 + 自测迭代 (triton-op-coding + triton-op-verifier)\nPhase 3: 性能优化        (triton-latency-optimizer) —— 可选\n```\n\n> 完整 rollout 轨迹由 OpenHands/rllm runner 在框架层捕获，**无需** agent 自行导出会话或写 report/summary。\n\n### Phase 1: 算法设计\n\n读 `src/{op_name}.py`，调用 `triton-op-designer` 设计算法草图，写到 `src/sketch.txt`。仅执行一次，后续迭代不重做。\n\n### Phase 2: 代码生成与自测迭代\n\n```\niteration = 0; max_iterations = 5; verifier_error = ""; suggestion = ""\nwhile iteration < max_iterations:\n    1) 调 triton-op-coding 生成/修复实现：\n       首次传 op_name/task/arch/sketch；重试再加 上一版代码 + verifier_error + suggestion。\n       产物直接写入 output/submission/{op_name}_impl.py（就地迭代，不建 iter_N 目录）。\n    2) 运行固定入口：\n       bash tools/triton_eval_pipeline.sh --op_name {op_name} \\\n           --impl output/submission/{op_name}_impl.py --task src/{op_name}.py [--json src/{op_name}.json]\n    3) 读 metrics.json：\n       - success == true            → 进入 Phase 3\n       - 否则按 error_type 分析（见《错误分析》）：\n           A 类（代码/算法可修）→ 生成 suggestion，iteration++，continue\n           B 类（环境/基础设施）→ 终止\n           C 类（同一 A 子类连续 ≥3 次）→ 终止\n到达 max_iterations 仍未 success → 任务失败结束。\n```\n\n### Phase 3: 性能优化（可选；最多 2 轮，不劣化即可）\n\n> 一如既往**只改** `output/submission/{op_name}_impl.py`（目录已预置，无需 mkdir）。固定入口会在\n> 每次 `success==true` 时自动留存"迄今最优正确版"（`{op_name}_impl.best.py`），**评测/奖励以最优正确版\n> 为准**——所以优化失败**不会降低成绩**，**也无需手动 `cp` 备份/还原**；放心尝试，但**别无限试**，按下面硬上限收敛。\n\n```\nopt_iter = 0; max_opt_iterations = 2\nwhile opt_iter < max_opt_iterations:\n    opt_iter += 1\n    1) 调 triton-latency-optimizer 就地重写 output/submission/{op_name}_impl.py\n    2) 重新运行固定入口评测，读 metrics.json：\n       - success 且 speedup_vs_torch 较前更高 → 入口已自动刷新最优；continue 再试\n       - 否则（correctness 未过 / 无提升 / 失败）  → 立即结束 Phase 3\n    3) optimizer 报告无更多优化点 → 结束\n```\n\n---\n\n## PyTorch 退化政策\n\n`ModelNew.forward()` 的核心计算必须在 `@triton.jit` kernel 内实现；AST 检查会拒绝常见的 PyTorch 退化。\n\nforward 中**禁止**用于核心计算：\n\n- `torch.matmul` / `torch.sum` / `torch.relu` / `torch.softmax` 等计算算子；\n- `torch.nn.functional` 的计算调用（如 `F.linear` / `F.softmax`）；\n- `.sum()` / `.mean()` / `@` / `+` / `*` 等张量计算方法/运算符（当其替代目标运算时）；\n- 调用参考子模块（如 `self.conv(x)` / `self.linear(x)`）走优化路径。\n\n**允许**的支持性操作：分配、形状检查、reshape、contiguous 转换、launch kernel。launch 时直接传张量对象（`kernel[grid](A, B, C, ...)`），不要传 `.data_ptr()` 或整数指针。标量输出（reduction/loss）的最终标量也必须由 kernel 产出，禁止 forward 里 `.sum()`/`.mean()`/索引加算/标量除法做后处理。\n\n## Short Kernel Rules\n\n静默使用，不要先打印计划：\n\n- Elementwise/broadcast：一个向量化 tile kernel 覆盖输出元素；`diag(A) @ B` 即 `C[i,j]=A[i]*B[i,j]`，不要 materialize `diag(A)`。\n- Matmul/linear：tiled `tl.dot`，传张量，必要时 fp32 累加，参考不做 dtype cast 就不要 cast。\n- Reduction：tile 内规约；大轴用"小首段部分规约 + 末段规约 kernel"。\n- Transpose/slice/layout：分配输出，在 kernel 内写精确索引布局，保持 stride/shape/dtype 与参考一致。\n- Softmax/cumsum/conv/loss：先写最简正确版，编译/显存失败再缩 tile。\n\n---\n\n## 错误分析（读 `metrics.json` 的 `error_type` / `error`）\n\n> `metrics.json` 由固定入口产出；失败时 `error_type`/`error` 是主要调试信号（终端日志可能被截断）。关键字段：`success` / `ast_check_ok` / `correctness_ok` / `perf_data.speedup_vs_torch` / `error` / `error_type`。\n\n错误分类与决策：\n\n- **A 类（代码逻辑/算法错误，可修）**：含 PyTorch 退化（Type 1/2/3）、语法/类型错误、形状不匹配、kernel 参数错误（BLOCK_SIZE/grid）、DSL API 误用、数值精度不符。→ 生成修复建议，iteration++ 继续。\n- **B 类（环境/基础设施，不可修）**：文件缺失、NPU OOM/设备不可用、依赖缺失、超时。→ 立即终止。\n- **C 类（重复失败）**：同一 A 类子类连续 ≥ 3 次。→ 终止。\n\nPyTorch 退化子类型（`error_type` 含 ast/退化信息时）：\n\n| 子类型 | 含义 | 修复方向 |\n|--------|------|---------|\n| Type1 | 完全无 `@triton.jit` kernel | 创建 kernel，用 tl.load/tl.store 实现核心计算 |\n| Type2 | 有 kernel 但 forward 未调用 | forward 内 `kernel[grid](...)` 启动 |\n| Type3 | forward 部分计算仍用 PyTorch | 把禁止的 torch 计算移进 kernel |\n\n常见 `error_type` → 修复：`triton_ub_overflow` 缩小 BLOCK_SIZE_{M,N,K}；`triton_compile_failed`/`triton_lowering_failed` 检查 tl.constexpr/内存对齐/指针表达式；`correctness_failed` 检查 dtype、累加顺序、broadcasting、规约轴、容差；`benchmark_failed` 简化 kernel、减少访存。\n\n---\n\n## 约束\n\n| 约束 | 说明 |\n|------|------|\n| 提交物 | 仅 `output/submission/{op_name}_impl.py`（类 `ModelNew`）；不写 report.md/summary.json |\n| 工作目录 | 固定 `agent_workdir`，不新建带时间戳目录；文件操作限其内 |\n| 输入 | `src/{op_name}.py`(+`.json`) 已给定，禁止改写参考 |\n| 评测 | 必须经 `tools/triton_eval_pipeline.sh`；禁止自创测试、禁止改/读 `tools/`、`scripts/` 内容 |\n| 禁止 PyTorch 退化 | forward 禁用 torch.*/F.* 计算 |\n| Phase 2 最大迭代 | 5 次 |\n| Phase 3 最大迭代 | 2 次；首次 correctness 未过/无提升即结束（入口自动保最优正确版，失败不降分） |\n| A 类连续上限 | 同一子类连续 ≥ 3 次自动终止 |\n| 语言 | 思考/分析用中文；代码/路径用英文 |\n\n## 沟通风格\n\n专业、技术、简洁；每完成一个 Phase 给一行状态更新；错误时清晰描述 + 建议操作。\n', 'source': '/opt/workspace/agent_workdir/AGENTS.md', 'inputs': [], 'is_agentskills_format': False}, {'name': 'npu-arch', 'content': '# Ascend NPU 架构知识\n\n## 架构代际概述\n\n| 概念 | 说明 |\n|-----|------|\n| **NpuArch** | 芯片架构号，定义指令集和微架构，运行时通过 `GetCurNpuArch()` 获取 |\n| **SocVersion** | 片上系统版本，软件命名标识，运行时通过 `GetSocVersion()` 获取 |\n| **__NPU_ARCH__** | Device 侧编译宏，四位数值，用于条件编译 |\n| **archXX** | 算子仓目录简写，取 DAV 编号前两位（如 DAV_3510 → arch35） |\n| **__DAV_C310__** | 构建系统内部宏，等价于 `NpuArch::DAV_3510` / `arch35` / `__NPU_ARCH__=3510`，不可按数值推断 |\n\n## 完整映射表\n\n完整产品系列 / SocVersion / NpuArch / 芯片型号映射见 [`npu-hardware-params.md` §0 产品映射表](references/npu-hardware-params.md#0-产品映射表)。\n\n## 获取当前架构\n\n```cpp\n#include "utils/tiling/platform/platform_ascendc.h"\n\nauto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());\nNpuArch npuArch = ascendcPlatform.GetCurNpuArch();         // DAV_2201 / DAV_3510 / ...\nplatform_ascendc::SocVersion socVer = ascendcPlatform.GetSocVersion();\n```\n\n`GetCurNpuArch()` 失败返回 `NpuArch::DAV_RESV`，`GetSocVersion()` 失败返回 `SocVersion::RESERVED_VERSION`。\n\n## DAV_3510 相对 DAV_2201 的关键变化\n\n> 详细硬件参数真值见 `references/npu-hardware-params.md`。运行时必须以 `PlatformAscendC` 接口获取实际值，禁止硬编码。\n\n### Buffer（同架构内通常一致）\n\n| Buffer | DAV_2201 | DAV_3510 |\n|--------|----------|----------|\n| L0C | 128 KB | 256 KB |\n| UB | 192 KB | 248 KB |\n| BT | 1 KB | 4 KB |\n\n### 频率/核数/L2/Memory（因子型号/形态而异）\n\n| 参数 | Ascend910B2 (DAV_2201) | Ascend950PR PCIE | Ascend950PR Server |\n|------|------------------------|------------------|-------------------|\n| Cube 核数 | 24 | 28 | 32 |\n| 频率 | 1.8 GHz | 1.65 GHz | 1.65 GHz |\n| L2 | 192 MB | 112 MB | 128 MB |\n| Memory | 64 GB | 112 GB | 128 GB |\n\n> 详见 [典型SKU示例](references/npu-hardware-params.md#子型号变化参数)。\n\n### 指令集与微架构\n\n| 类别 | 变化 |\n|------|------|\n| 数据格式 | 新增 FP8 / MXFP8 / MXFP4 / HiF8 Cube MMAD |\n| CV 直通通路 | 新增 L0C→UB、UB→L1、SSBuffer 消息 |\n| 同步机制 | BufferID 替代 set/wait 强配对 |\n| 编程模型 | 新增 SIMT、SIMD-Regbase、NDDMA、CCU 通算融合 |\n\n> Memory 带宽基于公开资料与经验值，详见 `npu-hardware-params.md` §4。\n\n## 详细文档索引\n\n`references/` 按需加载：\n\n- **`npu-hardware-params.md`** — 硬件参数参考：各架构子型号一致参数、典型SKU示例、基于公开资料与经验值的规格\n- **`npu-arch-guide.md`**：\n  - **典型硬件参数与获取方式**：核数 / Buffer 容量典型值，`GetCoreNumA*` / `GetCoreMemSize` / `aclrtGetDeviceInfo` 接口用法（含硬编码反例）\n  - **DAV_3510 微架构**：AI Core Buffer 层级、MTE 引擎、CV 数据通路改动、BufferID 同步\n  - **SIMT vs SIMD**：硬件能力差异与适用场景\n  - **SIMD-Regbase**：寄存器组、核心优势、代码形态变化\n  - **数据格式扩展**：完整数据类型表、C++ 类型名映射、MXFP Tiling 约束\n  - **NDDMA / CCU**：高维 DMA 用法、CCU 三种通信范式、KFC 调度模型\n  - **架构兼容性检查清单 / 参考信息来源**\n\n> **范围边界**：本技能聚焦架构判断与硬件能力识别。算子目录结构、CMake 配置、文件命名约定等工程模板内容不在本技能范围内。', 'source': '/opt/workspace/agent_workdir/.agents/skills/npu-arch/SKILL.md', 'inputs': [], 'is_agentskills_format': True, 'description': 'Ascend NPU 架构知识查询技能。通过芯片型号映射、架构代际划分和 archXX 特性说明，帮助判断目标平台能力、特性支持与条件编译策略。当需要确认芯片型号、NpuArch/SocVersion、架构差异、特性支持或编译分支条件时使用。', 'resources': {'skill_root': '/opt/workspace/agent_workdir/.agents/skills/npu-arch', 'scripts': [], 'references': ['npu-arch-guide-triton.md', 'npu-arch-guide.md', 'npu-hardware-params.md'], 'assets': []}}, {'name': 'triton-op-coding', 'content': '# Triton Ascend 代码生成 Skill\n\n<role>\n你是一个高性能计算的内核代码生成专家。\n\n你的任务是基于以下固定配置生成优化的内核代码：\n\n- **目标 DSL**: triton_ascend\n- **目标框架**: torch\n- **目标后端**: ascend\n- **目标架构**: Ascend NPU（默认 `ascend910b1`；若任务说明 / 环境变量 `OPERATOR_ARCH` 指定了具体型号，以其为准）\n</role>\n\n## 执行方式\n\n**重要**：你没有名为 `triton-op-coding` 的专用工具。本 skill 是指导文档，请使用以下现有工具完成本 Skill 描述的工作流：\n- `file_editor` — 读取任务/草图/参考文档，写出生成的内核代码\n- `terminal` — 如需执行 shell 命令\n\n知识文档（`@references/...`、`@../npu-arch/references/...`）通过 `file_editor` 的 view 命令读取；其路径相对本 skill 的 `<location>` 目录（见 `<available_skills>`）解析。\n\n## 核心约束：禁止 PyTorch 退化\n\n⚠️ **生成的代码必须是纯 Triton Ascend 实现，禁止退化成 PyTorch。**\n\n### forward() 中禁止的操作\n\n| 禁止操作 | 示例 | 原因 |\n|---------|------|------|\n| torch 计算函数 | `torch.matmul(x, w)`, `torch.relu(x)`, `torch.sum(x)` | 必须在 @triton.jit kernel 中实现 |\n| torch.nn.functional | `F.softmax(x, dim=-1)`, `F.linear(x, w)`, `F.relu(x)` | 必须在 @triton.jit kernel 中实现 |\n| tensor 方法计算 | `x.sum()`, `x.mean()`, `x.softmax(dim=-1)`, `x.relu()` | 必须在 @triton.jit kernel 中实现 |\n| tensor 运算符 | `x @ w`, `x + y`, `x * y`, `x / y` | 必须在 @triton.jit kernel 中实现 |\n| nn.Module 调用 | `self.conv(x)`, `self.linear(x)`, `self.layer(x)` | 必须在 @triton.jit kernel 中实现 |\n\n### forward() 中允许的操作\n\n| 允许操作 | 示例 | 说明 |\n|---------|------|------|\n| buffer 分配 | `torch.empty(shape)`, `torch.zeros(shape)`, `torch.ones(shape)` | 用于存储 kernel 输出 |\n| 形状操作 | `x.view(...)`, `x.reshape(...)`, `x.permute(...)`, `x.transpose(...)` | 不涉及计算 |\n| 元信息查询 | `x.shape`, `x.dtype`, `x.device`, `x.numel()` | 用于 grid 计算 |\n| kernel 启动 | `kernel[grid](...args)` | 调用自定义 @triton.jit kernel |\n\n### ❌ 错误示例（退化成 PyTorch）\n\n```python\n# ❌ 错误 1：完全无 kernel，纯 PyTorch\ndef forward(self, x, w):\n    return torch.matmul(x, w)\n\n# ❌ 错误 2：有 kernel 但 forward 未调用\n@triton.jit\ndef matmul_kernel(...):\n    pass\n\ndef forward(self, x, w):\n    return torch.matmul(x, w)  # kernel 定义了但没用\n\n# ❌ 错误 3：混合实现（部分 kernel + 部分 torch）\ndef forward(self, x, w):\n    y = self.kernel[grid](x, w)\n    return y.sum(dim=-1)  # ← 违规：tensor 方法计算\n\n# ❌ 错误 4：tensor 运算符\ndef forward(self, x, w):\n    y = self.kernel[grid](x, w)\n    return y + 1  # ← 违规：+ 是 PyTorch 运算符\n```\n\n### ✅ 正确示例（纯 Triton 实现）\n\n```python\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr):\n    idx = tl.arange(0, BLOCK_SIZE)\n    x = tl.load(x_ptr + idx)\n    y = tl.load(y_ptr + idx)\n    output = x + y  # ← 计算在 kernel 中\n    tl.store(output_ptr + idx, output)\n\nclass ModelNew(nn.Module):\n    def forward(self, x, y):\n        output = torch.empty_like(x)  # ✅ 允许：buffer 分配\n        add_kernel[(1,)](x, y, output, x.numel(), BLOCK_SIZE=128)  # ✅ 允许：kernel 启动\n        return output  # ✅ 允许：直接返回 kernel 输出\n```\n\n---\n\n## 输入信息\n\n你将获得以下信息：\n\n1. **任务描述和规格说明** — 算子任务格式的算子需求（包含 `Model` 类）\n2. **算法设计草图**（`sketch`） — kernel-designer 生成的算法草图（首次生成时由 workflow 传入）\n3. **相关的知识和示例** — Triton Ascend 编程知识（见下方知识加载规则）\n4. **执行历史** — 之前的错误信息和修复建议（迭代生成时）\n\n## 知识加载规则\n\n### 必选知识（每次生成都加载）\n\n- **硬件规格**（每次生成都必须加载）：\n `@../npu-arch/references/npu-arch-guide-triton.md` 和 `@../npu-arch/references/npu-hardware-params.md` \n\n\n- `@references/triton-ascend-fundamentals.md` — API 参考、编程基础、Grid 配置、内存优化、性能优化、调试清单\n- `@references/triton-ascend-examples.md` — PyTorch + Triton Ascend 完整示例代码\n\n### 按算子类型选择的知识\n\n根据算子类型，**额外**加载对应的参考文档：\n\n| 算子类型 | 识别特征 | 加载文档 |\n|---------|---------|---------|\n| Element-wise | add/mul/relu/sigmoid/tanh/gelu/exp/log/silu 等逐元素操作 | `@references/triton-ascend-elementwise.md` |\n| MatMul | matmul/bmm/linear/gemm 等矩阵乘法 | `@references/triton-ascend-matmul.md` |\n| Reduce | sum/mean/max/min/softmax/layernorm/logsoftmax 等归约操作 | `@references/triton-ascend-reduce.md` |\n| Attention | self-attention/cross-attention/flash-attention/scaled-dot-product | `@references/triton-ascend-attention.md` |\n| Sort/Select | nms 等排序选择操作 | `@references/triton-ascend-sort-select.md` |\n| Interpolate | Interpolate等插值操作 | `@references/triton-ascend-interpolate.md` |\n\n如果算子涉及多种类型（如融合算子），加载所有相关文档。\n\n---\n\n## 算法草图使用规则\n\n当传入了 `sketch`（kernel-designer 生成的算法设计草图）时，**必须以草图为基础进行代码实现** ，充分利用其中的算法思路和优化策略。\n\n如果没有传入 `sketch`，则根据 `task_desc` 自行设计实现方案。\n\n---\n\n## 代码生成模式\n\n### 模式 1: 首次生成（无历史信息）\n\n当只有 `op_name`、`task_desc` 等基本参数时：\n\n1. 仔细阅读 `task_desc` 中 `Model.forward()` 的参考实现\n2. 理解算子的数学逻辑和计算模式\n3. 判断算子类型，加载对应的知识文档\n4. 选择合适的并行化策略和内存访问模式\n5. 生成 kernel 函数和 `ModelNew` 类\n\n### 模式 2: 代码修改（有 previous_code + user_requirements）\n\n当用户要求修改已有代码时：\n\n1. **仅修改用户要求的部分**，不要重构无关代码\n2. **保持代码结构和接口不变**（除非用户要求修改）\n3. **确保修改后的代码仍然完整可运行**\n4. 输出完整的修改后代码\n\n### 模式 3: 迭代修复（有 verifier_error / conductor_suggestion）\n\n当上一轮验证失败时：\n\n1. **分析错误**：仔细阅读 `verifier_error`，理解失败的具体原因\n2. **参考建议**：严格按照 `conductor_suggestion` 中的修复方向进行修改\n3. **保留优点**：保留上一轮代码中正确的部分，只修改有问题的部分\n4. **针对性修复**：不做不必要的大规模重构\n5. **避免重复**：如果建议中提到了历史教训，确保不犯同样的错误\n\n---\n\n## 输出要求\n\n生成的代码**必须**是一个完整的 Python 文件，包含以下结构：\n\n```python\nimport torch\nimport torch.nn as nn\nimport triton\nimport triton.language as tl\n# 其他必要的 import（如 torch_npu）\n\n# Kernel 函数（一个或多个）\n@triton.jit\ndef {op_name}_kernel(...):\n    # 高性能内核实现\n    ...\n\n# 新 Model 类\nclass ModelNew(nn.Module):\n    def __init__(self, <与原 Model 完全相同的参数>):\n        super().__init__()\n        # 与原 Model 相同的初始化逻辑\n        # 在此获取核心数（如需要）\n\n    def forward(self, <与原 Model 完全相同的输入>):\n        # 调用自定义 kernel\n        ...\n        return output\n```\n\n### 关键约束\n\n| 约束 | 说明 |\n|------|------|\n| 类名 `ModelNew` | 必须使用 `ModelNew`，**不能**是 `Model` |\n| 接口一致 | `__init__` 和 `forward` 的签名必须与原 `Model` **完全一致** |\n| 输出一致 | 输出的形状、数据类型必须与原 `Model` 一致 |\n| 自包含 | 所有 kernel 函数和辅助函数必须定义在同一文件内 |\n| 可执行 | 代码必须可以直接导入运行 |\n| 无测试代码 | 不需要生成测试代码 |\n| 权重一致 | 含随机权重的算子（Conv2d/Linear 等）必须通过固定种子确保权重一致 |\n| **禁止 PyTorch 退化** | **forward() 中所有核心计算必须在 @triton.jit kernel 中实现，禁止使用 torch.*/F.*/tensor 方法/tensor 运算符** |\n\n### 含随机权重算子的权重一致性（关键！）\n\n当任务描述中的 `Model` 类包含 `nn.Conv2d`、`nn.Linear`、`nn.ConvTranspose2d` 等带可学习参数的模块，或者使用 `torch.randn` / `nn.Parameter(torch.randn(...))` 创建随机参数时，**必须**在 `ModelNew.__init__` 中通过固定随机种子来确保与原 `Model` 的权重完全一致。\n\n**原理**：验证框架会在创建 `Model` 前调用 `torch.manual_seed(0)`，再在创建 `ModelNew` 前再次调用 `torch.manual_seed(0)`。只要两者在 `__init__` 内部以相同的顺序创建参数，就能获得完全一致的权重。\n\n**标准模式**：\n\n```python\nclass ModelNew(nn.Module):\n    def __init__(self, in_channels, out_channels, kernel_size, ...):\n        super().__init__()\n        # 1. 固定种子 — 必须与验证框架中的种子一致 (0)\n        torch.manual_seed(0)\n\n        # 2. 按照原 Model 的**完全相同的顺序**创建模块并提取权重\n        #    确保随机数消耗顺序一致\n        conv = nn.Conv2d(in_channels, out_channels, kernel_size)\n        self.weight = nn.Parameter(conv.weight.clone())\n        self.bias = nn.Parameter(conv.bias.clone()) if conv.bias is not None else None\n\n        # 如果原 Model 还有其他随机参数（如 nn.Parameter(torch.randn(...))），\n        # 也必须在此按相同顺序创建\n        self.extra_bias = nn.Parameter(torch.randn(bias_shape))\n\n    def forward(self, x):\n        # 使用提取的权重调用自定义 kernel\n        return custom_conv_kernel(x, self.weight, self.bias, ...)\n```\n\n**核心要点**：\n1. `ModelNew.__init__` 的**第一行**必须调用 `torch.manual_seed(0)`\n2. 参数创建的**顺序**必须与原 `Model.__init__` 完全一致（因为每次 `torch.randn` 调用会推进随机状态）\n3. 通过创建相同的 `nn.Module`（如 `nn.Conv2d`）来获取权重，而非手动 `torch.randn` —— 这保证内部参数的 shape 和初始化方式一致\n4. 如果原 `Model` 有多个含权重的模块，必须按**原顺序**逐一创建并提取\n\n---\n\n## 思考要求\n\n**重要**：思考过程中请只做框架级别的分析和决策，例如：\n- 算子类型判断（elementwise / reduce / matmul 等）\n- 选择什么优化策略（循环展开、向量化等）\n- 数据类型如何处理\n- 代码结构的大致骨架\n\n**不要在思考过程中写出完整的代码**，完整代码只在最终输出中给出。\n\n## 生成原则\n\n- 生成**完整的、可编译的**代码\n- 遵循 Triton Ascend 的最佳实践\n- 针对 Ascend NPU 架构进行优化\n- 正确处理边界情况和异常条件\n- 包含必要的导入和包装函数\n- 数值正确性优先，性能次之\n- **严格遵守禁止 PyTorch 退化的约束** — 所有核心计算必须在 @triton.jit kernel 中实现', 'source': '/opt/workspace/agent_workdir/.agents/skills/triton-op-coding/SKILL.md', 'inputs': [], 'is_agentskills_format': True, 'description': 'Triton Ascend 算子代码生成 Skill — 根据算子任务格式任务描述生成高性能 Triton Ascend 内核代码。支持首次生成和基于错误反馈的迭代优化。 触发：当用户需要根据任务描述生成或迭代修复 Triton Ascend 内核代码时使用。\n', 'resources': {'skill_root': '/opt/workspace/agent_workdir/.agents/skills/triton-op-coding', 'scripts': [], 'references': ['triton-ascend-attention.md', 'triton-ascend-elementwise.md', 'triton-ascend-examples.md', 'triton-ascend-fundamentals.md', 'triton-ascend-interpolate.md', 'triton-ascend-matmul.md', 'triton-ascend-reduce.md', 'triton-ascend-sort-select.md'], 'assets': []}}, {'name': 'triton-op-designer', 'content': '# Triton Ascend 算法草图设计 Skill\n\n<role>\n你是一个高性能计算的算法设计专家。\n\n你的任务是基于以下固定配置设计高质量的算法草图（sketch）：\n\n- **目标 DSL**: triton_ascend\n- **目标框架**: torch\n- **目标后端**: ascend\n- **目标架构**: Ascend NPU（默认 `ascend910b1`；若任务说明 / 环境变量 `OPERATOR_ARCH` 指定了具体型号，以其为准）\n\n⚠️ 你**仅生成算法草图**，不生成可执行代码。草图用于指导后续的代码生成（triton-op-coding）。\n</role>\n\n## 执行方式\n\n**重要**：你没有名为 `triton-op-designer` 的专用工具。本 skill 是指导文档，请使用以下现有工具完成本 Skill 描述的工作流：\n- `file_editor` — 读取任务文件、参考文档（view 命令）\n- `terminal` — 如需执行 shell 命令\n\n按需加载的知识文档（`@references/...`、`@../npu-arch/references/...`）均通过 `file_editor` 的 view 命令读取；其路径相对本 skill 的 `<location>` 目录（见 `<available_skills>`）解析。\n\n## 输入信息\n\n你将获得以下信息：\n\n1. **任务描述和规格说明** — 算子任务格式的算子需求（包含 `Model` 类）\n2. **相关的知识和示例** — UnifiedSketch DSL 规范和设计模式（见下方知识加载规则）\n3. **执行历史** — 之前的设计反馈和优化建议（迭代设计时）\n\n## 知识加载规则\n\n### 必选知识（每次设计都加载）\n\n- `@references/sketch-design.md` — UnifiedSketch DSL 语法规范、核心操作、设计模式、最佳实践\n\n- **硬件规格**\n  详细硬件规格参考： `@../npu-arch/references/npu-arch-guide-triton.md` 和 `@../npu-arch/references/npu-hardware-params.md` \n\n  使用 `file_editor` 工具（view 命令）读取对应架构的硬件规格文件。\n\n\n### 手写优化案例（根据任务选择最相关的 2 个）\n\n根据任务描述中的算子类型，从以下案例中选择**最相关的 2 个**加载。选择依据：算子类型匹配 > 数据规模接近 > 优化模式相似。\n\n| 类别 | 案例文件 | 核心优化 |\n|------|---------|---------|\n| **Elementwise** | `@references/cases/elemwise-broadcast-2d.md` | 2D 广播：小维不切分、循环外加载 |\n| | `@references/cases/elemwise-broadcast-3d.md` | 跨轴 3D 广播：两阶段 kernel |\n| | `@references/cases/elemwise-cast.md` | int8→fp16：二次切分 + 用满 UB |\n| | `@references/cases/elemwise-concat.md` | Slice+Concat 融合：精确切片 load |\n| | `@references/cases/elemwise-zeros.md` | 小 shape：少核、减调度开销 |\n| **Index** | `@references/cases/index-histogram.md` | 直方图：预排序 + 二分查找 |\n| | `@references/cases/index-put.md` | 批量 load 索引到 UB、get_element 复用 |\n| **MatMul** | `@references/cases/matmul-swizzle2d.md` | 固定核心数 grid、Swizzle2D 块重排 |\n| **Reduction** | `@references/cases/reduction-amax-large.md` | M≪N：reduce 轴多核 + 原子 + 二次切分 |\n| | `@references/cases/reduction-amax-medium.md` | 中等规模：矩阵累加再归约 |\n| | `@references/cases/reduction-amax-small.md` | 极小 shape：grid=1 最优 |\n| | `@references/cases/reduction-amin-atomic.md` | 原子 amin：两种原子方案对比 |\n| | `@references/cases/reduction-amin-large.md` | 超大 1D：二次切分 + 重组 |\n| | `@references/cases/reduction-amin-medium.md` | 大 N 维 amin：矩阵 min 再轴归约 |\n| | `@references/cases/reduction-amin-small.md` | 1D amin：并行度平衡 |\n| | `@references/cases/reduction-mean-large.md` | mean 行二次切分 |\n| | `@references/cases/reduction-mean-medium.md` | mean reduce 第一轴：重组 |\n| | `@references/cases/reduction-prod-small.md` | prod：tl.reduce + 自定义 mul |\n| | `@references/cases/reduction-sum-fused.md` | elemwise + sum 融合 |\n| | `@references/cases/reduction-sum-large.md` | 大规模 sum：重组 |\n| | `@references/cases/reduction-weighted-swiglu.md` | 3D SwiGLU backward：reshape + 行二次切分 |\n\n### 按需加载的知识\n\n| 条件 | 加载文档 |\n|------|---------|\n| 任务描述中包含 hint 标记（`@hint:`, `@range_hint` 等） | `@references/hint-mode.md` |\n\n---\n\n## 设计模式\n\n1. 仔细阅读 `task_desc` 中 `Model.forward()` 的参考实现\n2. 理解算子的数学逻辑和计算模式\n3. 判断算子类型（elementwise / reduce / matmul / attention / 复合）\n4. 根据目标硬件架构，选择合适的并行化策略和内存访问模式\n5. 使用 UnifiedSketch DSL 设计算法草图\n\n---\n\n## 输出要求\n\n**直接输出** `sketch op_name { ... }` 格式的算法草图，如果任务描述中包含 hint 标记，在草图末尾附上"设计适用范围"注释（格式见 `hint-mode.md`）。\n\n---\n\n## 设计原则\n\n- 设计**清晰的、可理解的**算法流程\n- 遵循 **Ascend NPU** 硬件特性的最佳实践（core 级别并行、内存层次）\n- 考虑**目标硬件架构**的优化机会（并行度、内存访问模式、数据对齐）\n- 标注**优化点和权衡决策**（使用 `@llm_hint` 注解）\n- 数值正确性优先，性能次之\n\n## 草图特点\n\n算法草图应该：\n\n- **高层抽象**: 关注算法逻辑和优化策略，而非实现细节\n- **易于理解**: 便于 triton-op-coding 转换为可执行的 Triton Ascend 代码\n- **包含优化提示**: 标注并行化、内存优化、循环展开等机会\n\n## 思考要求\n\n**重要**：思考过程中请只做框架级别的分析和决策，例如：\n\n- 算子类型判断（elementwise / reduce / matmul 等）\n- 选择什么并行策略（core 级并行、数据切分方式）\n- Tile 大小选择（���虑 NPU UB 容量和对齐要求）\n- 数据类型如何处理\n\n**不要在思考过程中写出完整的草图**，完整草图只在最终输出中给出。', 'source': '/opt/workspace/agent_workdir/.agents/skills/triton-op-designer/SKILL.md', 'inputs': [], 'is_agentskills_format': True, 'description': 'Triton Ascend 算子算法草图设计 Skill — 根据任务描述设计高质量的算法草图（sketch）， 用于指导后续代码生成。支持首次设计和基于历史上下文的迭代优化。 触发：当用户需要为 Triton Ascend 算子设计算法草图或在已有 sketch 基础上迭代时使用。\n', 'resources': {'skill_root': '/opt/workspace/agent_workdir/.agents/skills/triton-op-designer', 'scripts': [], 'references': ['cases/elemwise-broadcast-2d.md', 'cases/elemwise-broadcast-3d.md', 'cases/elemwise-cast.md', 'cases/elemwise-concat.md', 'cases/elemwise-zeros.md', 'cases/index-histogram.md', 'cases/index-put.md', 'cases/matmul-swizzle2d.md', 'cases/reduction-amax-large.md', 'cases/reduction-amax-medium.md', 'cases/reduction-amax-small.md', 'cases/reduction-amin-atomic.md', 'cases/reduction-amin-large.md', 'cases/reduction-amin-medium.md', 'cases/reduction-amin-small.md', 'cases/reduction-mean-large.md', 'cases/reduction-mean-medium.md', 'cases/reduction-prod-small.md', 'cases/reduction-sum-fused.md', 'cases/reduction-sum-large.md', 'cases/reduction-weighted-swiglu.md', 'hint-mode.md', 'sketch-design-extended.md', 'sketch-design.md'], 'assets': []}}, {'name': 'triton-latency-optimizer', 'content': '# Latency Optimizer Skill\n\n<role>\n你是一个擅长在 Ascend NPU 平台上编写高效 Triton 算子的性能优化专家。\n你的任务是按照严格的顺序逐步优化 Triton 代码，每次只尝试一个优化点。\n**必须确保优化前后的功能一致性和精度一致性。**\n**⚠️ 只能使用本 skill 规定的优化方式，禁止使用任何超出本 skill 之外的优化方式。**\n</role>\n\n## 执行方式\n\n**重要**：你没有名为 `triton-latency-optimizer` 的专用工具。本 skill 是指导文档，请使用以下现有工具完成本 Skill 描述的工作流：\n- `file_editor` — 读取 `code_file_path` 代码、写出 `output_path` 优化后代码、读取 `references/` 优化文档\n- `terminal` — 如需执行 shell 命令\n\n优化点参考文档（`references/...`）通过 `file_editor` 的 view 命令按需读取；其路径相对本 skill 的 `<location>` 目录（见 `<available_skills>`）解析。\n\n## 输入与输出\n\n### 输入参数\n\n- **code_file_path**: 输入代码文件路径（Triton Ascend 算子代码）\n- **output_path**: 输出代码文件路径（优化后的代码必须写入此路径）\n- **npu**: NPU 设备 ID\n- **arch**: 硬件架构\n\n### 输出要求\n\n**必须产出**：\n1. `output_path` 指定的优化后代码文件\n2. 优化策略说明（在代码注释或返回信息中）\n3. 功能一致性说明\n4. 精度一致性说明\n\n**若无更多优化点**：\n- 仍需产出 `output_path`（内容与输入相同或微调）\n- 在返回信息中明确说明"无更多优化点"\n\n## 优化点执行顺序\n\nAgent 必须严格按照以下顺序逐一检查优化点，**每次只能尝试一个优化点，命中后参考对应文档**。\n\n⚠️ **前置要求**：必须先命中某个优化点的「命中条件」（代码特征满足典型代码特征之一且适用条件成立），才能加载对应的参考文档。未命中则跳过，禁止加载参考文档。\n\n---\n\n### 优化点 1：入参静态化优化\n\n**适用条件**：代码中存在可声明为 `tl.constexpr` 的固定参数\n\n**典型代码特征**：\n```python\n@triton.jit\ndef kernel(A, B, C, M, N,\n            stride_am, stride_an,  # 运行时不变化的固定值，但未声明为 constexpr\n            BLOCK_SIZE_M: tl.constexpr,\n            BLOCK_SIZE_K: tl.constexpr):\n```\n\n**判断逻辑**：\n- 如果代码中存在运行时不变化的固定参数（如 stride、固定数值、BLOCK_SIZE等）未声明为 `tl.constexpr` → 涉及\n- 如果所有固定参数都已正确声明为 `tl.constexpr` → 不涉及，跳过\n\n**命中条件**：代码特征满足上述典型代码特征之一，且适用条件成立\n\n**参考文档**：`references/constexpr_parameters.md`\n\n---\n\n### 优化点 2：Tiling 优化（连续轴向量化）\n\n**适用条件**：处理多维张量（3D 及以上）的规约类或归一化算子，且规约轴并非内存布局中的最连续轴\n\n**典型代码特征**：\n```python\n@triton.jit\ndef kernel(input_ptr, output_ptr, dim1, dim2, ...):\n    # 特征 1：向量化偏移 tl.arange 作用在非连续轴（如 dim1/M 轴）\n    m_offsets = tl.arange(0, BLOCK_SIZE_M)\n    # 特征 2：访存偏移计算中，向量化部分乘上了较大的 stride\n    input_offset = m_offsets * stride_m + n_idx * stride_n\n    # 特征 3：循环内部频繁进行还原操作（如 tl.sum）将向量压缩为标量\n    acc = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)\n    ...\n    total_sum = tl.sum(acc, axis=0)\n```\n\n**判断逻辑**：\n- 检查 `tl.load` 的偏移量计算：如果 `tl.arange` 产生的向量偏移量作用于 `stride > 1` 的轴，而存在 `stride = 1` 的轴仅被当作标量索引处理 → 涉及\n- 检查循环累加器：如果累加器在还原轴上分块，但访存模式导致了非连续内存读取 → 涉及\n- 如果 `tl.arange` 已经作用于内存最连续的轴（通常是最后一张量的最后一维），且实现了合并访存 → 不涉及，跳过\n\n**命中条件**：代码逻辑旨在对某维度进行还原，但其分块策略导致硬件执行了跨步访存\n\n**参考文档**：`references/tiling_optimization.md`\n\n---\n\n### 优化点 3：分核优化\n\n**适用条件**：代码中 Grid 大小设置不合理，或未充分利用 NPU 硬件资源\n\n**典型代码特征**：\n```python\n# 特征 1：Grid 远大于物理核数\ngrid = (batch_size,)  # 如果 batch_size=128，远超 48 核\n\n# 特征 2：Grid 远小于物理核数\ngrid = (batch_size // 64,)  # 如果 batch_size=128，只有 2 核\n\n# 特征 3：每个 program 只处理 1 行数据\nrow_idx = tl.program_id(0)\nx = tl.load(ptr + row_idx * stride + cols, mask=mask)\n\n# 特征 4：未使用编译优化选项（multibuffer、unit_flag）\nkernel[grid](...)  # 未传入 multibuffer、unit_flag\n\n```\n\n**判断逻辑**：\n- 检查 Grid 大小是否接近物理核数（40-48）\n  - 如果 Grid >> 48 或 Grid << 48 或者 Grid值无从判断 → 涉及\n- 检查每个 program 处理的数据量\n  - 如果每个 program 只处理少量数据（如 1 行）→ 涉及\n- 检查是否使用了编译优化选项\n  - 如果未使用 multibuffer 且是内存密集型算子 → 涉及\n- 如果 Grid 合理且已使用优化选项 → 不涉及，跳过\n\n**命中条件**：代码中 Grid 大小设置不合理，或未充分利用 NPU 硬件资源\n\n**参考文档**：`references/vector_core_partition.md`\n\n---\n\n### 优化点 4：离散访存优化\n\n**适用条件**：代码中存在通过随机/不可预测索引访问全局内存\n\n**典型代码特征**：\n```python\n# 索引来源于 tl.load 加载的值（随机性）\nidx = tl.load(indices_ptr + offset)  # idx 是运行时确定的随机值\nval = tl.load(data_ptr + idx)        # 通过随机索引访问\n\n# 或者索引来源于 kernel 入参（可能是随机值）\nval = tl.load(ptr + random_index)\n```\n\n**判断逻辑**：\n- 检查 `tl.load` 的索引来源：\n  - 如果索引是 `tl.program_id` 线性变换 → 确定性连续，不涉及\n  - 如果索引是循环变量线性变换 → 确定性步长，不涉及\n  - 如果索引来源于 `tl.load` 加载的值或 kernel 入参 → 潜在随机，涉及\n- 如果所有访存索引都是确定性连续/步长模式 → 不涉及，跳过\n\n**命中条件**：代码中存在通过随机/不可预测索引访问全局内存\n\n**参考文档**：`references/discrete_memory_access.md`\n\n---\n\n### 优化点 5：Scalar 转 Vector 优化\n\n**适用条件**：代码中存在标量操作，可转换为向量操作以充分利用 NPU Vector 计算单元\n\n**典型代码特征**：\n```python\n# 特征 1：标量广播操作\nscalar_val = 0.5  # Python 标量\nresult = x * scalar_val  # scalar 广播，无法启用 vector 加速\n\n# 特征 2：标量规约操作\nsum_val = 0.0  # 标量累加器\nfor n in range(N):\n    val = tl.load(x_ptr + n)\n    sum_val += val  # 标量加法\n\n# 特征 3：标量控制流\nif x > 0:  # 标量条件，导致 SIMD 分支分化\n    result = tl.exp(x)\nelse:\n    result = tl.cos(x)\n\n# 特征 4：int 类型比较/除法/取余\nis_invalid = tok < 0  # int 类型比较，退化为标量\nc = a // b  # int 类型除法，退化为标量\nd = a % b   # int 类型取余，退化为标量\n```\n\n**判断逻辑**：\n- 检查是否存在 Python 标量与向量数据的计算（标量广播）\n- 检查是否存在标量累加器（如 `sum_val = 0.0`）\n- 检查是否存在 `if-else` 控制流处理向量数据\n- 检查是否存在 `int32/int64` 类型的比较、除法、取余操作\n- 如果存在以上任一情况 → 涉及\n- 如果所有操作都已使用向量形式 → 不涉及，跳过\n\n**命中条件**：代码中存在标量操作，可转换为向量操作\n\n**参考文档**：`references/scalar_to_vector.md`\n\n---\n\n### 优化点 6：避免向量API标量降级\n\n**适用条件**：代码中存在可能被编译器降级为标量循环的向量操作，包括通用算术操作、比较操作、扩展乘法、累积操作（cumsum/cumprod）或归约操作（reduce）\n\n**典型代码特征**：\n```python\n# 特征 1：通用算术操作使用 i64，或者满足降级条件\nz = x + y  # x/y 为 i64\nz = x % y  # x/y 为 i32且执行取余计算\n\n# 特征 2：整数比较操作（非 i32 EQ/NE，或非浮点比较）\nmask = x < y  # i8/i16/i32/i64 的 LT/GT/LE/GE 比较\n\n# 特征 3：扩展乘法\nz = x * y  # 触发 vmulext，始终降级\n\n# 特征 4：cumsum/cumprod 在最后一个维度上操作\nx_cumsum = tl.cumsum(x_1d, axis=0)  # 一维张量，或 cumDim 是 lastDim\n\n# 特征 5：reduce 操作在特定条件下\n# i64 类型的 sum/prod/max/min\n# 整数类型的 argmax/argmin\n# 浮点类型 argmax/argmin 且 flatten 后维度 > 2\n```\n\n**判断逻辑**：\n- 检查通用算术操作（add/sub/mul/min/max/abs/shl/shr/interleave/deinterleave）：如果数据类型为 i64\n- 检查比较操作：如果数据类型为 i8/i16/i64（所有比较），或 i32 的 LT/GT/LE/GE → 涉及\n- 检查取余操作：如果数据类型是任何int类型 → 涉及\n- 检查扩展乘法（vmulext）：任何扩展乘法 → 涉及\n- 检查 cumsum/cumprod：如果累积维度是输入张量的最后一个维度（一维时 axis=0 即最后维度），或数据类型为 i64 → 涉及\n- 检查 reduce 操作：如果是 i64 类型的 sum/prod/max/min；整数类型的 argmax/argmin；浮点类型 argmax/argmin 且 flatten 后维度 > 2 → 涉及\n- 如果以上情况均不存在 → 不涉及，跳过\n\n**命中条件**：代码中存在上述任一向量操作，且满足对应的标量降级条件\n\n**参考文档**：`references/avoid_scalar_lowering.md`\n\n---\n\n### 优化点 7：Pass 合并优化\n\n**适用条件**：代码中存在多次遍历相同数据计算不同统计量\n\n**典型代码特征**：\n```python\n# Pass 1: 计算 mean\nfor ...:\n    data = tl.load(...)\n    mean += tl.sum(data)\n\n# Pass 2: 计算 variance（再次遍历！）\nfor ...:\n    data = tl.load(...)  # 重复加载\n    var += tl.sum((data - mean) ** 2)\n\n# Pass 3: 归一化（第三次遍历！）\nfor ...:\n    data = tl.load(...)  # 第三次加载\n    tl.store(...)\n```\n\n**判断逻辑**：\n- 检查是否存在多个独立的循环遍历相同数据\n- 检查是否可以同时计算多个统计量（如 sum + sum_sq 可同时计算 mean + var）\n- 如果存在多次遍历且可合并 → 涉及\n- 如果只有单次遍历，或统计量之间有依赖无法合并 → 不涉及，跳过\n\n**命中条件**：代码中存在多次遍历相同数据，且可以合并计算\n\n**参考文档**：`references/pass-merge.md`\n\n---\n\n### 优化点 8：维度合并优化\n\n**适用条件**：代码中存在多层嵌套循环处理连续维度，且维度间无依赖关系\n\n**典型代码特征**：\n```python\n# 问题代码：3层循环处理 NCHW 布局\nfor n in range(N):           # 64 次\n    for h in range(H):       # 512 次\n        for w_start in range(0, W, BLOCK_SIZE):  # 循环层数过多\n            base_offset = n * stride_n + c * stride_c + h * stride_h\n            data = tl.load(input_ptr + base_offset + ...)\n```\n\n**判断逻辑**：\n- 检查是否存在多层嵌套循环（3层及以上）\n- 检查循环维度是否为连续内存布局（如 NCHW 的 H×W）\n- 检查维度间是否有依赖关系\n- 如果存在多层循环且维度连续、无依赖 → 涉及\n- 如果循环层数较少，或维度间有依赖 → 不涉及，跳过\n\n**命中条件**：代码中存在多层嵌套循环处理连续维度，且可合并\n\n**参考文档**：`references/dimension-merge.md`\n\n---\n\n### 优化点 9：Libdevice 函数使用\n\n**适用条件**：代码中存在手动实现的数学函数，而 `tl.extra.cann.libdevice` 中已有优化版本\n\n**典型代码特征**：\n```python\n# 手动实现 round\nreturn (x + 0.5).to(tl.int8)\n\n# 手动实现 relu\nout = tl.maximum(x, 0.0)\n\n# 手动实现 tanh、sinh、pow 等数学函数\n```\n\n**判断逻辑**：\n- 检查代码中是否手动实现了以下函数：round、trunc、relu、tanh、sinh、cosh、pow、atan、acos、asin、expm1、log1p、hypot 等\n- 如果存在手动实现且 `tl.extra.cann.libdevice` 中有对应函数 → 涉及\n- 如果代码中没有数学函数实现，或已使用 libdevice 版本 → 不涉及，跳过\n\n**命中条件**：代码中存在手动实现的数学函数，且 libdevice 中有优化版本\n\n**参考文档**：`references/libdevice-usage.md`\n\n---\n\n### 优化点 10：循环不变量外提\n\n**适用条件**：代码中存在嵌套循环，且内层循环中有只依赖外层变量的 `tl.load`\n\n**典型代码特征**：\n```python\n# 问题代码：内层循环重复加载相同值\nfor outer_idx in range(outer_size):\n    for inner_idx in range(inner_size):\n        param_idx = outer_idx  # 只依赖外层变量\n        val = tl.load(param_ptr + param_idx)  # 重复加载相同值\n        ...\n\n# 或者通过整除映射到更粗粒度\nfor block in range(num_blocks):\n    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    channel = offsets // spatial_size\n    w = tl.load(weight_ptr + channel)  # 相同 channel 重复加载\n```\n\n**判断逻辑**：\n- 检查是否存在嵌套循环结构\n- 检查内层循环中是否有 `tl.load(param_ptr + index_expr)`\n- 检查 `index_expr` 是否只依赖外层循环变量，不依赖内层循环变量\n- 如果存在且内层循环次数 >> 外层循环次数 → 涉及\n- 如果没有嵌套循环，或所有 load 都依赖内层变量 → 不涉及，跳过\n\n**命中条件**：代码中存在嵌套循环，且内层循环中有只依赖外层变量的 `tl.load`\n\n**参考文档**：`references/loop-invariant-hoisting.md`\n\n---\n\n### 优化点 11：Load 指令重排序\n\n**适用条件**：代码中存在循环，且循环内有多个 `tl.load` 和 `tl.store`，存在数据依赖导致的阻塞\n\n**典型代码特征**：\n```python\nfor i in range(HEAD_NUM):\n    # load B 在前，会等待上一次循环的 store B\n    idx_B = tl.load(p_B_index)\n    b_B = tl.load(p_B)\n    \n    # load A 在后，必须等 load B 完成\n    b_A = tl.load(p_A)\n    \n    # calculation\n    b_O = b_A * b_B\n    \n    # store\n    tl.store(p_O, b_O)\n    tl.store(p_B, b_B)  # store B 会阻塞下一次循环的 load B\n```\n\n**判断逻辑**：\n- 检查是否存在循环结构\n- 检查循环内是否有多个 `tl.load` 和 `tl.store`\n- 检查是否存在 `load A` 与 `store B` 之间没有数据依赖，但被其他依赖阻塞的情况\n- 如果存在可重排序的 load 指令 → 涉及\n- 如果循环内只有一个 load，或所有 load 都有依赖关系 → 不涉及，跳过\n\n**命中条件**：代码中存在循环，且有 load 指令可以通过重排序提前发射\n\n**参考文档**：`references/load-order.md`\n\n---\n\n### 优化点 12：Autotune 自动调优\n\n**适用条件**：代码中存在一个或者多个可调参数（例如BLOCK_SIZE、BLOCK_M等），且这些参数未经过充分调优，考虑到其他优化点可能引入可调超参数，最后再优化该优化点\n\n**典型代码特征**：\n```python\n# 未使用 autotune，手动指定固定参数\n@triton.jit\ndef kernel(..., BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):\n    ...\n\n# 调用时固定参数\nkernel[grid](..., BLOCK_M=128, BLOCK_N=128)\n```\n\n**判断逻辑**：\n- 检查是否已使用 `@triton.autotune` 装饰器\n- 检查是否存在多个可调的 `tl.constexpr` 参数\n- 如果未使用 autotune 且存在可调参数 → 涉及\n- 如果已使用 autotune → 不涉及，跳过\n\n**命中条件**：代码中存在多个可调参数，且未使用 autotune\n\n**参考文档**：`references/autotune.md`\n\n---\n\n## 优化流程\n```\n1. 按顺序检查优化点 1 → 2 → 3 → ... → 12\n2. 对于当前优化点，先判断是否命中（代码特征满足 + 适用条件成立）：\n   - 未命中 → 跳过，检查下一优化点\n   - 命中 → 参考对应文档，应用优化策略\n3. 应用优化后，必须加载 references/checklist.md 检查代码规范\n4. 如果代码规范不满足 → 修改代码直到满足规范\n5. 代码规范满足后 → 返回优化后的代码，回到1继续检查优化点\n```\n\n**重要约束**：\n- ⚠️ **只能使用本 skill 规定的优化方式，禁止使用任何超出本 skill 之外的优化方式**\n- ⚠️ **必须先命中优化点的「命中条件」，才能加载参考文档；未命中则跳过**\n- 一次优化迭代只能使用一个优化点，可以有多轮优化，示例：\n```\n  第一轮：检查 1→2→3→...，命中优化点 X，应用后验证\n  第二轮：检查 1→2→...，命中优化点 Y，应用后验证\n  第三轮：检查 1→2→...，命中优化点 Z，应用后验证\n  ...\n  直到所有优化点都不命中\n```\n- 一次只能参考一个文档\n\n## 优化验证规则\n\n**⚠️ 强制要求：在进行任何精度验证或性能验证之前，必须先执行 checklist 检查，确保所有代码规范都已满足。验证流程如下：**\n\n1. **Checklist 检查**：加载 `references/checklist.md`，逐项检查代码是否满足所有规范要求\n2. **不满足规范** → 修改代码直到满足所有规范要求，然后重新执行 checklist 检查确认\n3. **满足规范后** → 执行精度验证和性能验证\n\n- **成功**：优化后的性能不劣化（speedup ≥ 1.0），该优化结果作为下一次优化迭代的基线\n- **失败**：优化后的性能劣化（speedup < 1.0），放弃本次优化结果，以优化前的代码作为下一次优化迭代的基线\n\n## 参考资料索引\n\n| 文档类型 | 文档路径 |\n|----------|----------|\n| 入参静态化优化 | `references/constexpr_parameters.md` |\n| Tiling 优化 | `references/tiling_optimization.md` |\n| 分核优化 | `references/vector_core_partition.md` |\n| 离散访存优化 | `references/discrete_memory_access.md` |\n| Scalar 转 Vector 优化 | `references/scalar_to_vector.md` |\n| 避免向量API标量降级 | `references/avoid_scalar_lowering.md` |\n| Pass 合并优化 | `references/pass-merge.md` |\n| 维度合并优化 | `references/dimension-merge.md` |\n| Libdevice 函数使用 | `references/libdevice-usage.md` |\n| 循环不变量外提 | `references/loop-invariant-hoisting.md` |\n| Load 指令重排序 | `references/load-order.md` |\n| Autotune 自动调优 | `references/autotune.md` |\n| 代码规范检查 | `references/checklist.md` |\n\n### 最终步骤：Block Size Scaling\n\n在所有上述指令级优化策略全部应用完毕后，**必须加载** `references/block_size_scaling.md`，执行 Block Size Scaling 作为最终优化步骤。\n\n## 执行流程\n\n1. 读取 `code_file_path` 的代码\n2. 分析代码特征，加载对应的优化策略文档\n3. 应用优化策略，生成优化后的代码\n4. 将优化后的代码写入 `output_path`\n5. 返回优化说明和状态信息\n\n## 关键约束\n\n- **必须产出代码文件**：即使无优化点，也要写出 `output_path`\n- **功能一致性**：优化前后的计算结果必须一致\n- **精度一致性**：数值精度不能降低\n- **可执行性**：输出代码必须能被 triton-op-verifier 直接验证和基准测试', 'source': '/opt/workspace/agent_workdir/.agents/skills/triton-latency-optimizer/SKILL.md', 'inputs': [], 'is_agentskills_format': True, 'description': '擅长在 Ascend NPU 平台上编写高效 Triton 算子的性能优化专家。 按照严格的顺序逐步优化 Triton 代码，每次只尝试一个优化点， 确保优化前后功能一致、精度一致。 ⚠️ 只能使用本 skill 规定的优化方式，禁止使用任何超出本 skill 之外的优化方式。 触发：当用户需要对 Ascend NPU 上的 Triton 算子代码进行性能优化、降低时延、提升吞吐时使用。\n', 'resources': {'skill_root': '/opt/workspace/agent_workdir/.agents/skills/triton-latency-optimizer', 'scripts': [], 'references': ['autotune.md', 'avoid_scalar_lowering.md', 'block_size_scaling.md', 'checklist.md', 'constexpr_parameters.md', 'dimension-merge.md', 'discrete_memory_access.md', 'libdevice-usage.md', 'load-order.md', 'loop-invariant-hoisting.md', 'pass-merge.md', 'scalar_to_vector.md', 'tiling_optimization.md', 'vector_core_partition.md'], 'assets': []}}, {'name': 'triton-op-verifier', 'content': '# Triton 算子验证 Skill\n\n你负责验证 `output/submission/{op_name}_impl.py` 是否编译运行正确、与 `src/{op_name}.py` 参考实现输出一致，并采集性能数据。\n\n⚠️ **禁止自写测试代码、禁止直接调用或修改 `scripts/` 下脚本、禁止改评测参数**——所有验证与性能采集**统一通过固定入口** `tools/triton_eval_pipeline.sh` 执行。它内部按固定顺序跑 AST 退化检查 → `verify.py`（NPU 数值）→ `benchmark.py`（性能），warmup/repeats/精度阈值全部写死。\n\n## 用法\n\n```bash\nbash tools/triton_eval_pipeline.sh --op_name {op_name} \\\n    --impl output/submission/{op_name}_impl.py \\\n    --task src/{op_name}.py [--json src/{op_name}.json]\n```\n\n结果写入 `metrics.json`（位于 `--out_dir`，默认 `agent_workdir` 根）。\n\n## metrics.json 关键字段\n\n| 字段 | 含义 |\n|------|------|\n| `success` | 全流程是否成功（ast + correctness + perf 均通过） |\n| `ast_check_ok` | AST 退化预检查是否通过 |\n| `correctness_ok` | NPU 数值正确性是否通过 |\n| `perf_data.speedup_vs_torch` | 相比 PyTorch 的加速比（**全 shape 几何平均**，异常 shape 不计入） |\n| `error` / `error_type` | 失败信息（含 traceback）与分类 |\n\n## 常见失败模式与修复方向（按 `error_type` 索引）\n\n| error_type / 特征 | 修复方向 |\n|---------|---------|\n| AST 退化（Type 1/2/3） | 见 `AGENTS.md` 退化子类型：把 forward 的 torch 计算移进 `@triton.jit` kernel |\n| `correctness_failed` / shape mismatch | 检查 grid/block 配置、输出 buffer 形状、broadcasting、规约轴 |\n| `correctness_failed` / 数值超差 | 检查 dtype 转换、累加顺序（必要时 fp32）、边界处理 |\n| `triton_compile_failed` / `triton_lowering_failed` | 检查 `tl.constexpr` 参数、内存对齐、指针表达式（别传 `.data_ptr()`） |\n| `triton_ub_overflow` / OOM | 减小 `BLOCK_SIZE_{M,N,K}`，优化内存复用（多为 B 类，可能需终止） |\n| `benchmark_failed` | 简化 kernel、减少访存、调 block size |\n| 超时 | 检查无限循环或过大 grid |\n\n## 精度判定（评测器内置，了解即可、不可改）\n\n`verify.py` 用基于 dtype 的**相对误差双门限**（MERE/MARE，NPU Benchmark 标准），非 `torch.allclose`：比较前两侧升 float32；先查形状/NaN/Inf 位置一致，再在有限值上算相对误差。dtype 阈值随精度变化（如 float16 紧、bfloat16 松）。这些阈值由入口写死，**agent 不可调整**。', 'trigger': {'type': 'keyword', 'keywords': ['verify']}, 'source': '/opt/workspace/agent_workdir/.agents/skills/triton-op-verifier/SKILL.md', 'inputs': [], 'is_agentskills_format': True, 'description': '算子代码验证——通过固定入口 tools/triton_eval_pipeline.sh 跑 AST 退化检查 + NPU 数值正确性 + 性能采集，读 metrics.json 判定。禁止自写测试。触发：需要验证 Triton 算子正确性/性能时。\n', 'resources': {'skill_root': '/opt/workspace/agent_workdir/.agents/skills/triton-op-verifier', 'scripts': ['_common_utils.py', '_log_utils.py', 'benchmark.py', 'validate_triton_impl.py', 'verify.py'], 'references': [], 'assets': []}}], 'system_message_suffix': 'Workspace directory: /opt/workspace/agent_workdir. Maximum iterations budget: 40. Session ID: cb902d99-6bf1-4d73-94f5-0b2532d30729.', 'load_user_skills': False, 'load_public_skills': False, 'marketplace_path': 'marketplaces/default.json', 'current_datetime': datetime.datetime(2026, 6, 4, 19, 16, 17, 943895)}, 'system_prompt_filename': '/tmp/rllm_minimal_system.j2', 'security_policy_filename': 'security_policy.j2', 'system_prompt_kwargs': {'llm_security_analyzer': True}, 'tool_concurrency_limit': 1, 'kind': 'Agent'}
+2026-06-04 19:16:17,949 [INFO] openhands.tools.file_editor.editor: FileEditor initialized with cwd: /opt/workspace/agent_workdir
+2026-06-04 19:16:17,949 [WARNING] openhands.tools.terminal.terminal.factory: tmux is not installed. Falling back to subprocess-based terminal, which may be less stable. For best agent performance, install tmux (e.g. `apt-get install tmux` or `brew install tmux`).
+/app/.venv/lib/python3.12/site-packages/openhands/tools/terminal/impl.py:50: UserWarning: tmux is not installed. Falling back to subprocess-based terminal, which may be less stable. For best agent performance, install tmux (e.g. `apt-get install tmux` or `brew install tmux`).
+  self.session = create_terminal_session(
+2026-06-04 19:16:17,950 [INFO] openhands.tools.terminal.terminal.subprocess_terminal: Using shell: /usr/bin/bash
+2026-06-04 19:16:18,961 [INFO] openhands.tools.terminal.impl: TerminalExecutor initialized with working_dir: /opt/workspace/agent_workdir, username: None, terminal_type: TerminalSession
+2026-06-04 19:16:18,962 [INFO] openhands.sdk.agent.base: Loaded 2 tools from spec: ['terminal', 'file_editor']
+2026-06-04 19:16:19,004 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=0 method=completion wall=1780571779.004140 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=2 messages_chars=9491 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:16:26,029 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=0 method=completion ok=True elapsed_s=7.024845 start_wall=1780571779.004140 end_wall=1780571786.028987 pid=1 rank=NA local_rank=NA
+2026-06-04 19:16:26,049 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=1 method=completion wall=1780571786.049394 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=5 messages_chars=12048 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:16:27,601 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=1 method=completion ok=True elapsed_s=1.552328 start_wall=1780571786.049394 end_wall=1780571787.601724 pid=1 rank=NA local_rank=NA
+2026-06-04 19:16:27,660 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=2 method=completion wall=1780571787.660229 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=8 messages_chars=36133 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:16:30,370 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=2 method=completion ok=True elapsed_s=2.709871 start_wall=1780571787.660229 end_wall=1780571790.370101 pid=1 rank=NA local_rank=NA
+2026-06-04 19:16:30,552 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=3 method=completion wall=1780571790.552291 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=11 messages_chars=52664 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:16:33,537 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=3 method=completion ok=True elapsed_s=2.984948 start_wall=1780571790.552291 end_wall=1780571793.537240 pid=1 rank=NA local_rank=NA
+2026-06-04 19:16:33,559 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=4 method=completion wall=1780571793.559398 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=13 messages_chars=54419 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:16:38,572 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=4 method=completion ok=True elapsed_s=5.013202 start_wall=1780571793.559398 end_wall=1780571798.572601 pid=1 rank=NA local_rank=NA
+2026-06-04 19:16:38,685 [INFO] rllm_entrypoint.runner: [LLM_CALL_START] call_id=5 method=completion wall=1780571798.684864 pid=1 rank=NA local_rank=NA ASCEND_RT_VISIBLE_DEVICES=NA llm_type=LLM llm_id=140621557187120 kwargs_keys=['messages', 'tools', 'add_security_risk_prediction', 'on_token'] messages_len=16 messages_chars=80780 tools_len=4
+/app/.venv/lib/python3.12/site-packages/openhands/sdk/llm/utils/telemetry.py:285: UserWarning: Cost calculation failed: This model isn't mapped yet. model=qwen35, custom_llm_provider=openai. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json.
+  warnings.warn(f"Cost calculation failed: {e}")
+2026-06-04 19:17:46,297 [INFO] rllm_entrypoint.runner: [LLM_CALL_END] call_id=5 method=completion ok=True elapsed_s=67.612760 start_wall=1780571798.684864 end_wall=1780571866.297625 pid=1 rank=NA local_rank=NA
+2026-06-04 19:17:46,309 [INFO] rllm_entrypoint.runner: [runner] Conversation reached terminal status: finished
+2026-06-04 19:17:46,309 [INFO] rllm_entrypoint.runner: EXAMPLE_COST: 0.0
+2026-06-04 19:17:46,309 [INFO] rllm_entrypoint.runner: Conversation completed. Status=finished
+2026-06-04 19:17:46,309 [INFO] rllm_entrypoint.events: [events] Pushing EvaluateEvent (status=finished cost=0.0000 llm_calls=6)
+2026-06-04 19:17:46,310 [INFO] rllm_entrypoint.events: [events] Pushing FinishEvent (exit_code=0, reason=completed)
+2026-06-04 19:17:46,310 [INFO] rllm_entrypoint.pause_ctrl: [pause_ctrl] Thread stopping.
