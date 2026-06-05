@@ -1,0 +1,7 @@
+{
+  "total_llm_calls": 25,
+  "iterations": 30,
+  "max_iterations": 40,
+  "exec_status": "finished",
+  "hit_cap": false
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "op_name": "softmaxf32",
+  "success": true,
+  "ast_check_ok": true,
+  "correctness_ok": true,
+  "perf_data": {
+    "framework_latency_ms": 0.0113,
+    "impl_latency_ms": 0.0105,
+    "speedup_vs_torch": 0.9421
+  },
+  "error": null,
+  "error_type": null,
+  "error_file": null,
+  "error_truncated": false
+}
