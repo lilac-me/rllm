@@ -225,15 +225,24 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
             )
             return int(start.returncode)
 
-        wait = subprocess.run(
-            ["docker", "wait", container_name],
-            capture_output=True,
-            timeout=int(request.get("container_timeout") or os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "1800")),
-        )
         try:
-            exit_code = int(wait.stdout.decode().strip())
-        except Exception:
-            exit_code = -1
+            wait = subprocess.run(
+                ["docker", "wait", container_name],
+                capture_output=True,
+                timeout=int(request.get("container_timeout") or os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "1800")),
+            )
+            try:
+                exit_code = int(wait.stdout.decode().strip())
+            except Exception:
+                exit_code = -1
+        except subprocess.TimeoutExpired:
+            # Rollout exceeded the wall-clock cap. Record it as a clean timeout OUTCOME (exit -2)
+            # and judge whatever partial submission exists — do NOT let it bubble to a 500. A slow
+            # rollout is a result, not a worker crash. `docker logs` below still grabs the partial
+            # transcript (container alive until the finally rm -f). The agent loop is already bounded
+            # by max_iterations; this wall-clock is only a hang backstop, so keep it generous.
+            print(f"[remote-eval] container {container_name} hit container_timeout — recording timeout outcome", flush=True)
+            exit_code = -2
 
         logs = subprocess.run(["docker", "logs", container_name], capture_output=True)
         agent_dir = Path(workspace) / "agent_workdir"
