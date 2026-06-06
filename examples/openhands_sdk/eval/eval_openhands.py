@@ -52,6 +52,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -326,15 +327,31 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
         "llm_max_output_tokens": str(cfg.max_output_tokens),
     }
     import urllib.request
+    import urllib.error
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(f"{remote_url}/run", data=data,
-                                 headers={"Content-Type": "application/json"}, method="POST")
     timeout = cfg.container_timeout + cfg.judge_timeout + 300
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return TrajResult(task.task_id, i, {}, {}, -1, f"worker POST failed: {e!r}")
+    # Retry transient connection failures (ECONNREFUSED from a full accept backlog under a
+    # concurrent POST burst, reset, connect timeout). A worker that returns an HTTP status
+    # (HTTPError) handled the request — don't retry that. Worker being alive but momentarily
+    # unreachable should NOT lose the whole rollout.
+    result = None
+    last_err = None
+    for attempt in range(5):
+        req = urllib.request.Request(f"{remote_url}/run", data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            break  # worker responded with an error — surface it, retrying won't help
+        except Exception as e:
+            last_err = e
+            if attempt < 4:
+                time.sleep(3 * (attempt + 1))  # 3s,6s,9s,12s backoff
+    if result is None:
+        return TrajResult(task.task_id, i, {}, {}, -1, f"worker POST failed after retries: {last_err!r}")
 
     # Extract agent_workdir (contains judge_metrics.json) back into the staging workspace,
     # replacing the pre-rollout copy (mirrors openhands_agent._run_remote_eval_worker).

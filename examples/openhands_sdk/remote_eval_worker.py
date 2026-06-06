@@ -465,6 +465,10 @@ def main() -> None:
     _gc_stale_workdirs(args.work_dir)
     # Worker startup = clean slate, no rollouts in flight, so every lock is stale.
     _clear_npu_locks()
+    # Bigger accept backlog: under a concurrent POST burst (eval fans out N rollouts at once),
+    # the default listen backlog of 5 overflows and the OS refuses connections (ECONNREFUSED)
+    # even though the worker is alive. Set before construction (server_activate reads it).
+    ThreadingHTTPServer.request_queue_size = 256
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.work_dir = args.work_dir  # type: ignore[attr-defined]
     print(f"[remote-eval] listening on http://{args.host}:{args.port}", flush=True)
