@@ -58,7 +58,9 @@ def build_operator_task(
         f"--impl {sub} --task {task_src} --out_dir judge_out"
     )
     mk = f"mkdir -p {WORKDIR}/output/submission {WORKDIR}/judge_out"
-    cp_tools = f"cp -r {CANON}/tools {WORKDIR}/tools"  # writable copy per container
+    # eval engine = pipeline (tools/) + verifier scripts (.agents/skills/.../scripts, pipeline's
+    # hardcoded VERIFIER_SCRIPTS path). Writable copy per container.
+    cp_eval = f"cp -r {CANON}/tools {WORKDIR}/tools && cp -r {CANON}/.agents {WORKDIR}/.agents"
     cp_agents = f"cp {CANON}/AGENTS.md {WORKDIR}/AGENTS.md"  # orchestrator into agent cwd (Claude Code reads it)
     place = [{"type": "upload_file", "source": f"{tasks_dir}/{op_name}.py", "target": f"{WORKDIR}/{task_src}"}]
     if task_json:
@@ -75,8 +77,8 @@ def build_operator_task(
             "ascend": {"device_ids": device_ids, "lock_dir": lock_dir},
             "volumes": [f"{skills_dir}:{CANON}:ro"],  # read-only SOURCE only
         },
-        "prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_tools} && {cp_agents} && command -v claude"}],
-        "eval_prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_tools}"}],
+        "prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_eval} && {cp_agents} && command -v claude"}],
+        "eval_prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_eval}"}],
     }
     evaluator = {
         "strategy": "operator_judge",
