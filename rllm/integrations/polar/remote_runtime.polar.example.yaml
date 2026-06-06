@@ -1,0 +1,17 @@
+# Reference fragment — merge under your trainer config's `rllm:` section to drive Triton operator-gen
+# rollouts on Polar (topology a). Dataset built by rllm/integrations/polar/operator_tasks.py.
+#
+# STATIC bits live here; the PER-OP runtime/evaluator ride in each dataset task's metadata
+# (build_operator_task -> metadata.polar_runtime / polar_evaluator), which
+# PolarRuntime.build_task_request forwards verbatim.
+remote_runtime:
+  enabled: true
+  backend: polar
+  polar:
+    rollout_url: http://127.0.0.1:8080    # Polar rollout server (polar serve_rollout)
+    poll_interval_seconds: 15.0
+    timeout_seconds: 3600.0               # budget per operator rollout
+    agent:                                # model_name auto-fills from the trainer's served model if omitted
+      harness: claude_code
+      skills_path: /opt/canonical/skills  # claude_code preset copies these -> CLAUDE_CONFIG_DIR/skills
+    # runtime / evaluator are NOT here — they are per-operator (dataset task metadata).
