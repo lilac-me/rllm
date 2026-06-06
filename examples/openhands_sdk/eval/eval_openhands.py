@@ -174,11 +174,13 @@ def _sanitize_op_name(stem: str) -> str:
 # --------------------------------------------------------------------------- #
 # 1. Loader — NPUKernelBench (real) + mock
 # --------------------------------------------------------------------------- #
-def _bake_task(py_path: Path, json_path: Path, staged_py: Path) -> str | None:
+def _bake_task(py_path: Path, json_path: Path, staged_py: Path, max_cases: int = 0) -> str | None:
     """Run npukb_to_task.py --bake -> self-contained {op}.py. Returns reason-string on skip, None on ok."""
     staged_py.parent.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(_NPUKB_TO_TASK), "--bake", "--json", str(json_path),
            "-o", str(staged_py), str(py_path)]
+    if max_cases and max_cases > 0:
+        cmd += ["--max-cases", str(max_cases)]   # fewer cases -> much faster NPU verify+benchmark per rollout
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0 or not staged_py.exists():
         return (p.stderr or p.stdout or f"exit {p.returncode}").strip().splitlines()[-1][:160]
@@ -217,7 +219,7 @@ def load_tasks(cfg: argparse.Namespace, staging: Path) -> list[Task]:
             if cfg.op_filter and cfg.op_filter not in task_id and cfg.op_filter not in op_name:
                 continue
             staged = staging / task_id / f"{op_name}.py"
-            reason = _bake_task(py, jp, staged)
+            reason = _bake_task(py, jp, staged, cfg.max_cases)
             if reason:
                 skipped.append(f"{task_id}: bake skip ({reason})")
                 continue
@@ -473,7 +475,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--model", default=None)
     ap.add_argument("--image", default=None)
     ap.add_argument("--max-iterations", type=int, default=30)
-    ap.add_argument("--container-timeout", type=int, default=900)
+    ap.add_argument("--container-timeout", type=int, default=2400,
+                    help="per-rollout wall-clock cap (s). Raised 900->2400: qwen3.6 CoT + NPU "
+                         "verify+benchmark over many cases/iterations easily exceeds 900s -> docker wait timeout -> 500")
+    ap.add_argument("--max-cases", type=int, default=0,
+                    help="cap test cases per op (0=all 50). e.g. 8 -> far faster NPU verify+benchmark per rollout")
     ap.add_argument("--judge-timeout", type=int, default=1800)
     ap.add_argument("--eval-device-ids", default=None)
     # run
