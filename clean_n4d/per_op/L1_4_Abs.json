@@ -1,0 +1,58 @@
+{
+  "task_id": "L1_4_Abs",
+  "op_name": "abs",
+  "arch": "ascend910b1",
+  "n_trajectories": 4,
+  "num_correct": 1,
+  "pass_at_k": {
+    "pass@1": 0.25,
+    "pass@4": 1.0
+  },
+  "best_of_N_speedup": 0.4868,
+  "trajectories": [
+    {
+      "traj_idx": 0,
+      "correctness_ok": true,
+      "speedup_vs_torch": 0.4868,
+      "success": true,
+      "error_type": null,
+      "iterations": 40,
+      "hit_cap": true,
+      "exit_code": 0,
+      "error": null
+    },
+    {
+      "traj_idx": 1,
+      "correctness_ok": false,
+      "speedup_vs_torch": 0.0,
+      "success": false,
+      "error_type": "correctness_failed",
+      "iterations": 40,
+      "hit_cap": true,
+      "exit_code": 0,
+      "error": null
+    },
+    {
+      "traj_idx": 2,
+      "correctness_ok": false,
+      "speedup_vs_torch": 0.0,
+      "success": false,
+      "error_type": "correctness_failed",
+      "iterations": 40,
+      "hit_cap": true,
+      "exit_code": 0,
+      "error": null
+    },
+    {
+      "traj_idx": 3,
+      "correctness_ok": false,
+      "speedup_vs_torch": 0.0,
+      "success": false,
+      "error_type": "correctness_failed",
+      "iterations": 40,
+      "hit_cap": true,
+      "exit_code": 0,
+      "error": null
+    }
+  ]
+}
