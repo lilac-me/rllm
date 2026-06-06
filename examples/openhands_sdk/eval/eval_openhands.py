@@ -344,8 +344,18 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
                 result = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as e:
-            last_err = e
-            break  # worker responded with an error — surface it, retrying won't help
+            # Worker handler threw -> 500 carrying a worker_error body. SURFACE it (the eval
+            # used to drop it). Retry 5xx (often transient: NPU device contention / OOM in
+            # the rollout container), not 4xx.
+            try:
+                we = json.loads(e.read().decode("utf-8", "replace")).get("worker_error")
+            except Exception:
+                we = None
+            last_err = f"HTTP {e.code} worker_error={we!r}"
+            if e.code >= 500 and attempt < 4:
+                time.sleep(3 * (attempt + 1))
+                continue
+            break
         except Exception as e:
             last_err = e
             if attempt < 4:

@@ -18,6 +18,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -437,7 +438,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload["remote_docker_start_log_tail"] = _read_tail(agent_dir / "remote_docker_start.log")
             self._json_response(200, payload)
         except Exception as exc:
-            payload = {"exit_code": -1, "worker_error": repr(exc)}
+            tb = traceback.format_exc()
+            # Print the full traceback to the worker log AND return it, so the eval/operator
+            # can see WHY the handler 500'd (don't bury it in a bare repr).
+            print(f"[remote-eval] do_POST EXCEPTION:\n{tb}", flush=True)
+            payload = {"exit_code": -1, "worker_error": repr(exc), "traceback": tb[-2000:]}
             agent_dir = Path(tmp_root) / "workspace" / "agent_workdir"
             if agent_dir.exists():
                 try:
