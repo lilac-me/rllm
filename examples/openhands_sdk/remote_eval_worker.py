@@ -27,6 +27,20 @@ from typing import Any
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from op_route import op_route  # noqa: E402  路由键复用同一套逻辑（默认 triton）
+from distributed_npu_lock import FairDevicePool, DeviceLease  # noqa: E402  host-side device allocation
+
+
+def _acquire_npu(eval_device_ids: str, lock_dir: str) -> DeviceLease | None:
+    """Acquire ONE device from the configured pool for this rollout, using file locks under
+    lock_dir (shared with concurrent rollouts/workers). Returns a DeviceLease whose
+    device_id must be passed as ASCEND_RT_VISIBLE_DEVICES to the container — otherwise
+    torch_npu defaults to card 0 and every rollout piles onto card 0 regardless of the
+    configured eval_device_ids. Caller MUST .release() in a finally."""
+    ids = [int(x) for x in eval_device_ids.split(",") if x.strip()]
+    if not ids:
+        return None
+    pool = FairDevicePool(lock_dir=lock_dir, prefix="npu", device_count=len(ids), device_ids=ids)
+    return pool.acquire_any_fair(wait=True, retry_interval=1.0)
 
 
 # Host path used as the `-v` source for OpenHands containers' NPU file-lock
@@ -158,6 +172,18 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
     lock_dir = _SHARED_NPU_LOCK_DIR  # single source of truth (honors OPENHANDS_EVAL_LOCK_DIR)
     Path(lock_dir).mkdir(mode=0o755, parents=True, exist_ok=True)
 
+    # Acquire one device from the configured pool BEFORE launching docker, and pass it as
+    # ASCEND_RT_VISIBLE_DEVICES. Without this, torch_npu defaults to card 0 inside the
+    # container → every rollout serializes onto card 0 regardless of eval_device_ids.
+    # (The in-container EVAL_DEVICE_IDS / EVAL_LOCK_DIR vars below are vestigial; the
+    # in-container lock manager isn't wired — host-side allocation is the source of truth.)
+    npu_lease = _acquire_npu(eval_device_ids, lock_dir)
+    if npu_lease is not None:
+        print(f"[remote-eval] acquired NPU {npu_lease.device_id} for {container_name}", flush=True)
+    elif eval_device_ids:
+        print(f"[remote-eval] WARN: could not acquire NPU from pool {eval_device_ids!r} "
+              f"— container will start with ASCEND_RT_VISIBLE_DEVICES unset (likely card 0)", flush=True)
+
     cmd = [
         "docker", "run",
         "-d",
@@ -188,6 +214,8 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
         "-e", "EVAL_RETRY_INTERVAL=1.0",
         "-e", "EVAL_TIMEOUT=None",
         "-e", "EVAL_VERBOSE=true",
+        # ↓↓↓ THE actual NPU pin (torch_npu reads this; without it every rollout uses card 0).
+        "-e", f"ASCEND_RT_VISIBLE_DEVICES={npu_lease.device_id if npu_lease else ''}",
         "-v", "/dev:/dev",
         "-v", "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
         "-v", "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro",
@@ -262,6 +290,11 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
         return exit_code
     finally:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if npu_lease is not None:
+            try:
+                npu_lease.release()
+            except Exception:
+                pass
 
 
 def _snapshot_canonical(workspace: str, judge_root: str) -> None:
@@ -290,6 +323,10 @@ def _run_judge(judge_root: str, request: dict[str, Any]) -> dict[str, Any]:
     lock_dir = _SHARED_NPU_LOCK_DIR
     Path(lock_dir).mkdir(mode=0o755, parents=True, exist_ok=True)
     aw = "/opt/workspace/agent_workdir"
+    # Same fix as _run_container: pin ASCEND_RT_VISIBLE_DEVICES to a held device.
+    npu_lease = _acquire_npu(eval_device_ids, lock_dir)
+    if npu_lease is not None:
+        print(f"[remote-eval] judge acquired NPU {npu_lease.device_id} for {name}", flush=True)
     cmd = [
         "docker", "run", "--rm", "--name", name,
         "--network", "host", "--ipc", "host",
@@ -299,6 +336,7 @@ def _run_judge(judge_root: str, request: dict[str, Any]) -> dict[str, Any]:
         "-e", f"EVAL_DEVICE_COUNT={eval_device_count}",
         "-e", f"EVAL_DEVICE_IDS={eval_device_ids}",
         "-e", "EVAL_ENV_NAME=ASCEND_RT_VISIBLE_DEVICES",
+        "-e", f"ASCEND_RT_VISIBLE_DEVICES={npu_lease.device_id if npu_lease else ''}",
         "-v", "/dev:/dev",
         "-v", "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
         "-v", "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro",
@@ -329,6 +367,11 @@ def _run_judge(judge_root: str, request: dict[str, Any]) -> dict[str, Any]:
                 "error": f"judge container failed: {exc!r}", "error_type": "judge_container_failed"}
     finally:
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if npu_lease is not None:
+            try:
+                npu_lease.release()
+            except Exception:
+                pass
     mpath = os.path.join(judge_root, "agent_workdir", "judge_out", "metrics.json")
     if os.path.exists(mpath):
         try:
