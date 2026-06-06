@@ -59,6 +59,7 @@ def build_operator_task(
     )
     mk = f"mkdir -p {WORKDIR}/output/submission {WORKDIR}/judge_out"
     cp_tools = f"cp -r {CANON}/tools {WORKDIR}/tools"  # writable copy per container
+    cp_agents = f"cp {CANON}/AGENTS.md {WORKDIR}/AGENTS.md"  # orchestrator into agent cwd (Claude Code reads it)
     place = [{"type": "upload_file", "source": f"{tasks_dir}/{op_name}.py", "target": f"{WORKDIR}/{task_src}"}]
     if task_json:
         place.append(
@@ -74,7 +75,7 @@ def build_operator_task(
             "ascend": {"device_ids": device_ids, "lock_dir": lock_dir},
             "volumes": [f"{skills_dir}:{CANON}:ro"],  # read-only SOURCE only
         },
-        "prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_tools} && command -v claude"}],
+        "prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_tools} && {cp_agents} && command -v claude"}],
         "eval_prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_tools}"}],
     }
     evaluator = {
