@@ -331,7 +331,11 @@ def _rollout_remote_worker(task: Task, i: int, cfg: argparse.Namespace, out: Pat
     import urllib.request
     import urllib.error
     data = json.dumps(payload).encode("utf-8")
-    timeout = cfg.container_timeout + cfg.judge_timeout + 300
+    # The worker uses stall-detection (no total cap) — a hard op can run for hours — so the
+    # client HTTP wait must be generous too, else urlopen times out while the worker is still
+    # legitimately working. Floor at 6h; raise via OPENHANDS_EVAL_HTTP_TIMEOUT for longer ops.
+    timeout = int(os.environ.get("OPENHANDS_EVAL_HTTP_TIMEOUT", "0")) or max(
+        cfg.container_timeout + cfg.judge_timeout + 300, 6 * 3600)
     # Retry transient connection failures (ECONNREFUSED from a full accept backlog under a
     # concurrent POST burst, reset, connect timeout). A worker that returns an HTTP status
     # (HTTPError) handled the request — don't retry that. Worker being alive but momentarily

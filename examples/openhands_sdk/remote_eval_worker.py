@@ -225,24 +225,31 @@ def _run_container(workspace: str, request: dict[str, Any]) -> int:
             )
             return int(start.returncode)
 
-        try:
-            wait = subprocess.run(
-                ["docker", "wait", container_name],
-                capture_output=True,
-                timeout=int(request.get("container_timeout") or os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "1800")),
-            )
+        # Stall-based liveness, NOT a total-time cap. A hard operator can legitimately take hours,
+        # so we never bound total wall-clock — the agent loop is already bounded by max_iterations.
+        # We only kill a container that makes NO progress (no new output) for `stall_timeout`
+        # seconds: that's a genuine hang (deadlocked NPU kernel / frozen process). The stall window
+        # must exceed the longest legitimate quiet period — a single verify call (VERIFY_TIMEOUT=900s
+        # in the pipeline) or a long reasoning generation — so default 1800s (30 min).
+        stall_timeout = int(request.get("stall_timeout") or os.environ.get("OPENHANDS_STALL_TIMEOUT", "1800"))
+        poll = 60
+        last_sig, last_progress, exit_code = None, time.monotonic(), -1
+        while True:
             try:
-                exit_code = int(wait.stdout.decode().strip())
-            except Exception:
-                exit_code = -1
-        except subprocess.TimeoutExpired:
-            # Rollout exceeded the wall-clock cap. Record it as a clean timeout OUTCOME (exit -2)
-            # and judge whatever partial submission exists — do NOT let it bubble to a 500. A slow
-            # rollout is a result, not a worker crash. `docker logs` below still grabs the partial
-            # transcript (container alive until the finally rm -f). The agent loop is already bounded
-            # by max_iterations; this wall-clock is only a hang backstop, so keep it generous.
-            print(f"[remote-eval] container {container_name} hit container_timeout — recording timeout outcome", flush=True)
-            exit_code = -2
+                w = subprocess.run(["docker", "wait", container_name], capture_output=True, timeout=poll)
+                exit_code = int((w.stdout.decode().strip() or "-1"))
+                break  # container exited on its own
+            except subprocess.TimeoutExpired:
+                pass  # still running — check progress
+            tail = subprocess.run(["docker", "logs", "--tail", "40", container_name], capture_output=True)
+            sig = hash(tail.stdout + tail.stderr)
+            if sig != last_sig:
+                last_sig, last_progress = sig, time.monotonic()
+            elif time.monotonic() - last_progress > stall_timeout:
+                print(f"[remote-eval] container {container_name} STALLED (no output {stall_timeout}s) "
+                      f"— killing as hang", flush=True)
+                exit_code = -2
+                break
 
         logs = subprocess.run(["docker", "logs", container_name], capture_output=True)
         agent_dir = Path(workspace) / "agent_workdir"
