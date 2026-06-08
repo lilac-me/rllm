@@ -123,17 +123,27 @@ def session_result_to_episode(result: dict, uid: str, task, *, expect_per_reques
             reward = float(r)
             break
 
-    trajectories = []
-    if steps or reward is not None:
-        trajectories.append(Trajectory(name="default", task=task, steps=steps, reward=reward if reward is not None else 0.0))
-
     status = result.get("status") or traj.get("status")
+    completed = str(status).upper() == "COMPLETED"
+
+    # ONLY a COMPLETED session yields a TRAINABLE trajectory. ERROR/TIMEOUT — including operator_judge
+    # RAISING on an infra failure (-> trajectory.status=ERROR, reward stays None) — must NOT become a
+    # 0.0-reward trainable episode: that would defeat the infra-vs-operator retry contract and poison
+    # GRPO with a false negative (see §3.4 / operator_reward.INFRA_ERROR_TYPES). Non-COMPLETED ->
+    # non-trainable (empty trajectories, which transform.py drops); RemoteTaskResult.finished=False
+    # already routes the task to retry/skip upstream.
+    trajectories = []
+    if completed and (steps or reward is not None):
+        trajectories.append(Trajectory(name="default", task=task, steps=steps,
+                                       reward=reward if reward is not None else 0.0))
+
     return Episode(
         id=uid,
         task=task,
-        is_correct=bool(reward and reward >= 1.0),
+        is_correct=bool(completed and reward and reward >= 1.0),
         session_id=result.get("session_id"),
         trajectories=trajectories,
-        termination_reason=TerminationReason.UNKNOWN,  # TODO: map Polar COMPLETED/TIMEOUT/ERROR
-        metrics={"empty": int(not traces), "steps_collected": len(traces), "polar_status": status},
+        termination_reason=TerminationReason.UNKNOWN,  # TODO: map finish_reason==length -> MAX_RESPONSE_LENGTH_EXCEEDED
+        metrics={"empty": int(not traces), "steps_collected": len(traces),
+                 "polar_status": status, "trainable": int(bool(trajectories))},
     )

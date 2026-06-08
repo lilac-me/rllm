@@ -69,3 +69,13 @@ def test_polar_episode_builder_direct():
     ep = polar_episode_builder(rr, "t9:0", {"id": "t9", "instruction": "x"})
     assert ep.session_id == "sess-1"
     assert ep.is_correct is False
+
+
+def test_error_session_with_traces_is_not_trainable():
+    # ERROR session (e.g. operator_judge raised on an infra failure) carrying token traces but
+    # reward=None must NOT become a 0.0-reward trainable episode — that would poison GRPO with a
+    # false negative. Adapter must drop it to non-trainable (no trajectories).
+    rr = session_result_to_remote_result(_session(reward=None, status="ERROR"), "terr")
+    assert rr.finished is False                       # status != COMPLETED -> retry/skip upstream
+    ep = polar_episode_builder(rr, "terr:0", {"id": "terr", "instruction": "x"})
+    assert ep.trajectories == [] and ep.is_correct is False   # non-trainable, not reward-0.0
