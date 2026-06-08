@@ -18,7 +18,7 @@ if _ROOT not in sys.path:
 from rllm.integrations.polar.operator_tasks import build_operator_task  # noqa: E402
 from rllm.integrations.polar.runtime import build_task_request  # noqa: E402
 
-_KW = dict(image="polar-op-agent:latest", device_ids="8,9,10,11", lock_dir="/shared/npu-locks",
+_KW = dict(image="polar-op-agent:latest", device_pool="8,9,10,11", lock_dir="/shared/npu-locks",
            skills_dir="/data/cannbot-skills", tasks_dir="/data/op-tasks")
 _CFG = {"agent": {"harness": "claude_code", "skills_path": "/opt/canonical/skills"}, "timeout_seconds": 3600.0}
 
@@ -30,7 +30,7 @@ def test_task_carries_per_op_specs():
     assert ev["strategy"] == "operator_judge" and ev["refresh_runtime"] is True
     assert ev["config"]["op_name"] == "add" and "add_impl.py" in ev["config"]["judge_command"]
     rt = t["metadata"]["polar_runtime"]
-    assert rt["kwargs"]["ascend"]["device_ids"] == "8,9,10,11"
+    assert rt["kwargs"]["ascend"]["pool"] == "8,9,10,11"
 
 
 def test_writable_copy_invariant():

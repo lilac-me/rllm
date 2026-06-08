@@ -39,7 +39,7 @@ def build_operator_task(
     op_name: str,
     *,
     image: str,
-    device_ids: str,
+    device_pool: str,
     lock_dir: str,
     skills_dir: str,
     tasks_dir: str,
@@ -74,7 +74,7 @@ def build_operator_task(
         "network": "host",
         "workdir": WORKDIR,
         "kwargs": {
-            "ascend": {"device_ids": device_ids, "lock_dir": lock_dir},
+            "ascend": {"pool": device_pool, "lock_dir": lock_dir},  # host flock picks 1 free card/container
             "volumes": [f"{skills_dir}:{CANON}:ro"],  # read-only SOURCE only
         },
         "prepare": [*place, {"type": "exec", "command": f"{mk} && {cp_eval} && {cp_agents} && command -v claude"}],
