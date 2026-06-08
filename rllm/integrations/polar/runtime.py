@@ -33,6 +33,10 @@ def build_task_request(submission: "TaskSubmission", cfg: dict[str, Any]) -> dic
     agent = meta.get("polar_agent") or cfg.get("agent")
     if not agent:
         raise ValueError("polar config needs an 'agent' spec, e.g. {'harness': 'claude_code', 'model_name': ...}")
+    # GRPO groups rollouts by id.split(':')[0] (rllm uid = f'{task_id}:{rollout_idx}'); a ':' in the
+    # task_id silently collapses DIFFERENT tasks into one group -> wrong advantage baseline (audit).
+    if ":" in str(submission.task_id):
+        raise ValueError(f"task_id must not contain ':' (breaks GRPO group key): {submission.task_id!r}")
     req: dict[str, Any] = {
         "task_id": submission.task_id,
         "instruction": task.get("instruction") or meta.get("instruction") or "",

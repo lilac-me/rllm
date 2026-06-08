@@ -43,7 +43,18 @@ def _assistant_text(messages: list[dict] | None) -> str:
 
 
 def normalize_trace(trace: dict) -> NormStep:
-    """Extract + validate one Polar Trace. Raises ValueError on any length/mask violation."""
+    """Extract + validate one Polar Trace. Raises ValueError on any length/mask violation, OR on a
+    token_id<->logprob misattribution / missing-logprob that Polar's record_utils flagged in metadata
+    (the length-only contract can't see these — see RL-sample audit). Raising here -> the task errors
+    -> non-trainable + retried, exactly like a length violation; never trains on corrupt capture."""
+    integ = trace.get("metadata")
+    integ = integ.get("logprob_integrity") if isinstance(integ, dict) else None
+    if isinstance(integ, dict) and (integ.get("misattributed") or integ.get("missing")):
+        raise ValueError(
+            f"logprob integrity violation (misattributed={integ.get('misattributed')}, "
+            f"missing={integ.get('missing')}): token-faithful capture broken — refusing to train"
+        )
+
     response_ids = list(trace.get("response_ids") or [])
     prompt_ids = list(trace.get("prompt_ids") or [])
 
@@ -137,13 +148,27 @@ def session_result_to_episode(result: dict, uid: str, task, *, expect_per_reques
         trajectories.append(Trajectory(name="default", task=task, steps=steps,
                                        reward=reward if reward is not None else 0.0))
 
+    # Map Polar status / finish_reason -> rllm TerminationReason. Crucial: a truncated completion
+    # (finish_reason=='length') must surface as MAX_RESPONSE_LENGTH_EXCEEDED so CompactFilteringConfig
+    # (config.py:92, mask_max_response_length_exceeded) can mask/drop it — the hardcoded UNKNOWN made
+    # that filter silently inert, training a half-emitted kernel at full weight (RL-sample audit).
+    su = str(status).upper()
+    if su == "TIMEOUT":
+        term = TerminationReason.TIMEOUT
+    elif su == "ERROR":
+        term = TerminationReason.ERROR
+    elif any(str(tr.get("finish_reason")) == "length" for tr in traces):
+        term = TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED
+    else:
+        term = TerminationReason.UNKNOWN
+
     return Episode(
         id=uid,
         task=task,
         is_correct=bool(completed and reward and reward >= 1.0),
         session_id=result.get("session_id"),
         trajectories=trajectories,
-        termination_reason=TerminationReason.UNKNOWN,  # TODO: map finish_reason==length -> MAX_RESPONSE_LENGTH_EXCEEDED
+        termination_reason=term,
         metrics={"empty": int(not traces), "steps_collected": len(traces),
                  "polar_status": status, "trainable": int(bool(trajectories))},
     )

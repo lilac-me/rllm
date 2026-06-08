@@ -57,6 +57,16 @@ def test_normalize_no_logprobs_ok():
     assert normalize_trace(t).logprobs == []
 
 
+def test_normalize_rejects_logprob_integrity_violation():
+    # record_utils flags token_id<->logprob misattribution / missing-logprob in metadata (the
+    # length check passes); normalize_trace must REFUSE such a trace so it never trains GRPO.
+    for integ in ({"misattributed": 1, "missing": 0}, {"misattributed": 0, "missing": 2}):
+        with pytest.raises(ValueError):
+            normalize_trace({**GOOD_TRACE, "metadata": {"logprob_integrity": integ}})
+    # clean flag (no violation) passes
+    normalize_trace({**GOOD_TRACE, "metadata": {"logprob_integrity": {"misattributed": 0, "missing": 0}}})
+
+
 def test_assistant_text_from_blocks():
     t = {**GOOD_TRACE, "response_messages": [
         {"role": "assistant", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]}

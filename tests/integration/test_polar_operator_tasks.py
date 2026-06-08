@@ -56,6 +56,17 @@ def test_roundtrip_through_build_task_request():
     assert any(p.endswith("src/softmax.json") for p in targets)
 
 
+def test_task_id_colon_rejected():
+    # a ':' in task_id would collapse different operators into one GRPO group (id.split(':')[0]).
+    t = build_operator_task("add", **_KW)
+    sub = SimpleNamespace(task=t, task_id="op:add:v2", session_id="s", inference_url="")
+    try:
+        build_task_request(sub, _CFG)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError on task_id containing ':'")
+
+
 def test_cfg_agent_required_else_raises():
     t = build_operator_task("add", **_KW)
     sub = SimpleNamespace(task=t, task_id="x", session_id="s", inference_url="")
